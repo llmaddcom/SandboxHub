@@ -2,7 +2,8 @@
 沙盒注册表
 
 职责：维护 sandbox_id → SandboxRecord 和 (user_id, role_id) → sandbox_id 两层索引。
-所有方法线程安全（asyncio.Lock）。
+写操作（register/mark_released）通过 asyncio.Lock 保护；
+读操作（get/find_active/list_all）在单线程 asyncio 事件循环下安全，不加锁。
 """
 from __future__ import annotations
 
