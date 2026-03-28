@@ -15,8 +15,6 @@ from fastapi import APIRouter, HTTPException
 from loguru import logger
 from pydantic import BaseModel
 
-from src.config import settings
-
 router = APIRouter(prefix="/v1/sandboxes")
 
 # 依赖注入（app 启动后通过 set_* 注入）
@@ -79,14 +77,16 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
     # 3. 兜底冷启动
     if container is None:
         logger.warning(f"warm pool 为空，冷启动 | type={req.sandbox_type}")
-        container = await _container_manager.run_container(req.sandbox_type)
+        try:
+            container = await _container_manager.run_container(req.sandbox_type)
+        except Exception as e:
+            logger.error(f"冷启动失败 | type={req.sandbox_type} | err={e}")
+            raise HTTPException(status_code=503, detail=f"cold start failed: {e}")
 
     record = await _registry.register(container, req.user_id, req.role_id)
 
-    # 后台补充 pool（使用 settings 获取目标大小，不访问内部状态）
-    target = settings.pool_size_for_type(req.sandbox_type)
-    if target > 0:
-        asyncio.create_task(_warm_pool._refill(req.sandbox_type, target))
+    # 后台补充 pool
+    asyncio.create_task(_warm_pool.ensure_pool(req.sandbox_type))
 
     logger.info(f"sandbox 已分配 | id={record.sandbox_id} | ip={container.container_ip}")
     return AcquireResponse(sandbox_id=record.sandbox_id, status="ready")

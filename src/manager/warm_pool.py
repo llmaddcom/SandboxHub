@@ -53,6 +53,15 @@ class WarmPool:
             logger.warning(f"容器归还 pool 失败，将销毁 | ip={container_info.container_ip} | err={e}")
             await self._manager.remove_container(container_info.container_id)
 
+    async def ensure_pool(self, sandbox_type: SandboxType) -> None:
+        """
+        触发一次 pool 补充到配置目标大小。
+        供外部调用（如 acquire 后补充），内部委托给 _refill。
+        """
+        target = settings.pool_size_for_type(sandbox_type)
+        if target > 0:
+            await self._refill(sandbox_type, target)
+
     async def _refill(self, sandbox_type: SandboxType, target: int) -> None:
         """补充指定类型到目标数量，并发启动缺少的容器数。已在补充中则跳过。"""
         async with self._lock:

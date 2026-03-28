@@ -16,6 +16,12 @@ from src.config import settings
 # 模块级连接池，按容器 IP 缓存 client
 _client_pool: dict[str, httpx.AsyncClient] = {}
 
+# hop-by-hop 请求头，不透传给容器
+_SKIP_REQ_HEADERS = {"host", "content-length", "transfer-encoding"}
+
+# httpx decompresses automatically; strip the header to match the already-decoded body
+_SKIP_RESP_HEADERS = {"transfer-encoding", "content-encoding"}
+
 
 def _get_client(container_ip: str) -> httpx.AsyncClient:
     if container_ip not in _client_pool:
@@ -27,6 +33,13 @@ def _get_client(container_ip: str) -> httpx.AsyncClient:
     return _client_pool[container_ip]
 
 
+async def close_client(container_ip: str) -> None:
+    """关闭并移除指定 IP 的连接池 client。容器销毁时调用，防止连接泄漏和跨沙盒错误路由。"""
+    client = _client_pool.pop(container_ip, None)
+    if client:
+        await client.aclose()
+
+
 async def forward(container_ip: str, path: str, request: Request) -> Response:
     """
     透传 HTTP 请求到容器 API。
@@ -35,9 +48,6 @@ async def forward(container_ip: str, path: str, request: Request) -> Response:
     - 过滤 hop-by-hop 请求头（host, content-length）
     - 原样返回容器响应（status / body / content-type）
     """
-    _SKIP_REQ_HEADERS = {"host", "content-length", "transfer-encoding"}
-    _SKIP_RESP_HEADERS = {"transfer-encoding", "content-encoding"}
-
     body = await request.body()
     req_headers = {
         k: v for k, v in request.headers.items()
