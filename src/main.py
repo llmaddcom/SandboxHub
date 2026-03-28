@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
         target = settings.pool_size_for_type(sandbox_type)
         if target > 0:
             logger.info(f"预热 pool | type={sandbox_type} | target={target}")
-            asyncio.create_task(warm_pool._refill(sandbox_type, target))
+            asyncio.create_task(warm_pool.ensure_pool(sandbox_type))
 
     # 启动维护后台任务
     maintain_task = asyncio.create_task(warm_pool.maintain_loop())

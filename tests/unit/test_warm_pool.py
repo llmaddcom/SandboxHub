@@ -86,3 +86,23 @@ async def test_release_destroys_container_on_clean_failure(mock_manager):
     mock_close.assert_awaited_once_with(container.container_ip)
     mock_manager.remove_container.assert_awaited_once_with(container.container_id)
     assert pool.available_count("ubuntu") == 0
+
+
+@pytest.mark.asyncio
+async def test_restore_adds_container_to_pool(mock_manager):
+    pool = WarmPool(mock_manager)
+    container = make_container()
+    await pool.restore(container)
+    assert pool.available_count("ubuntu") == 1
+
+
+@pytest.mark.asyncio
+async def test_restore_multiple_types_populate_distinct_pools(mock_manager):
+    pool = WarmPool(mock_manager)
+    container = make_container("172.17.0.5")
+    await pool.restore(container)
+    assert pool.available_count("ubuntu") == 1
+    # verify acquire pops it correctly
+    result = await pool.acquire("ubuntu")
+    assert result is container
+    assert pool.available_count("ubuntu") == 0
