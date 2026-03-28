@@ -188,8 +188,9 @@ class ContainerManager:
 
     async def wait_healthy(self, container_ip: str, timeout: int = 30) -> bool:
         """轮询直到健康或超时，返回是否成功。"""
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
             if await self.is_healthy(container_ip):
                 return True
             await asyncio.sleep(1)
