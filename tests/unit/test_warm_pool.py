@@ -51,8 +51,10 @@ async def test_available_count(mock_manager):
 async def test_release_cleans_and_returns_to_pool(mock_manager):
     pool = WarmPool(mock_manager)
     container = make_container()
-    await pool.release(container)
+    with patch("src.proxy.forwarder.close_client", new_callable=AsyncMock) as mock_close:
+        await pool.release(container)
     mock_manager.clean_and_reset.assert_awaited_once_with(container.container_ip)
+    mock_close.assert_awaited_once_with(container.container_ip)
     assert pool.available_count("ubuntu") == 1
 
 
