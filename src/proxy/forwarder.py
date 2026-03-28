@@ -40,6 +40,12 @@ async def close_client(container_ip: str) -> None:
         await client.aclose()
 
 
+async def close_all_clients() -> None:
+    """关闭所有缓存的连接池 client，通常在应用关闭时调用。"""
+    for ip in list(_client_pool.keys()):
+        await close_client(ip)
+
+
 async def forward(container_ip: str, path: str, request: Request) -> Response:
     """
     透传 HTTP 请求到容器 API。

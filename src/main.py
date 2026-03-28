@@ -22,7 +22,7 @@ from src.manager.registry import SandboxRegistry
 from src.manager.warm_pool import WarmPool
 from src.routers import proxy as proxy_router
 from src.routers import sandboxes as sandboxes_router
-from src.proxy.forwarder import close_client
+from src.proxy.forwarder import close_all_clients
 
 
 @asynccontextmanager
@@ -32,10 +32,10 @@ async def lifespan(app: FastAPI):
     registry = SandboxRegistry()
     warm_pool = WarmPool(container_manager)
 
-    # 恢复已运行的受管容器（进程重启后保持连续性）
+    # 恢复已运行的受管容器到 warm pool（仅 warm/未分配状态，不重建 Registry）
     recovered = container_manager.recover_running_containers()
     for info in recovered:
-        warm_pool._pools[info.sandbox_type].append(info)
+        await warm_pool.restore(info)
     if recovered:
         logger.info(f"恢复 {len(recovered)} 个运行中容器到 warm pool")
 
@@ -64,9 +64,7 @@ async def lifespan(app: FastAPI):
         pass
 
     # 关闭所有缓存的 httpx 连接池
-    from src.proxy.forwarder import _client_pool
-    for ip in list(_client_pool.keys()):
-        await close_client(ip)
+    await close_all_clients()
 
     logger.info("SandboxHub 已关闭")
 

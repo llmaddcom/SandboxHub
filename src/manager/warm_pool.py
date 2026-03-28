@@ -117,6 +117,14 @@ class WarmPool:
                 if target > 0:
                     await self._refill(sandbox_type, target)
 
+    async def restore(self, container_info: ContainerInfo) -> None:
+        """
+        将恢复的 warm 容器直接加入 pool（应用重启后调用）。
+        仅适用于未分配状态的容器，有锁保护。
+        """
+        async with self._lock:
+            self._pools[container_info.sandbox_type].append(container_info)
+
     def available_count(self, sandbox_type: str) -> int:
         return len(self._pools.get(sandbox_type, []))
 
