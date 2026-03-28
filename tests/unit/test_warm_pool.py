@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from src.manager.warm_pool import WarmPool
 from src.models import ContainerInfo
 
@@ -79,6 +79,8 @@ async def test_release_destroys_container_on_clean_failure(mock_manager):
     pool = WarmPool(mock_manager)
     container = make_container()
     mock_manager.clean_and_reset.side_effect = RuntimeError("clean failed")
-    await pool.release(container)
+    with patch("src.proxy.forwarder.close_client", new_callable=AsyncMock) as mock_close:
+        await pool.release(container)
+    mock_close.assert_awaited_once_with(container.container_ip)
     mock_manager.remove_container.assert_awaited_once_with(container.container_id)
     assert pool.available_count("ubuntu") == 0

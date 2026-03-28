@@ -46,6 +46,12 @@ class WarmPool:
         """
         try:
             await self._manager.clean_and_reset(container_info.container_ip)
+            # 关闭上一租户的连接池，防止跨租户连接复用
+            try:
+                from src.proxy.forwarder import close_client
+                await close_client(container_info.container_ip)
+            except Exception:
+                pass
             async with self._lock:
                 self._pools[container_info.sandbox_type].append(container_info)
             logger.info(f"容器归还 pool | ip={container_info.container_ip} | type={container_info.sandbox_type}")
