@@ -72,3 +72,13 @@ async def test_refill_skips_when_pool_already_full(mock_manager):
     pool._pools["ubuntu"].append(make_container("172.17.0.6"))
     await pool._refill("ubuntu", target=2)
     mock_manager.run_container.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_release_destroys_container_on_clean_failure(mock_manager):
+    pool = WarmPool(mock_manager)
+    container = make_container()
+    mock_manager.clean_and_reset.side_effect = RuntimeError("clean failed")
+    await pool.release(container)
+    mock_manager.remove_container.assert_awaited_once_with(container.container_id)
+    assert pool.available_count("ubuntu") == 0

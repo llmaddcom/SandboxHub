@@ -24,6 +24,8 @@ class WarmPool:
         # sandbox_type → list of available ContainerInfo
         self._pools: dict[str, list[ContainerInfo]] = defaultdict(list)
         self._lock = asyncio.Lock()
+        # sandbox types currently being refilled; prevents concurrent _refill double-spawning
+        self._refilling: set[str] = set()
 
     async def acquire(self, sandbox_type: SandboxType) -> ContainerInfo | None:
         """
@@ -38,8 +40,9 @@ class WarmPool:
 
     async def release(self, container_info: ContainerInfo) -> None:
         """
-        清理容器 workspace，重置 bash session，归还到池。
-        在后台执行，不阻塞 release API 返回。
+        清理容器 workspace 并重置 bash session，完成后归还到池。
+        调用方 await 此方法，清理完成才返回。
+        router 层如需非阻塞，应使用 asyncio.create_task(pool.release(...))。
         """
         try:
             await self._manager.clean_and_reset(container_info.container_ip)
@@ -51,18 +54,26 @@ class WarmPool:
             await self._manager.remove_container(container_info.container_id)
 
     async def _refill(self, sandbox_type: SandboxType, target: int) -> None:
-        """补充指定类型到目标数量，并发启动缺少的容器数。"""
+        """补充指定类型到目标数量，并发启动缺少的容器数。已在补充中则跳过。"""
         async with self._lock:
+            if sandbox_type in self._refilling:
+                return
             current = len(self._pools[sandbox_type])
-        needed = target - current
-        if needed <= 0:
-            return
+            needed = target - current
+            if needed <= 0:
+                return
+            self._refilling.add(sandbox_type)
+
         logger.info(f"补充 pool | type={sandbox_type} | needed={needed}")
-        tasks = [
-            asyncio.create_task(self._create_warm(sandbox_type, i))
-            for i in range(needed)
-        ]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            tasks = [
+                asyncio.create_task(self._create_warm(sandbox_type, i))
+                for i in range(needed)
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            async with self._lock:
+                self._refilling.discard(sandbox_type)
 
     async def _create_warm(self, sandbox_type: SandboxType, slot: int) -> None:
         """创建单个预热容器，成功后加入 pool；失败只记 warning。"""
