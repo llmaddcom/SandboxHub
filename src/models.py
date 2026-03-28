@@ -5,7 +5,7 @@ ContainerInfo：运行中容器的基础信息（由 ContainerManager 产出）
 SandboxRecord：已分配沙盒的完整记录（由 Registry 管理）
 """
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 SandboxType = Literal["ubuntu"]
@@ -27,4 +27,4 @@ class SandboxRecord:
     user_id: str
     role_id: str
     status: SandboxStatus
-    acquired_at: datetime = field(default_factory=datetime.utcnow)
+    acquired_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
