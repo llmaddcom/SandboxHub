@@ -51,6 +51,11 @@ class WarmPool:
             logger.info(f"容器归还 pool | ip={container_info.container_ip} | type={container_info.sandbox_type}")
         except Exception as e:
             logger.warning(f"容器归还 pool 失败，将销毁 | ip={container_info.container_ip} | err={e}")
+            try:
+                from src.proxy.forwarder import close_client
+                await close_client(container_info.container_ip)
+            except Exception:
+                pass
             await self._manager.remove_container(container_info.container_id)
 
     async def ensure_pool(self, sandbox_type: SandboxType) -> None:

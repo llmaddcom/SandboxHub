@@ -19,7 +19,7 @@ _client_pool: dict[str, httpx.AsyncClient] = {}
 # hop-by-hop 请求头，不透传给容器
 _SKIP_REQ_HEADERS = {"host", "content-length", "transfer-encoding"}
 
-# httpx decompresses automatically; strip the header to match the already-decoded body
+# httpx 会自动解压响应体；移除此头以匹配已解码的内容
 _SKIP_RESP_HEADERS = {"transfer-encoding", "content-encoding"}
 
 

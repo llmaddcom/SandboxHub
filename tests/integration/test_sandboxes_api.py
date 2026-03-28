@@ -4,6 +4,8 @@
 
 不连接真实 Docker，通过 mock registry/warm_pool/container_manager 验证路由逻辑。
 """
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from httpx import AsyncClient, ASGITransport
@@ -104,6 +106,9 @@ async def test_acquire_cold_start_when_pool_empty(app_with_mocks):
 
     assert resp.status_code == 200
     container_manager.run_container.assert_awaited_once()
+    # ensure_pool 通过 asyncio.create_task 后台启动，需让事件循环执行一次才能验证
+    await asyncio.sleep(0)
+    warm_pool.ensure_pool.assert_awaited_once()
 
 
 @pytest.mark.asyncio
