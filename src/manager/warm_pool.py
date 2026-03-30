@@ -133,3 +133,16 @@ class WarmPool:
             st: {"available": len(pool)}
             for st, pool in self._pools.items()
         }
+
+    async def drain(self) -> None:
+        """Remove all warm containers. Called on service shutdown."""
+        async with self._lock:
+            all_containers = [c for pool in self._pools.values() for c in pool]
+            self._pools.clear()
+
+        if all_containers:
+            await asyncio.gather(
+                *[self._manager.remove_container(c.container_id) for c in all_containers],
+                return_exceptions=True,
+            )
+            logger.info(f"warm pool 已清空，删除 {len(all_containers)} 个容器")

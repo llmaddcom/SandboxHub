@@ -106,3 +106,22 @@ async def test_restore_multiple_types_populate_distinct_pools(mock_manager):
     result = await pool.acquire("ubuntu")
     assert result is container
     assert pool.available_count("ubuntu") == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_removes_all_warm_containers(mock_manager):
+    pool = WarmPool(mock_manager)
+    pool._pools["ubuntu"].append(make_container("172.17.0.10"))
+    pool._pools["ubuntu"].append(make_container("172.17.0.11"))
+
+    await pool.drain()
+
+    assert mock_manager.remove_container.await_count == 2
+    assert pool.available_count("ubuntu") == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_empty_pool_does_nothing(mock_manager):
+    pool = WarmPool(mock_manager)
+    await pool.drain()
+    mock_manager.remove_container.assert_not_called()
