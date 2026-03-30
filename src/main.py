@@ -16,13 +16,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter
 from loguru import logger
 
-from src.config import settings
-from src.manager.container_manager import ContainerManager
-from src.manager.registry import SandboxRegistry
-from src.manager.warm_pool import WarmPool
-from src.routers import proxy as proxy_router
-from src.routers import sandboxes as sandboxes_router
-from src.proxy.forwarder import close_all_clients
+from .config import settings
+from .manager.container_manager import ContainerManager
+from .manager.registry import SandboxRegistry
+from .manager.warm_pool import WarmPool
+from .routers import proxy as proxy_router
+from .routers import sandboxes as sandboxes_router
+from .proxy.forwarder import close_all_clients
 
 
 @asynccontextmanager
@@ -63,10 +63,16 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
-    # 关闭所有缓存的 httpx 连接池
-    await close_all_clients()
+    # 并发清理所有容器（warm pool + 已分配），确保无孤儿容器
+    allocated_infos = await registry.drain()
+    await asyncio.gather(
+        warm_pool.drain(),
+        *[container_manager.remove_container(ci.container_id) for ci in allocated_infos],
+        return_exceptions=True,
+    )
 
-    logger.info("SandboxHub 已关闭")
+    await close_all_clients()
+    logger.info("SandboxHub 已关闭，所有容器已清理")
 
 
 app = FastAPI(title="SandboxHub", version="0.1.0", lifespan=lifespan)
@@ -84,3 +90,9 @@ async def health():
     """健康检查，返回服务状态和 warm pool 状态。"""
     pool_status = sandboxes_router._warm_pool.status() if sandboxes_router._warm_pool else {}
     return {"ok": True, "warm_pool": pool_status}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8088, reload=False)
+
