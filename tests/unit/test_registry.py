@@ -72,3 +72,27 @@ async def test_list_all():
     await reg.register(make_container("172.17.0.5"), user_id="u1", role_id="r1")
     await reg.register(make_container("172.17.0.6"), user_id="u2", role_id="r2")
     assert len(reg.list_all()) == 2
+
+
+@pytest.mark.asyncio
+async def test_drain_returns_all_container_infos_and_clears_registry():
+    registry = SandboxRegistry()
+    container1 = ContainerInfo(
+        container_id="cid1", container_name="sb1",
+        container_ip="172.17.0.5", sandbox_type="ubuntu",
+    )
+    container2 = ContainerInfo(
+        container_id="cid2", container_name="sb2",
+        container_ip="172.17.0.6", sandbox_type="ubuntu",
+    )
+    await registry.register(container1, user_id="u1", role_id="r1")
+    await registry.register(container2, user_id="u2", role_id="r2")
+
+    infos = await registry.drain()
+
+    assert len(infos) == 2
+    cids = {i.container_id for i in infos}
+    assert cids == {"cid1", "cid2"}
+    # Registry is cleared
+    assert registry.list_all() == []
+    assert await registry.find_active("u1", "r1") is None

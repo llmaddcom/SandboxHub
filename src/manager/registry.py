@@ -70,3 +70,11 @@ class SandboxRegistry:
 
     def list_all(self) -> list[SandboxRecord]:
         return list(self._by_id.values())
+
+    async def drain(self) -> list[ContainerInfo]:
+        """Return all tracked ContainerInfos and clear the registry. Called on shutdown."""
+        async with self._lock:
+            infos = [r.container_info for r in self._by_id.values()]
+            self._by_id.clear()
+            self._by_user_role.clear()
+        return infos
