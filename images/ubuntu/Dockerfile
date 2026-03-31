@@ -97,8 +97,12 @@ RUN ARCH=$(dpkg --print-architecture) && \
     echo "Node: $(node --version), npm: $(npm --version), pnpm: $(pnpm --version)"
 
 # ===== 6. 安装 noVNC =====
-RUN git clone --branch v1.5.0 https://gitee.com/mirrors/noVNC.git /opt/noVNC && \
-    git clone --branch v0.12.0 https://gitee.com/mirrors/websockify /opt/noVNC/utils/websockify && \
+RUN curl -fsSL https://github.com/novnc/noVNC/archive/refs/tags/v1.5.0.tar.gz \
+      | tar -xz -C /opt && \
+    mv /opt/noVNC-1.5.0 /opt/noVNC && \
+    curl -fsSL https://github.com/novnc/websockify/archive/refs/tags/v0.12.0.tar.gz \
+      | tar -xz -C /opt/noVNC/utils && \
+    mv /opt/noVNC/utils/websockify-0.12.0 /opt/noVNC/utils/websockify && \
     ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html
 
 # ===== 7. 工作目录与沙盒工作区 =====
@@ -118,7 +122,7 @@ RUN mkdir -p /workspace/persona \
 RUN mkdir -p /root/Downloads
 
 # ===== 8. 安装 Python 环境 (Pyenv) =====
-RUN git clone https://gitee.com/mirrors/pyenv.git /root/.pyenv && \
+RUN git clone https://github.com/pyenv/pyenv.git /root/.pyenv && \
     cd /root/.pyenv && src/configure && make -C src && cd .. && \
     echo 'export PYENV_ROOT="/root/.pyenv"' >> /root/.bashrc && \
     echo 'command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"' >> /root/.bashrc && \
