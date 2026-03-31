@@ -38,7 +38,10 @@ env/
 
 # Environment
 .env
-.env.local
+.env*
+
+# Project docs (local only)
+docs/
 
 # OS
 .DS_Store
