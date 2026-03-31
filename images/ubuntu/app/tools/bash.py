@@ -187,6 +187,63 @@ class BashSession:
 
         return CLIResult(output=output, error=error)
 
+    async def run_stream(self, command: str, timeout: float | None = None):
+        """Yield stdout chunks line-by-line as command runs; yield done when complete.
+
+        Yields dicts:
+            {"type": "stdout", "chunk": str}  — each stdout line as it arrives
+            {"type": "stderr", "chunk": str}  — full stderr after completion (if any)
+            {"type": "done"}                  — command finished
+        """
+        if not self._started:
+            raise ToolError("会话尚未启动。")
+        if self._process.returncode is not None:
+            yield {"type": "stderr", "chunk": f"bash 已退出，返回码为 {self._process.returncode}"}
+            yield {"type": "done"}
+            return
+
+        effective_timeout = self._timeout if timeout is None else min(timeout, MAX_TIMEOUT)
+
+        assert self._process.stdin
+        assert self._process.stdout
+        assert self._process.stderr
+
+        async with self._lock:
+            stdin_cmd = (
+                f"timeout {effective_timeout}s bash -c {shlex.quote(command)}; "
+                f"__ec_sb=$?; "
+                f"printf '\\n{self._ec_prefix}%s\\n{self._sentinel}\\n' $__ec_sb\n"
+            )
+            self._process.stdin.write(stdin_cmd.encode())
+            await self._process.stdin.drain()
+
+            try:
+                async with asyncio.timeout(effective_timeout + 10):
+                    while True:
+                        line_bytes = await self._process.stdout.readline()
+                        if not line_bytes:
+                            break
+                        line = line_bytes.decode(errors="replace")
+                        if line.rstrip("\n") == self._sentinel:
+                            break
+                        if line.startswith(self._ec_prefix):
+                            continue
+                        yield {"type": "stdout", "chunk": line}
+            except asyncio.TimeoutError:
+                yield {"type": "stderr", "chunk": f"[命令超时 ({effective_timeout}s)]"}
+
+            # Non-blocking stderr drain after command completes
+            try:
+                async with asyncio.timeout(0.1):
+                    raw_err = await self._process.stderr.read(OUTPUT_MAX_BYTES + 1)
+                    error = raw_err.decode(errors="replace").rstrip("\n")
+                    if error:
+                        yield {"type": "stderr", "chunk": error}
+            except asyncio.TimeoutError:
+                pass
+
+            yield {"type": "done"}
+
 
 class BashTool:
     """Bash 终端工具类。
