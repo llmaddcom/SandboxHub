@@ -6,7 +6,9 @@
 - POST /api/terminal/restart: 重启终端会话
 """
 
+import json
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..tools import BashTool, ToolError
@@ -89,6 +91,22 @@ async def execute_command(request: ExecuteRequest):
         raise HTTPException(status_code=400, detail=f"终端错误: {e.message}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"执行命令失败: {str(e)}")
+
+
+@router.post("/execute/stream", summary="流式执行 bash 命令 (SSE)")
+async def execute_command_stream(request: ExecuteRequest):
+    """流式执行 bash 命令，通过 SSE 实时推送输出。
+
+    事件格式：
+      data: {"type": "stdout", "chunk": "..."}
+      data: {"type": "stderr", "chunk": "..."}
+      data: {"type": "done"}
+    """
+    async def event_gen():
+        async for event in get_bash_tool().execute_stream(request.command, request.timeout):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @router.post("/restart", response_model=RestartResponse, summary="重启终端会话")
