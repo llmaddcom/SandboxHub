@@ -11,7 +11,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from computer_use_demo.tools import ToolError
+from ..tools import ToolError
 
 # 创建屏幕操作路由，设置前缀和标签
 router = APIRouter(prefix="/api/screen", tags=["屏幕操作"])

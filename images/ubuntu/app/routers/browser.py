@@ -13,8 +13,8 @@ import shlex
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from computer_use_demo.tools import ToolError
-from computer_use_demo.tools.run import run
+from ..tools import ToolError
+from ..tools.run import run
 
 router = APIRouter(prefix="/api/browser", tags=["浏览器操作"])
 

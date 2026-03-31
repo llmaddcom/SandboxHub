@@ -15,7 +15,7 @@ from fastapi import APIRouter, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse as FastAPIFileResponse
 from pydantic import BaseModel, Field
 
-from computer_use_demo.tools import EditTool, ToolError
+from ..tools import EditTool, ToolError
 
 MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
 

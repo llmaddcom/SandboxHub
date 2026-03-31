@@ -15,7 +15,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from computer_use_demo.tools import ToolError
+from ..tools import ToolError
 
 # 创建鼠标操作路由，设置前缀和标签
 router = APIRouter(prefix="/api/mouse", tags=["鼠标操作"])

@@ -10,7 +10,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from computer_use_demo.tools import ToolError
+from ..tools import ToolError
 
 # 创建键盘操作路由，设置前缀和标签
 router = APIRouter(prefix="/api/keyboard", tags=["键盘操作"])

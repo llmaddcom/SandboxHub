@@ -9,7 +9,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from computer_use_demo.tools import BashTool, ToolError
+from ..tools import BashTool, ToolError
 
 # 创建终端操作路由，设置前缀和标签
 router = APIRouter(prefix="/api/terminal", tags=["终端操作"])

@@ -1,8 +1,8 @@
 import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from src.tools.bash import _head_tail_truncate, HEAD_BYTES, TAIL_BYTES, BashSession, BashTool
-from src.tools.base import ToolResult
+from app.tools.bash import _head_tail_truncate, HEAD_BYTES, TAIL_BYTES, BashSession, BashTool
+from app.tools.base import ToolResult
 
 
 def test_head_tail_short_text_unchanged():
@@ -174,7 +174,7 @@ async def test_bash_tool_rebuilds_session_on_process_exit():
     new_session.run = AsyncMock(return_value=ToolResult(output="ok"))
     new_session.start = AsyncMock()
 
-    with patch("src.tools.bash.BashSession", return_value=new_session):
+    with patch("app.tools.bash.BashSession", return_value=new_session):
         result = await tool.execute("echo ok")
 
     assert "重建" in (result.system or "")
