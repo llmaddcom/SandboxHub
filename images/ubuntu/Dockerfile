@@ -150,7 +150,7 @@ RUN python -m pip install --upgrade pip==23.1.2 setuptools==58.0.4 wheel==0.40.0
       -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple --trusted-host mirrors.aliyun.com && \
     python -m pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
-COPY --chown=$USERNAME:$USERNAME src/requirements.txt $HOME/computer_use_demo/requirements.txt
+COPY --chown=$USERNAME:$USERNAME app/requirements.txt $HOME/computer_use_demo/requirements.txt
 RUN python -m pip install -r $HOME/computer_use_demo/requirements.txt
 
 # ===== 10b. Node.js Playwright（pdf skill render_cover.js 使用）=====
