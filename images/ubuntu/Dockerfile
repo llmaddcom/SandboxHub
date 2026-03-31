@@ -96,8 +96,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
     echo "Node: $(node --version), npm: $(npm --version), pnpm: $(pnpm --version)"
 
 # ===== 6. 安装 noVNC =====
-RUN git clone --branch v1.5.0 https://github.com/novnc/noVNC.git /opt/noVNC && \
-    git clone --branch v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify && \
+RUN git clone --branch v1.5.0 https://gitee.com/mirrors/noVNC.git /opt/noVNC && \
+    git clone --branch v0.12.0 https://gitee.com/mirrors/websockify /opt/noVNC/utils/websockify && \
     ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html
 
 # ===== 7. 用户与权限配置 =====
@@ -128,7 +128,7 @@ USER computeruse
 RUN mkdir -p $HOME/Downloads
 
 # ===== 9. 安装 Python 环境 (Pyenv) =====
-RUN git clone https://github.com/pyenv/pyenv.git ~/.pyenv && \
+RUN git clone https://gitee.com/mirrors/pyenv.git ~/.pyenv && \
     cd ~/.pyenv && src/configure && make -C src && cd .. && \
     echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc && \
     echo 'command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc && \
