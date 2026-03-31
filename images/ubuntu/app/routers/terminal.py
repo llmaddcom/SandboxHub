@@ -103,8 +103,12 @@ async def execute_command_stream(request: ExecuteRequest):
       data: {"type": "done"}
     """
     async def event_gen():
-        async for event in get_bash_tool().execute_stream(request.command, request.timeout):
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        try:
+            async for event in get_bash_tool().execute_stream(request.command, request.timeout):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            err_event = {"type": "error", "chunk": str(e)}
+            yield f"data: {json.dumps(err_event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 

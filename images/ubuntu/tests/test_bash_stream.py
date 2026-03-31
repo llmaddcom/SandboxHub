@@ -22,7 +22,8 @@ def _make_stream_session(sentinel: str, stdout_lines: list[bytes], stderr: bytes
 
     mock_process = MagicMock()
     mock_process.returncode = None
-    mock_process.stdin = AsyncMock()
+    mock_process.stdin = MagicMock()
+    mock_process.stdin.write = MagicMock()
     mock_process.stdin.drain = AsyncMock()
     mock_process.stdout = mock_stdout
     mock_process.stderr = mock_stderr
@@ -142,7 +143,8 @@ async def test_bash_tool_execute_stream_creates_session_if_none():
         self._lock = asyncio.Lock()
         mock_proc = MagicMock()
         mock_proc.returncode = None
-        mock_proc.stdin = AsyncMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.write = MagicMock()
         mock_proc.stdin.drain = AsyncMock()
         mock_stdout = AsyncMock()
         mock_stdout.readline = AsyncMock(side_effect=[
