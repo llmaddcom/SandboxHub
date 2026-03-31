@@ -172,8 +172,8 @@ USER $USERNAME
 # 不在镜像内预编译（源码目录不在此 build context 中）。
 
 # ===== 11. 代码与入口配置 =====
-COPY --chown=$USERNAME:$USERNAME image/ $HOME
-COPY --chown=$USERNAME:$USERNAME src/ $HOME/computer_use_demo/
+COPY --chown=$USERNAME:$USERNAME scripts/ $HOME/
+COPY --chown=$USERNAME:$USERNAME app/ $HOME/computer_use_demo/
 RUN chmod +x $HOME/entrypoint.sh
 
 ARG DISPLAY_NUM=1
