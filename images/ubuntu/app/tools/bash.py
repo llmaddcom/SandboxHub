@@ -293,6 +293,28 @@ class BashTool:
 
         return await self._session.run(command, timeout=timeout)
 
+    async def execute_stream(self, command: str, timeout: float | None = None):
+        """Stream command output; yields same event dicts as BashSession.run_stream().
+
+        Auto-creates session on first call. Detects crashed session and rebuilds it,
+        yielding a warning event before streaming the command.
+        """
+        if self._session is None:
+            self._session = BashSession()
+            await self._session.start()
+
+        if self._session._started and self._session._process.returncode is not None:
+            self._session.stop()
+            self._session = BashSession()
+            await self._session.start()
+            yield {
+                "type": "stderr",
+                "chunk": "⚠️ bash session 已重建（进程崩溃）。工作目录已重置为 $HOME，环境变量已清空。",
+            }
+
+        async for event in self._session.run_stream(command, timeout=timeout):
+            yield event
+
     async def restart(self) -> ToolResult:
         """重启终端会话。
 

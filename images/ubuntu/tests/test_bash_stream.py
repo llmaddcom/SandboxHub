@@ -103,3 +103,66 @@ async def test_run_stream_yields_stderr_after_completion():
 
     stderr_events = [e for e in events if e["type"] == "stderr"]
     assert any("error message" in e["chunk"] for e in stderr_events)
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_execute_stream_delegates_to_session():
+    from app.tools.bash import BashTool
+    tool = BashTool.__new__(BashTool)
+    sentinel = "SENT_TOOL_A"
+    lines = [
+        b"result\n",
+        f"__EC{sentinel}__0\n".encode(),
+        f"{sentinel}\n".encode(),
+    ]
+    tool._session = _make_stream_session(sentinel, lines)
+
+    events = []
+    async for event in tool.execute_stream("echo result"):
+        events.append(event)
+
+    assert any(e["type"] == "stdout" and "result" in e["chunk"] for e in events)
+    assert events[-1] == {"type": "done"}
+
+
+@pytest.mark.asyncio
+async def test_bash_tool_execute_stream_creates_session_if_none():
+    from app.tools.bash import BashTool, BashSession
+    tool = BashTool()
+    assert tool._session is None
+
+    # Patch BashSession.start so we don't spawn a real process
+    original_start = BashSession.start
+
+    async def fake_start(self):
+        self._started = True
+        sentinel = "FAKE_SENTINEL"
+        self._sentinel = sentinel
+        self._ec_prefix = f"__EC{sentinel}__"
+        self._lock = asyncio.Lock()
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.stdin = AsyncMock()
+        mock_proc.stdin.drain = AsyncMock()
+        mock_stdout = AsyncMock()
+        mock_stdout.readline = AsyncMock(side_effect=[
+            b"hi\n",
+            f"__EC{sentinel}__0\n".encode(),
+            f"{sentinel}\n".encode(),
+            b"",
+        ])
+        mock_stderr = AsyncMock()
+        mock_stderr.read = AsyncMock(return_value=b"")
+        mock_proc.stdout = mock_stdout
+        mock_proc.stderr = mock_stderr
+        self._process = mock_proc
+
+    BashSession.start = fake_start
+    try:
+        events = []
+        async for event in tool.execute_stream("echo hi"):
+            events.append(event)
+        assert tool._session is not None
+        assert any(e.get("chunk", "").strip() == "hi" for e in events)
+    finally:
+        BashSession.start = original_start
