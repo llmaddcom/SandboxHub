@@ -12,6 +12,7 @@ Xvnc :${DISPLAY_NUM} \
     -geometry ${GEOMETRY} -depth 24 -dpi 96 \
     -SecurityTypes None -rfbport 5900 \
     -nolisten tcp \
+    -I-accept-the-risk-of-running-as-root \
     2>/tmp/xvnc_error.log &
 XVNC_PID=$!
 

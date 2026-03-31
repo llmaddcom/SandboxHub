@@ -1,8 +1,8 @@
 # ============================================================
-# 沙盒操作服务 Docker 镜像 (V3 优化版)
+# 沙盒操作服务 Docker 镜像 (V4 root 版)
 # 基于 Ubuntu 22.04，提供虚拟桌面环境 + FastAPI 操作接口
 # 包含：全中文环境、剪贴板双向同步、僵尸进程防范、标准文件流水线
-# 变更：TigerVNC + openbox 替代 Xvfb + mutter，Chrome 替代 Firefox
+# 变更：统一 root 用户运行，移除 computeruse，技能环境全预装
 # ============================================================
 
 FROM docker.io/ubuntu:22.04
@@ -10,9 +10,10 @@ FROM docker.io/ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DEBIAN_PRIORITY=high
 
-# ===== 1. 替换 APT 源为阿里云镜像 =====
+# ===== 1. 替换 APT 源为阿里云镜像（amd64 + arm64）=====
 RUN sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list && \
-    sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list
+    sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list && \
+    sed -i 's|http://ports.ubuntu.com/ubuntu-ports|http://mirrors.aliyun.com/ubuntu-ports|g' /etc/apt/sources.list
 
 # ===== 2. 基础工具、编译依赖与关键系统组件 =====
 RUN apt-get update && apt-get -y upgrade && \
@@ -52,7 +53,7 @@ ENV LC_ALL=zh_CN.UTF-8
 # ===== 3. 安装桌面应用程序 (LibreOffice 等，无 Firefox) =====
 RUN apt-get update && \
     apt-get -y install --no-install-recommends \
-    libreoffice x11-apps xpdf gedit xpaint tint2 galculator pcmanfm unzip && \
+    libreoffice x11-apps xpdf gedit xpaint tint2 galculator pcmanfm zip unzip && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ===== 4. 安装浏览器 (Chrome amd64 / Chromium arm64) =====
@@ -92,7 +93,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
     tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 && \
     rm -f /tmp/node.tar.xz && \
     npm config set registry https://registry.npmmirror.com && \
-    npm install -g yarn pnpm && \
+    npm install -g yarn pnpm pptxgenjs && \
     echo "Node: $(node --version), npm: $(npm --version), pnpm: $(pnpm --version)"
 
 # ===== 6. 安装 noVNC =====
@@ -100,42 +101,31 @@ RUN git clone --branch v1.5.0 https://gitee.com/mirrors/noVNC.git /opt/noVNC && 
     git clone --branch v0.12.0 https://gitee.com/mirrors/websockify /opt/noVNC/utils/websockify && \
     ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html
 
-# ===== 7. 用户与权限配置 =====
-ENV USERNAME=computeruse
-ENV HOME=/home/$USERNAME
-RUN useradd -m -s /bin/bash -d $HOME $USERNAME && \
-    echo "${USERNAME} ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+# ===== 7. 工作目录与沙盒工作区 =====
+ENV HOME=/root
+WORKDIR /root
 
 RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
-# 切换到普通用户
-USER computeruse
-WORKDIR $HOME
-
-# ===== 8. 构建标准沙盒工作区 (Workspace) =====
 # /workspace 为根级工作区，CreateRoleAPI 通过 push_to_sandbox 写入 persona/、memory/ 等文件
-# 必须由 root 创建后授权给 computeruse，否则普通用户无权在根目录建目录
-USER root
 RUN mkdir -p /workspace/persona \
              /workspace/memory \
              /workspace/session/input \
              /workspace/session/output \
              /workspace/skills \
-             /workspace/tmp && \
-    chown -R computeruse:computeruse /workspace
-USER computeruse
+             /workspace/tmp
 
-RUN mkdir -p $HOME/Downloads
+RUN mkdir -p /root/Downloads
 
-# ===== 9. 安装 Python 环境 (Pyenv) =====
-RUN git clone https://gitee.com/mirrors/pyenv.git ~/.pyenv && \
-    cd ~/.pyenv && src/configure && make -C src && cd .. && \
-    echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc && \
-    echo 'command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc && \
-    echo 'eval "$(pyenv init -)"' >> ~/.bashrc
+# ===== 8. 安装 Python 环境 (Pyenv) =====
+RUN git clone https://gitee.com/mirrors/pyenv.git /root/.pyenv && \
+    cd /root/.pyenv && src/configure && make -C src && cd .. && \
+    echo 'export PYENV_ROOT="/root/.pyenv"' >> /root/.bashrc && \
+    echo 'command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"' >> /root/.bashrc && \
+    echo 'eval "$(pyenv init -)"' >> /root/.bashrc
 
-ENV PYENV_ROOT="$HOME/.pyenv"
-ENV PATH="$PYENV_ROOT/bin:$PATH"
+ENV PYENV_ROOT="/root/.pyenv"
+ENV PATH="/root/.pyenv/bin:$PATH"
 ENV PYENV_VERSION=3.11.6
 
 RUN eval "$(pyenv init -)" && \
@@ -143,38 +133,40 @@ RUN eval "$(pyenv init -)" && \
     pyenv global $PYENV_VERSION && \
     pyenv rehash
 
-ENV PATH="$HOME/.pyenv/shims:$HOME/.pyenv/bin:$PATH"
+ENV PATH="/root/.pyenv/shims:/root/.pyenv/bin:$PATH"
 
-# ===== 10. Python 依赖安装 =====
+# ===== 9. Python 依赖安装 =====
 RUN python -m pip install --upgrade pip==23.1.2 setuptools==58.0.4 wheel==0.40.0 \
       -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple --trusted-host mirrors.aliyun.com && \
     python -m pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
-COPY --chown=$USERNAME:$USERNAME app/requirements.txt $HOME/computer_use_demo/requirements.txt
-RUN python -m pip install -r $HOME/computer_use_demo/requirements.txt
+COPY app/requirements.txt /root/computer_use_demo/requirements.txt
+RUN python -m pip install -r /root/computer_use_demo/requirements.txt
 
-# ===== 10b. Node.js Playwright（pdf skill render_cover.js 使用）=====
+# ===== 9b. Node.js Playwright（pdf skill render_cover.js 使用）=====
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/ms-playwright
-USER root
 RUN npm install -g playwright && \
     PLAYWRIGHT_BROWSERS_PATH=/usr/local/ms-playwright npx playwright install chromium --with-deps && \
     chmod -R a+rx /usr/local/ms-playwright
-USER $USERNAME
 
-# ===== 10c. .NET 8.0 SDK（docx skill，运行时编译）=====
-USER root
+# ===== 9c. .NET 8.0 SDK（docx skill，运行时编译）=====
 RUN curl -fsSL https://dot.net/v1/dotnet-install.sh \
       | bash -s -- --channel 8.0 --install-dir /usr/local/dotnet && \
     ln -sf /usr/local/dotnet/dotnet /usr/local/bin/dotnet
 ENV PATH="/usr/local/dotnet:$PATH"
-USER $USERNAME
-# docx skill（MiniMaxAIDocx.Cli）在首次运行时从 /workspace/skills/docx/scripts/dotnet/ 编译，
-# 不在镜像内预编译（源码目录不在此 build context 中）。
 
-# ===== 11. 代码与入口配置 =====
-COPY --chown=$USERNAME:$USERNAME scripts/ $HOME/
-COPY --chown=$USERNAME:$USERNAME app/ $HOME/computer_use_demo/
-RUN chmod +x $HOME/entrypoint.sh
+# ===== 9d. 预热 NuGet 缓存（docx skill：DocumentFormat.OpenXml + System.CommandLine）=====
+# root 用户 restore，缓存落在 /root/.nuget/packages/，运行时直接命中本地缓存
+RUN mkdir -p /tmp/nuget-warmup && \
+    printf '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n  <ItemGroup>\n    <PackageReference Include="DocumentFormat.OpenXml" Version="3.5.1" />\n    <PackageReference Include="System.CommandLine" Version="2.0.5" />\n  </ItemGroup>\n</Project>\n' \
+      > /tmp/nuget-warmup/warmup.csproj && \
+    dotnet restore /tmp/nuget-warmup/warmup.csproj && \
+    rm -rf /tmp/nuget-warmup
+
+# ===== 10. 代码与入口配置 =====
+COPY scripts/ /root/
+COPY app/ /root/computer_use_demo/
+RUN chmod +x /root/entrypoint.sh
 
 ARG DISPLAY_NUM=1
 ARG HEIGHT=768

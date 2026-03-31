@@ -48,15 +48,25 @@ class ContainerManager:
         return f"cr-sb-warm-{sandbox_type}-{slot}-{uuid.uuid4().hex[:6]}"
 
     def _build_container_env(self) -> dict:
-        proxy = settings.SANDBOX_HTTP_PROXY
-        if not proxy:
-            return {}
-        return {
-            "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy,
-            "http_proxy": proxy, "https_proxy": proxy,
-            "NO_PROXY": "localhost,127.0.0.1,172.16.0.0/12,10.0.0.0/8",
-            "no_proxy": "localhost,127.0.0.1,172.16.0.0/12,10.0.0.0/8",
+        # TERM=dumb / PAGER=cat 防止 ANSI 颜色码和交互式分页器污染 LLM 输出
+        # 参考 OpenAI Codex unified_exec 的环境变量设计
+        env = {
+            "TERM": "dumb",
+            "NO_COLOR": "1",
+            "PAGER": "cat",
+            "GIT_PAGER": "cat",
+            "GH_PAGER": "cat",
+            "DEBIAN_FRONTEND": "noninteractive",  # apt install 静默模式
         }
+        proxy = settings.SANDBOX_HTTP_PROXY
+        if proxy:
+            env.update({
+                "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy,
+                "http_proxy": proxy, "https_proxy": proxy,
+                "NO_PROXY": "localhost,127.0.0.1,172.16.0.0/12,10.0.0.0/8",
+                "no_proxy": "localhost,127.0.0.1,172.16.0.0/12,10.0.0.0/8",
+            })
+        return env
 
     # ── Docker 操作（同步，供 to_thread 调用） ────────────────────────────────
 
@@ -79,7 +89,9 @@ class ContainerManager:
             network=settings.SANDBOX_NETWORK,
             shm_size="2g",
             security_opt=["seccomp=unconfined"],
-            dns=["8.8.8.8", "114.114.114.114"],
+            dns=["202.96.209.5", "114.114.114.114"],
+            # 本机 UDP 53 被防火墙拦截，强制使用 TCP DNS
+            dns_opt=["use-vc"],
             environment=self._build_container_env(),
             labels={
                 settings.CONTAINER_LABEL: "true",

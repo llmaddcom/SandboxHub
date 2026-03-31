@@ -12,3 +12,5 @@ pandas>=2.0.0
 reportlab>=4.0.0
 matplotlib>=3.7.0
 Pillow>=10.0.0
+pypdf>=3.0.0
+markitdown[pptx]>=0.1.0
