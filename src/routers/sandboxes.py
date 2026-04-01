@@ -2,9 +2,10 @@
 """
 沙盒生命周期路由
 
-职责：暴露 acquire/release/status/list 接口。
+职责：暴露 acquire/release/status/list/ping 接口。
 acquire 优先复用已有 sandbox，其次从 warm pool 取，最后冷启动兜底。
 release 触发后台清理，立即返回 ok。
+ping 提供浅检查（registry 状态）和深检查（TCP 可达性）两种健康检查模式。
 """
 from __future__ import annotations
 
@@ -51,6 +52,13 @@ class StatusResponse(BaseModel):
     status: str
     container_ip: str
     acquired_at: str
+
+
+class PingResponse(BaseModel):
+    ok: bool
+    status: str
+    container_ip: str
+    reachable: Optional[bool] = None
 
 
 # ── 接口 ──────────────────────────────────────────────────────────────────────
@@ -123,13 +131,6 @@ async def get_status(sandbox_id: str) -> StatusResponse:
     )
 
 
-class PingResponse(BaseModel):
-    ok: bool
-    status: str
-    container_ip: str
-    reachable: Optional[bool] = None
-
-
 @router.get("/{sandbox_id}/ping", response_model=PingResponse, response_model_exclude_none=True)
 async def ping_sandbox(sandbox_id: str, deep: bool = False) -> PingResponse:
     """
@@ -144,7 +145,7 @@ async def ping_sandbox(sandbox_id: str, deep: bool = False) -> PingResponse:
 
     ip = record.container_info.container_ip
     if not deep:
-        return PingResponse(ok=True, status=record.status, container_ip=ip)
+        return PingResponse(ok=record.status == "ready", status=record.status, container_ip=ip)
 
     reachable = await _container_manager.is_healthy(ip)
     return PingResponse(ok=reachable, status=record.status, container_ip=ip, reachable=reachable)
