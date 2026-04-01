@@ -9,7 +9,7 @@ release 触发后台清理，立即返回 ok。
 from __future__ import annotations
 
 import asyncio
-from typing import Literal
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from loguru import logger
@@ -121,6 +121,33 @@ async def get_status(sandbox_id: str) -> StatusResponse:
         container_ip=record.container_info.container_ip,
         acquired_at=record.acquired_at.isoformat(),
     )
+
+
+class PingResponse(BaseModel):
+    ok: bool
+    status: str
+    container_ip: str
+    reachable: Optional[bool] = None
+
+
+@router.get("/{sandbox_id}/ping", response_model=PingResponse, response_model_exclude_none=True)
+async def ping_sandbox(sandbox_id: str, deep: bool = False) -> PingResponse:
+    """
+    检查沙盒健康状态。
+
+    deep=false（默认）：浅检查，仅查询 registry 是否存在且 status=ready。
+    deep=true：在浅检查基础上，TCP 探测容器 API 端口是否可达。
+    """
+    record = await _registry.get(sandbox_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"sandbox {sandbox_id!r} not found")
+
+    ip = record.container_info.container_ip
+    if not deep:
+        return PingResponse(ok=True, status=record.status, container_ip=ip)
+
+    reachable = await _container_manager.is_healthy(ip)
+    return PingResponse(ok=reachable, status=record.status, container_ip=ip, reachable=reachable)
 
 
 @router.get("")
