@@ -3,11 +3,17 @@
 
 接口列表：
 - GET  /api/system/health: 健康检查
+- GET  /api/system/env: 运行时环境/工具链信息（语言版本、CLI、工作区）
 - POST /api/system/wait: 等待指定时间后截图
 - GET  /api/system/clipboard: 获取剪贴板内容
 - POST /api/system/clipboard: 设置剪贴板内容
 - GET  /api/system/info: 获取系统信息
 """
+
+import asyncio
+import os
+import platform
+import sys
 
 import psutil
 from fastapi import APIRouter, HTTPException
@@ -64,6 +70,18 @@ class ClipboardSetResponse(BaseModel):
     message: str = Field(description="操作结果信息")
 
 
+class EnvInfoResponse(BaseModel):
+    success: bool = Field(description="是否获取成功")
+    profile: str = Field(description="当前沙盒 profile（code / desktop）")
+    platform: str = Field(description="操作系统平台信息")
+    python_version: str = Field(description="Python 版本")
+    workspace: str = Field(description="工作区路径")
+    workspace_writable: bool = Field(description="工作区是否可写")
+    tools: dict[str, str | None] = Field(
+        description="已安装命令行工具的版本（缺失则为 null），如 node/npm/pnpm/git/rg",
+    )
+
+
 class SystemInfoResponse(BaseModel):
     success: bool = Field(description="是否获取成功")
     cpu_count: int = Field(description="CPU 核心数")
@@ -84,6 +102,57 @@ async def health_check():
     return HealthResponse(
         status="healthy",
         message="沙盒操作服务运行正常",
+    )
+
+
+# 探测命令行工具版本：cmd -> 取版本的命令（多取首行，避免多行噪声污染）
+_TOOL_VERSION_CMDS: dict[str, str] = {
+    "node": "node --version",
+    "npm": "npm --version",
+    "pnpm": "pnpm --version",
+    "yarn": "yarn --version",
+    "git": "git --version",
+    "rg": "rg --version",
+    "rclone": "rclone version",
+    "pip": "pip --version",
+}
+
+
+async def _probe_version(cmd: str) -> str | None:
+    """运行版本命令，成功取首行非空输出，失败/缺失返回 None。"""
+    try:
+        code, stdout, _ = await run(cmd, timeout=5.0)
+    except Exception:
+        return None
+    if code != 0:
+        return None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return None
+
+
+@router.get("/env", response_model=EnvInfoResponse, summary="运行时环境/工具链信息")
+async def get_env_info():
+    """返回沙盒运行时环境：profile、语言版本、已装 CLI 工具版本与工作区可写性。
+
+    供编码 Agent 在执行任务前自检环境（参考 opencode/codex 的环境探测），
+    避免对不存在的工具发起调用。所有版本探测均为 best-effort，缺失工具返回 null。
+    """
+    workspace = os.getenv("SANDBOX_WORKSPACE", "/workspace")
+    versions = await asyncio.gather(
+        *(_probe_version(cmd) for cmd in _TOOL_VERSION_CMDS.values())
+    )
+    tools = dict(zip(_TOOL_VERSION_CMDS.keys(), versions))
+    return EnvInfoResponse(
+        success=True,
+        profile=os.getenv("SANDBOX_PROFILE", "desktop"),
+        platform=platform.platform(),
+        python_version=sys.version.split()[0],
+        workspace=workspace,
+        workspace_writable=os.path.isdir(workspace) and os.access(workspace, os.W_OK),
+        tools=tools,
     )
 
 

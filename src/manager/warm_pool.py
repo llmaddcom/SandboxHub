@@ -43,7 +43,13 @@ class WarmPool:
         清理容器 workspace 并重置 bash session，完成后归还到池。
         调用方 await 此方法，清理完成才返回。
         router 层如需非阻塞，应使用 asyncio.create_task(pool.release(...))。
+
+        挂载容器例外：它是角色专属、且 /workspace 是 MinIO 实时挂载——绝不能 rm -rf
+        （会删 MinIO 数据），也不能归还共享 pool（跨租户串台）。故先卸载再销毁。
         """
+        if container_info.mounted:
+            await self._destroy_mounted(container_info)
+            return
         try:
             await self._manager.clean_and_reset(container_info.container_ip)
             # 关闭上一租户的连接池，防止跨租户连接复用
@@ -63,6 +69,22 @@ class WarmPool:
             except Exception:
                 pass
             await self._manager.remove_container(container_info.container_id)
+
+    async def _destroy_mounted(self, container_info: ContainerInfo) -> None:
+        """卸载工作区挂载并销毁容器（挂载容器不入池）。失败只记 warning，仍尽力销毁。"""
+        try:
+            await self._manager.unmount_workspace(
+                container_info.container_id, container_info.mount_path
+            )
+        except Exception as e:
+            logger.warning(f"卸载工作区失败（继续销毁）| ip={container_info.container_ip} | err={e}")
+        try:
+            from src.proxy.forwarder import close_client
+            await close_client(container_info.container_ip)
+        except Exception:
+            pass
+        await self._manager.remove_container(container_info.container_id)
+        logger.info(f"挂载容器已销毁 | ip={container_info.container_ip}")
 
     async def ensure_pool(self, sandbox_type: SandboxType) -> None:
         """
@@ -112,7 +134,7 @@ class WarmPool:
         """
         while True:
             await asyncio.sleep(settings.POOL_MAINTAIN_INTERVAL)
-            for sandbox_type in ("ubuntu",):
+            for sandbox_type in settings.sandbox_types:
                 target = settings.pool_size_for_type(sandbox_type)
                 if target > 0:
                     await self._refill(sandbox_type, target)

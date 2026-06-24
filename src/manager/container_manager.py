@@ -17,7 +17,10 @@ import httpx
 from loguru import logger
 
 from src.config import settings
-from src.models import ContainerInfo, SandboxType
+from src.models import ContainerInfo, SandboxType, WorkspaceMount
+
+# 挂载容器标签：用于启动恢复时识别并清理孤儿挂载容器（其 registry 映射在重启后已丢失）。
+_MOUNTED_LABEL = "sandboxhub.mounted"
 
 
 class ContainerManager:
@@ -47,7 +50,10 @@ class ContainerManager:
     def _build_warm_name(self, sandbox_type: str, slot: int) -> str:
         return f"cr-sb-warm-{sandbox_type}-{slot}-{uuid.uuid4().hex[:6]}"
 
-    def _build_container_env(self) -> dict:
+    def _build_mounted_name(self, sandbox_type: str) -> str:
+        return f"cr-sb-mnt-{sandbox_type}-{uuid.uuid4().hex[:8]}"
+
+    def _build_container_env(self, sandbox_type: SandboxType) -> dict:
         # TERM=dumb / PAGER=cat 防止 ANSI 颜色码和交互式分页器污染 LLM 输出
         # 参考 OpenAI Codex unified_exec 的环境变量设计
         env = {
@@ -58,8 +64,11 @@ class ContainerManager:
             "GH_PAGER": "cat",
             "DEBIAN_FRONTEND": "noninteractive",  # apt install 静默模式
         }
+        # 代理只注入桌面镜像（ubuntu）：它跑 Chrome 等需经宿主代理出网。轻量 code 镜像
+        # 直连网络，注入指向 host.docker.internal:8118 的代理反而会让其出网失败（宿主无该代理
+        # 或容器到宿主不可达），故 code 一律不注入代理。
         proxy = settings.SANDBOX_HTTP_PROXY
-        if proxy:
+        if proxy and sandbox_type != "code":
             env.update({
                 "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy,
                 "http_proxy": proxy, "https_proxy": proxy,
@@ -70,10 +79,18 @@ class ContainerManager:
 
     # ── Docker 操作（同步，供 to_thread 调用） ────────────────────────────────
 
-    def _run_container_sync(self, sandbox_type: SandboxType, name: str) -> tuple[str, str]:
+    def _run_container_sync(
+        self,
+        sandbox_type: SandboxType,
+        name: str,
+        workspace: Optional[WorkspaceMount] = None,
+    ) -> tuple[str, str]:
         """
         docker run，等待 IP，返回 (container_id, container_ip)。
         同步方法，在 asyncio.to_thread 中调用。
+
+        ``workspace`` 非空时，容器额外获得 FUSE 能力（``SYS_ADMIN`` + ``/dev/fuse``）以便
+        容器内 rclone 挂载 MinIO，并打上挂载标签供启动恢复识别。
         """
         image = settings.image_for_type(sandbox_type)
         # 清理同名残留
@@ -82,22 +99,42 @@ class ContainerManager:
         except docker.errors.NotFound:
             pass
 
-        container = self._docker.containers.run(
-            image,
+        labels = {
+            settings.CONTAINER_LABEL: "true",
+            "sandboxhub.type": sandbox_type,
+        }
+        if workspace is not None:
+            labels[_MOUNTED_LABEL] = "true"
+
+        run_kwargs = dict(
+            image=image,
             detach=True,
             name=name,
             network=settings.SANDBOX_NETWORK,
             shm_size="2g",
-            security_opt=["seccomp=unconfined"],
-            dns=["202.96.209.5", "114.114.114.114"],
-            # 本机 UDP 53 被防火墙拦截，强制使用 TCP DNS
-            dns_opt=["use-vc"],
-            environment=self._build_container_env(),
-            labels={
-                settings.CONTAINER_LABEL: "true",
-                "sandboxhub.type": sandbox_type,
-            },
+            # 让容器用 host.docker.internal 指向宿主，代理 URL 不必写死网段
+            extra_hosts={"host.docker.internal": "host-gateway"},
+            environment=self._build_container_env(sandbox_type),
+            labels=labels,
         )
+        # 桌面镜像跑 Chrome 需放开 seccomp；轻量 code 镜像无此需求，保持默认 seccomp
+        security_opt: list[str] = []
+        if sandbox_type == "ubuntu":
+            security_opt.append("seccomp=unconfined")
+        # 工作区挂载：容器内 rclone 需 FUSE。SYS_ADMIN + /dev/fuse + 放开 apparmor。
+        if workspace is not None:
+            run_kwargs["cap_add"] = ["SYS_ADMIN"]
+            run_kwargs["devices"] = ["/dev/fuse:/dev/fuse:rwm"]
+            security_opt.append("apparmor:unconfined")
+        if security_opt:
+            run_kwargs["security_opt"] = security_opt
+        # 自定义 DNS（可选）。use-vc 强制 TCP DNS，应对宿主 UDP 53 被拦截
+        dns = settings.dns_servers()
+        if dns:
+            run_kwargs["dns"] = dns
+            run_kwargs["dns_opt"] = ["use-vc"]
+
+        container = self._docker.containers.run(**run_kwargs)
 
         # 等待 IP 分配（最多 30s）
         deadline = time.time() + 30
@@ -147,6 +184,7 @@ class ContainerManager:
                         "container_name": c.name,
                         "container_ip": ip,
                         "sandbox_type": c.labels.get("sandboxhub.type", "ubuntu"),
+                        "mounted": c.labels.get(_MOUNTED_LABEL) == "true",
                     })
                 except RuntimeError:
                     continue
@@ -157,26 +195,127 @@ class ContainerManager:
 
     # ── 异步公开接口 ──────────────────────────────────────────────────────────
 
-    async def run_container(self, sandbox_type: SandboxType, slot: int = 0) -> ContainerInfo:
+    async def run_container(
+        self,
+        sandbox_type: SandboxType,
+        slot: int = 0,
+        workspace: Optional[WorkspaceMount] = None,
+    ) -> ContainerInfo:
         """
         启动新容器，等待健康检查，返回 ContainerInfo。
         冷启动路径，在 asyncio.to_thread 中执行 Docker 操作。
+
+        ``workspace`` 非空时：容器带 FUSE 能力启动，健康后在容器内用 rclone 把
+        MinIO ``bucket/prefix`` 挂到 ``mount_path``；挂载失败即销毁容器并抛错。
         """
-        name = self._build_warm_name(sandbox_type, slot)
+        mounted = workspace is not None
+        name = (
+            self._build_mounted_name(sandbox_type)
+            if mounted
+            else self._build_warm_name(sandbox_type, slot)
+        )
         container_id, ip = await asyncio.to_thread(
-            self._run_container_sync, sandbox_type, name
+            self._run_container_sync, sandbox_type, name, workspace
         )
         # 等待 API 就绪
         if not await self.wait_healthy(ip):
             await asyncio.to_thread(self._stop_and_remove_sync, container_id)
             raise RuntimeError(f"容器健康检查超时 | name={name}")
-        logger.info(f"容器就绪 | name={name} | ip={ip}")
+
+        if mounted:
+            try:
+                await self.mount_workspace(container_id, workspace)
+            except Exception as e:
+                # 挂载失败不可降级为「无挂载容器」：会让容器内写入丢失、createrole 读不到。
+                await asyncio.to_thread(self._stop_and_remove_sync, container_id)
+                raise RuntimeError(f"工作区挂载失败 | name={name} | err={e}")
+
+        logger.info(
+            f"容器就绪 | name={name} | ip={ip}"
+            + (f" | mounted={workspace.bucket}/{workspace.prefix}" if mounted else "")
+        )
         return ContainerInfo(
             container_id=container_id,
             container_name=name,
             container_ip=ip,
             sandbox_type=sandbox_type,
+            mounted=mounted,
+            mount_path=workspace.mount_path if mounted else "/workspace",
         )
+
+    # ── 工作区挂载（容器内 rclone over MinIO/S3）─────────────────────────────
+
+    async def mount_workspace(self, container_id: str, workspace: WorkspaceMount) -> None:
+        """在容器内用 rclone 把 MinIO bucket/prefix 实时挂到 mount_path，并等待挂载就绪。"""
+        await asyncio.to_thread(self._mount_workspace_sync, container_id, workspace)
+        if not await self._wait_mounted(container_id, workspace.mount_path):
+            raise RuntimeError(f"挂载点未就绪 | path={workspace.mount_path}")
+
+    def _mount_workspace_sync(self, container_id: str, workspace: WorkspaceMount) -> None:
+        """启动容器内 rclone mount（后台进程）。同步方法，在 asyncio.to_thread 中调用。
+
+        rclone 的 S3(MinIO) remote 经 ``RCLONE_CONFIG_MINIO_*`` 环境变量内联，凭据不落盘。
+        ``--vfs-cache-mode writes`` + 短 ``--vfs-write-back`` 使文件关闭后近实时回写 MinIO；
+        ``--dir-cache-time`` 短使 MinIO 侧新增对象较快在容器内可见。容器与 rclone 均 root，
+        无需 ``--allow-other``。
+        """
+        container = self._docker.containers.get(container_id)
+        mount_path = workspace.mount_path
+        remote = f"minio:{workspace.bucket}/{workspace.prefix}".rstrip("/")
+        cmd = (
+            f"mkdir -p {mount_path} && "
+            f"rclone mount {remote} {mount_path} "
+            f"--vfs-cache-mode {settings.RCLONE_VFS_CACHE_MODE} "
+            f"--vfs-write-back {settings.RCLONE_VFS_WRITE_BACK} "
+            f"--dir-cache-time {settings.RCLONE_DIR_CACHE_TIME} "
+            f"--poll-interval {settings.RCLONE_DIR_CACHE_TIME} "
+            f"--log-level INFO --log-file /tmp/rclone-mount.log"
+        )
+        # detach=True：rclone 作为容器内常驻前台进程后台运行；不退出即维持挂载。
+        container.exec_run(
+            cmd=["/bin/sh", "-lc", cmd],
+            environment=settings.minio_rclone_env(),
+            detach=True,
+            privileged=False,
+        )
+
+    async def _wait_mounted(self, container_id: str, mount_path: str) -> bool:
+        """轮询 ``mountpoint -q`` 直到挂载点就绪或超时。"""
+        for _ in range(settings.MOUNT_READY_RETRIES):
+            ok = await asyncio.to_thread(self._is_mountpoint_sync, container_id, mount_path)
+            if ok:
+                return True
+            await asyncio.sleep(settings.MOUNT_READY_INTERVAL)
+        return False
+
+    def _is_mountpoint_sync(self, container_id: str, mount_path: str) -> bool:
+        try:
+            container = self._docker.containers.get(container_id)
+            res = container.exec_run(cmd=["/bin/sh", "-lc", f"mountpoint -q {mount_path}"])
+            return res.exit_code == 0
+        except Exception:
+            return False
+
+    def _unmount_workspace_sync(self, container_id: str, mount_path: str) -> None:
+        """卸载容器内 rclone 挂载（销毁容器前调用，避免误把 MinIO 数据当本地文件清理）。"""
+        try:
+            container = self._docker.containers.get(container_id)
+            container.exec_run(
+                cmd=[
+                    "/bin/sh", "-lc",
+                    # fuse3 提供 fusermount3；兼容 fuse(v2) 的 fusermount 与 umount 兜底。
+                    f"fusermount3 -u {mount_path} 2>/dev/null || "
+                    f"fusermount -u {mount_path} 2>/dev/null || "
+                    f"umount {mount_path} 2>/dev/null || true",
+                ],
+            )
+        except docker.errors.NotFound:
+            pass
+        except Exception as e:
+            logger.warning(f"卸载工作区失败（容器仍将销毁）| id={container_id} | err={e}")
+
+    async def unmount_workspace(self, container_id: str, mount_path: str) -> None:
+        await asyncio.to_thread(self._unmount_workspace_sync, container_id, mount_path)
 
     async def remove_container(self, container_id: str) -> None:
         """异步删除容器。"""
@@ -225,6 +364,17 @@ class ContainerManager:
             logger.warning(f"clean_and_reset 失败 | ip={container_ip} | err={e}")
 
     def recover_running_containers(self) -> list[ContainerInfo]:
-        """应用启动时从 Docker 恢复运行中的受管容器。"""
+        """应用启动时从 Docker 恢复运行中的受管容器。
+
+        仅恢复**未挂载**的 warm 容器到 pool；挂载容器是角色专属、其 registry 映射在重启后
+        已丢失，且 pool 复用会造成跨租户串台，故视为孤儿就地销毁，不返回。
+        """
         raw = self._list_managed_sync()
-        return [ContainerInfo(**r) for r in raw]
+        recovered: list[ContainerInfo] = []
+        for r in raw:
+            if r.pop("mounted", False):
+                logger.info(f"清理孤儿挂载容器 | name={r['container_name']}")
+                self._stop_and_remove_sync(r["container_id"])
+                continue
+            recovered.append(ContainerInfo(**r))
+        return recovered

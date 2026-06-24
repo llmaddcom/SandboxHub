@@ -20,7 +20,7 @@ from fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
 from .routers.browser_cdp import _get_page as _cdp_get_page, _get_op_lock as _cdp_get_op_lock
-from .tools import BashTool, ComputerTool, EditTool
+from .tools import BashTool, ComputerTool, EditTool, MatchError
 from .tools.run import run
 
 mcp = FastMCP("Ubuntu Sandbox MCP")
@@ -297,18 +297,26 @@ async def write_file(path: str, content: str) -> str:
 
 
 @mcp.tool
-async def edit_file(path: str, old_text: str, new_text: str) -> str:
+async def edit_file(
+    path: str, old_text: str, new_text: str, replace_all: bool = False
+) -> str:
     """通过字符串替换编辑文件。
 
-    在文件中查找 old_text 并替换为 new_text。old_text 必须在文件中唯一。
+    在文件中查找 old_text 并替换为 new_text，采用多级容错匹配（容忍行尾空白、
+    缩进、花引号等细微差异）。默认要求 old_text 唯一命中；命中多处时可设
+    replace_all=True 全部替换。
 
     Args:
         path: 文件的绝对路径
-        old_text: 要被替换的原始文本（必须在文件中唯一出现）
+        old_text: 要被替换的原始文本（默认必须唯一命中）
         new_text: 替换后的新文本
+        replace_all: 是否替换全部匹配，默认 False
     """
     edit = _get_edit()
-    result = await edit.str_replace(path, old_text, new_text)
+    try:
+        result = await edit.str_replace(path, old_text, new_text, replace_all)
+    except MatchError as e:
+        return f"编辑失败（{e.reason}）：{e.detail}"
     return result.output or result.error or ""
 
 

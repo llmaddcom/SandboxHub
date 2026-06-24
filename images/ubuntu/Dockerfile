@@ -24,7 +24,7 @@ RUN apt-get update && apt-get -y upgrade && \
     dumb-init \
     # --- 虚拟桌面与 VNC (TigerVNC 替代 Xvfb + x11vnc) ---
     tigervnc-standalone-server \
-    xterm xdotool scrot imagemagick \
+    xterm xdotool scrot imagemagick x11-utils \
     openbox \
     # --- 剪贴板修复 (解决 noVNC 无法复制粘贴) ---
     autocutsel xclip \
@@ -39,7 +39,9 @@ RUN apt-get update && apt-get -y upgrade && \
     libreadline-dev libsqlite3-dev libncursesw5-dev \
     xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev \
     # --- 网络工具 ---
-    net-tools netcat && \
+    net-tools netcat \
+    # --- 工作区 MinIO 挂载（容器内 rclone mount 需 fusermount3 与 /dev/fuse）---
+    rclone fuse3 && \
     # 生成并设置中文 locale
     locale-gen zh_CN.UTF-8 && \
     update-locale LANG=zh_CN.UTF-8 && \
@@ -111,14 +113,6 @@ WORKDIR /root
 
 RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
-# /workspace 为根级工作区，CreateRoleAPI 通过 push_to_sandbox 写入 persona/、memory/ 等文件
-RUN mkdir -p /workspace/persona \
-             /workspace/memory \
-             /workspace/session/input \
-             /workspace/session/output \
-             /workspace/skills \
-             /workspace/tmp
-
 RUN mkdir -p /root/Downloads
 
 # ===== 8. 安装 Python 环境 (Pyenv) =====
@@ -171,6 +165,9 @@ RUN mkdir -p /tmp/nuget-warmup && \
 COPY scripts/ /root/
 COPY app/ /root/computer_use_demo/
 RUN chmod +x /root/entrypoint.sh
+
+# profile=desktop：加载完整 GUI 路由（screen/mouse/keyboard/browser/CDP）
+ENV SANDBOX_PROFILE=desktop
 
 ARG DISPLAY_NUM=1
 ARG HEIGHT=768

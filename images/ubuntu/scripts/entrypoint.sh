@@ -16,14 +16,14 @@ echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee /etc/resolv.conf > /
 ./novnc_startup.sh
 
 # 3. 后台启动 Chrome CDP
-# --use-gl=swiftshader: 强制软件渲染（Docker 无 GPU，SwiftShader 是唯一可靠路径）
-# --in-process-gpu: GPU 线程内嵌主进程，消除跨进程 IPC 故障点
-# 移除 --disable-gpu + --disable-software-rasterizer（两者叠加导致无渲染后端，IPC 阻塞）
+# --use-gl=angle --use-angle=swiftshader: Chrome 120+ 废弃了 --use-gl=swiftshader，
+#   现在必须通过 ANGLE 后端使用 SwiftShader（软件渲染），否则 GL factory 找不到实现直接崩溃
+# --user-data-dir: 避免 DevTools remote debugging 要求非默认数据目录的警告
 _start_chrome() {
     DISPLAY=:${DISPLAY_NUM} google-chrome-stable \
         --no-sandbox --disable-dev-shm-usage \
-        --use-gl=swiftshader \
-        --in-process-gpu \
+        --use-gl=angle --use-angle=swiftshader \
+        --user-data-dir=/tmp/chrome-user-data \
         --remote-debugging-port=9222 \
         --window-size=${WIDTH},${HEIGHT} \
         --no-first-run --no-default-browser-check \

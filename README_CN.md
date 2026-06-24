@@ -14,6 +14,7 @@ SandboxHub 包含两个组件，共同维护在本 monorepo 中：
 |------|------|------|
 | **编排层** | `src/` | 管理容器生命周期 — 预热池、acquire/release、HTTP 代理 |
 | **Ubuntu 镜像** | `images/ubuntu/` | Ubuntu 22.04 沙盒 — 虚拟桌面、FastAPI 工具接口、MCP 服务 |
+| **Code 镜像** | `images/code/` | 无 GUI 轻量沙盒 — Python + Node 工具链、开发/办公库，仅终端/文件/系统/进程接口，秒级冷启动 |
 
 ```
 LLM Agent
@@ -49,10 +50,41 @@ SandboxHub 在此基础上新增：
 ### 1. 构建沙盒镜像
 
 ```bash
+# 完整桌面镜像（GUI + 浏览器 + 技能）
 docker build -t sandbox-ubuntu:latest images/ubuntu/
+
+# 轻量无 GUI 的 code 镜像（Python + Node + 开发/办公库）
+# 构建上下文为 images/（复用 ubuntu/app 代码），故必须 -f 指定 Dockerfile 并以 images 为上下文：
+docker build -f images/code/Dockerfile -t sandbox-code:latest images
 ```
 
-> **国内网络说明：** Dockerfile 已配置阿里云 APT 镜像、TUNA pip 镜像，以及 noVNC/pyenv 的 Gitee 镜像，构建无需代理。
+> **国内网络说明：** 两个 Dockerfile 均已配置国内镜像 —— APT/pip 用 TUNA、Node/npm 用 npmmirror，APT/pip/npm 安装无需代理。
+> **code** 镜像可在墙内全程无代理构建；**ubuntu** 镜像还需从境外拉取以下资源（建议代理）：
+> - Google Chrome / Chromium（arm64）
+> - noVNC、websockify（GitHub）
+> - pyenv（GitHub）
+
+> **Code 镜像工具链：** Python 3.11 + Node 20（yarn/pnpm）、`git`/`ripgrep`/`jq`/`vim`、build-essential，以及日常 Python 库（pandas、openpyxl、python-docx/pptx、reportlab、pypdf、matplotlib、markitdown…）。Agent 可在运行时通过 `GET /api/system/env` 自检环境。
+
+#### 使用代理构建
+
+若本机已运行 v2ray/clash 等代理（HTTP 代理监听 `127.0.0.1:8118`），使用 `--network host` 让构建容器直接访问宿主机代理：
+
+```bash
+# 代理配置（按实际调整）
+PROXY_HOST="127.0.0.1"
+HTTP_PORT="8118"
+HTTP_PROXY_URL="http://${PROXY_HOST}:${HTTP_PORT}"
+
+docker build --network host \
+  --build-arg HTTP_PROXY=${HTTP_PROXY_URL} \
+  --build-arg HTTPS_PROXY=${HTTP_PROXY_URL} \
+  --build-arg http_proxy=${HTTP_PROXY_URL} \
+  --build-arg https_proxy=${HTTP_PROXY_URL} \
+  -t sandbox-ubuntu:latest images/ubuntu/
+```
+
+> `--network host` 使构建阶段的 `RUN` 命令与宿主机共享网络栈，从而能访问 `127.0.0.1` 上监听的本地代理。
 
 ### 2. 安装并配置 SandboxHub
 

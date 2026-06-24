@@ -16,6 +16,9 @@ from fastapi import APIRouter, HTTPException
 from loguru import logger
 from pydantic import BaseModel
 
+from src.config import settings
+from src.models import WorkspaceMount
+
 router = APIRouter(prefix="/v1/sandboxes")
 
 # 依赖注入（app 启动后通过 set_* 注入）
@@ -33,10 +36,20 @@ def set_dependencies(registry, warm_pool, container_manager) -> None:
 
 # ── 请求/响应模型 ──────────────────────────────────────────────────────────────
 
+class WorkspaceSpec(BaseModel):
+    """acquire 可选的工作区挂载诉求：把 MinIO bucket/prefix 实时挂进容器 mount_path。"""
+    bucket: str
+    prefix: str
+    mount_path: str = "/workspace"
+
+
 class AcquireRequest(BaseModel):
     user_id: str
     role_id: str
-    sandbox_type: Literal["ubuntu"] = "ubuntu"
+    sandbox_type: Literal["ubuntu", "code"] = "ubuntu"
+    # 可选：携带则请求把该角色云盘挂进容器（见 WorkspaceSpec）。createrole 在开启挂载
+    # 开关时随每次 acquire 下发；SandboxHub 缺凭据/总开关关闭时记 warning 并回退为不挂载。
+    workspace: Optional[WorkspaceSpec] = None
 
 
 class AcquireResponse(BaseModel):
@@ -73,16 +86,46 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
     3. 兜底：冷启动新容器
     后台异步补充 pool，不阻塞返回。
     """
-    # 1. 复用
+    # 1. 复用（已分配的容器，无论挂载与否，直接复用——挂载随容器持续存在）
     existing = await _registry.find_active(req.user_id, req.role_id)
     if existing:
         logger.debug(f"复用 sandbox | id={existing.sandbox_id} | user={req.user_id}")
         return AcquireResponse(sandbox_id=existing.sandbox_id, status="ready")
 
-    # 2. warm pool
-    container = await _warm_pool.acquire(req.sandbox_type)
+    # 2. 决定是否挂载工作区。请求带 workspace 但本服务无挂载能力（开关关/缺 MinIO 凭据）
+    #    时记 warning 并回退为不挂载，避免因配置缺失而让终端整体不可用。
+    workspace = None
+    if req.workspace is not None:
+        if settings.mount_ready:
+            workspace = WorkspaceMount(
+                bucket=req.workspace.bucket,
+                prefix=req.workspace.prefix,
+                mount_path=req.workspace.mount_path,
+            )
+        else:
+            logger.warning(
+                "请求工作区挂载但本服务未就绪（WORKSPACE_MOUNT_ENABLED/MinIO 凭据），"
+                f"回退为不挂载 | user={req.user_id} | role={req.role_id}"
+            )
 
-    # 3. 兜底冷启动
+    # 3. 挂载容器：专属、不走 warm pool（mount 须在创建时带 FUSE 能力），冷启动。
+    if workspace is not None:
+        try:
+            container = await _container_manager.run_container(
+                req.sandbox_type, workspace=workspace
+            )
+        except Exception as e:
+            logger.error(f"挂载容器冷启动失败 | type={req.sandbox_type} | err={e}")
+            raise HTTPException(status_code=503, detail=f"mounted cold start failed: {e}")
+        record = await _registry.register(container, req.user_id, req.role_id)
+        logger.info(
+            f"挂载 sandbox 已分配 | id={record.sandbox_id} | ip={container.container_ip} "
+            f"| mount={workspace.bucket}/{workspace.prefix}->{workspace.mount_path}"
+        )
+        return AcquireResponse(sandbox_id=record.sandbox_id, status="ready")
+
+    # 4. 非挂载：warm pool 优先，空则兜底冷启动
+    container = await _warm_pool.acquire(req.sandbox_type)
     if container is None:
         logger.warning(f"warm pool 为空，冷启动 | type={req.sandbox_type}")
         try:

@@ -1,0 +1,32 @@
+# 轻量 code 沙箱（无 GUI）的 Python 依赖
+# = 基础运行依赖（terminal/file/system/process 路由）+ 日常办公/数据处理常用库
+# 不含 playwright 等浏览器/GUI 依赖（code profile 不加载 browser 路由）。
+# 业务可在运行时通过 pip install 追加（已配置清华 pip 镜像）。
+
+-r requirements-base.txt
+
+# ── 表格 / 数据 ──────────────────────────────────────────────
+openpyxl>=3.1.0
+XlsxWriter>=3.1.0
+pandas>=2.0.0
+numpy>=1.26.0
+tabulate>=0.9.0
+
+# ── 文档（Word / PPT / PDF）─────────────────────────────────
+python-docx>=1.1.0
+python-pptx>=0.6.23
+reportlab>=4.0.0
+pypdf>=4.0.0
+markitdown[pptx]>=0.1.0
+
+# ── 图像 / 图表 ──────────────────────────────────────────────
+Pillow>=10.0.0
+matplotlib>=3.7.0
+
+# ── 文本 / 网页 / 网络 ───────────────────────────────────────
+lxml>=5.0.0
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+httpx>=0.27.0
+PyYAML>=6.0
+charset-normalizer>=3.3.0

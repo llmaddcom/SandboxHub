@@ -13,7 +13,10 @@ from collections import defaultdict
 from pathlib import Path
 
 from .base import CLIResult, ToolError, ToolResult
+from .matcher import STRATEGY_LABELS, MatchError, apply_spans, find_replacement_spans
 from .run import maybe_truncate, run
+
+__all__ = ["EditTool", "MatchError"]
 
 # 编辑片段显示的上下文行数
 SNIPPET_LINES: int = 4
@@ -97,25 +100,33 @@ class EditTool:
         self._file_history[_path].append(file_text)
         return ToolResult(output=f"文件创建成功: {_path}")
 
-    async def str_replace(self, path: str, old_str: str, new_str: str | None = None) -> ToolResult:
+    async def str_replace(
+        self,
+        path: str,
+        old_str: str,
+        new_str: str | None = None,
+        replace_all: bool = False,
+    ) -> ToolResult:
         """在文件中进行字符串替换。
 
         参数:
             path: 文件的绝对路径
             old_str: 要替换的原始字符串
             new_str: 替换后的新字符串（None 表示删除）
+            replace_all: 是否替换全部匹配（默认仅替换唯一匹配）
 
         返回:
             CLIResult: 包含替换结果和编辑片段的结果
 
         抛出:
-            ToolError: 如果路径无效、字符串未找到或存在多个匹配
+            ToolError: 如果路径无效
+            MatchError: 如果字符串未找到、不唯一或匹配跨度异常
         """
         _path = Path(path)
         self._validate_path("str_replace", _path)
         if old_str is None:
             raise ToolError("字符串替换操作必须提供 old_str 参数")
-        return self._str_replace(_path, old_str, new_str)
+        return self._str_replace(_path, old_str, new_str, replace_all)
 
     async def insert(self, path: str, insert_line: int, insert_text: str) -> ToolResult:
         """在文件指定行插入内容。
@@ -216,32 +227,20 @@ class EditTool:
             output=self._make_output(file_content, str(path), init_line=init_line)
         )
 
-    def _str_replace(self, path: Path, old_str: str, new_str: str | None):
+    def _str_replace(
+        self, path: Path, old_str: str, new_str: str | None, replace_all: bool = False
+    ):
         """字符串替换的内部实现。"""
         # 读取文件内容并规范化制表符
         file_content = self._read_file(path).expandtabs()
         old_str = old_str.expandtabs()
         new_str = new_str.expandtabs() if new_str is not None else ""
 
-        # 检查 old_str 在文件中是否唯一
-        occurrences = file_content.count(old_str)
-        if occurrences == 0:
-            raise ToolError(
-                f"未执行替换，old_str `{old_str}` 在 {path} 中不存在。"
-            )
-        elif occurrences > 1:
-            file_content_lines = file_content.split("\n")
-            lines = [
-                idx + 1
-                for idx, line in enumerate(file_content_lines)
-                if old_str in line
-            ]
-            raise ToolError(
-                f"未执行替换。old_str `{old_str}` 在第 {lines} 行存在多个匹配，请确保它是唯一的"
-            )
+        # 通过多级容错匹配链定位替换区间（未找到/不唯一/跨度异常时抛 MatchError）
+        spans, strategy = find_replacement_spans(file_content, old_str, replace_all)
 
         # 执行替换
-        new_file_content = file_content.replace(old_str, new_str)
+        new_file_content = apply_spans(file_content, spans, new_str)
 
         # 写入新内容
         self._write_file(path, new_file_content)
@@ -249,14 +248,17 @@ class EditTool:
         # 保存历史记录
         self._file_history[path].append(file_content)
 
-        # 创建编辑区域的代码片段
-        replacement_line = file_content.split(old_str)[0].count("\n")
+        # 创建首个编辑区域的代码片段
+        replacement_line = file_content[: spans[0][0]].count("\n")
         start_line = max(0, replacement_line - SNIPPET_LINES)
         end_line = replacement_line + SNIPPET_LINES + new_str.count("\n")
         snippet = "\n".join(new_file_content.split("\n")[start_line: end_line + 1])
 
         # 构建成功消息
-        success_msg = f"文件 {path} 已编辑。"
+        success_msg = f"文件 {path} 已编辑（替换 {len(spans)} 处"
+        if strategy != "exact":
+            success_msg += f"，容错策略：{STRATEGY_LABELS[strategy]}"
+        success_msg += "）。"
         success_msg += self._make_output(snippet, f"{path} 的片段", start_line + 1)
         success_msg += "请检查更改是否符合预期，必要时可再次编辑。"
 
