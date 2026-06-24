@@ -52,7 +52,30 @@ SandboxHub adds on top:
 docker build -t sandbox-ubuntu:latest images/ubuntu/
 ```
 
-> **Network note (China):** The Dockerfile uses Aliyun APT mirrors, TUNA pip mirrors, and Gitee mirrors for noVNC/pyenv. No VPN needed for the build.
+> **Network note (China):** The Dockerfile uses Aliyun APT mirrors and TUNA pip mirrors — no proxy needed for APT/pip. The following resources still require an overseas connection (proxy recommended):
+> - Google Chrome / Chromium (arm64)
+> - noVNC, websockify (GitHub)
+> - pyenv (GitHub)
+
+#### Building with a proxy
+
+If you have a local proxy (e.g. v2ray/clash) listening on `127.0.0.1:8118`, use `--network host` so build-time `RUN` commands can reach it:
+
+```bash
+# Adjust to match your proxy settings
+PROXY_HOST="127.0.0.1"
+HTTP_PORT="8118"
+HTTP_PROXY_URL="http://${PROXY_HOST}:${HTTP_PORT}"
+
+docker build --network host \
+  --build-arg HTTP_PROXY=${HTTP_PROXY_URL} \
+  --build-arg HTTPS_PROXY=${HTTP_PROXY_URL} \
+  --build-arg http_proxy=${HTTP_PROXY_URL} \
+  --build-arg https_proxy=${HTTP_PROXY_URL} \
+  -t sandbox-ubuntu:latest images/ubuntu/
+```
+
+> `--network host` shares the host network stack with build-stage `RUN` commands, allowing them to reach a proxy bound to `127.0.0.1`.
 
 ### 2. Install and configure SandboxHub
 
@@ -103,6 +126,27 @@ curl -X POST http://localhost:8088/v1/sandboxes/acquire \
 ```
 
 Returns in <100ms from the warm pool. Reuses an existing container if the same `(user_id, role_id)` pair already has one allocated.
+
+#### Acquire with a mounted workspace (MinIO ↔ container)
+
+```bash
+curl -X POST http://localhost:8088/v1/sandboxes/acquire \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u1", "role_id": "r1", "sandbox_type": "code",
+       "workspace": {"bucket": "createrole-workspaces", "prefix": "roles/r1", "mount_path": "/workspace"}}'
+```
+
+When `workspace` is present and SandboxHub has MinIO credentials configured (see Configuration),
+the container is cold-started with FUSE capabilities and `rclone mount`s the MinIO `bucket/prefix`
+at `mount_path` (default `/workspace`). Files written under the mount propagate to MinIO
+near-real-time (rclone VFS write-back), and objects added to the prefix in MinIO become visible
+in the container — i.e. the role's cloud drive and its sandbox share one filesystem.
+
+Mounted sandboxes are **role-dedicated**: they bypass the warm pool and are destroyed (after
+unmount) on release — never recycled and never `rm -rf`'d (which would delete MinIO data).
+If credentials are missing or `WORKSPACE_MOUNT_ENABLED=false`, the `workspace` field is ignored
+(logged as a warning) and an ordinary unmounted container is returned. Requires `rclone` + `fuse3`
+in the image (both bundled) and the host permitting `/dev/fuse` + `SYS_ADMIN` for the container.
 
 ### Execute a terminal command
 
@@ -177,6 +221,13 @@ Full API docs available at `http://localhost:8000/docs` inside a running contain
 | `SANDBOX_API_PORT` | `8000` | Port exposed by the container's FastAPI |
 | `POOL_MAINTAIN_INTERVAL` | `30` | Seconds between pool replenishment checks |
 | `SANDBOX_HTTP_PROXY` | _(empty)_ | HTTP proxy injected into containers |
+| `WORKSPACE_MOUNT_ENABLED` | `true` | Master switch for the MinIO workspace mount feature |
+| `MINIO_ENDPOINT` | _(empty)_ | MinIO `host:port` (no scheme) for the rclone S3 remote; empty disables mounting |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | _(empty)_ | MinIO credentials passed to the container's rclone |
+| `MINIO_SECURE` | `false` | `true` = use https for MinIO |
+| `RCLONE_VFS_CACHE_MODE` | `writes` | rclone VFS cache mode for the mount |
+| `RCLONE_VFS_WRITE_BACK` | `1s` | Delay before a closed file is uploaded to MinIO |
+| `RCLONE_DIR_CACHE_TIME` | `2s` | Directory listing cache (MinIO→container visibility lag) |
 
 ---
 

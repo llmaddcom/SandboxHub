@@ -52,7 +52,30 @@ SandboxHub 在此基础上新增：
 docker build -t sandbox-ubuntu:latest images/ubuntu/
 ```
 
-> **国内网络说明：** Dockerfile 已配置阿里云 APT 镜像、TUNA pip 镜像，以及 noVNC/pyenv 的 Gitee 镜像，构建无需代理。
+> **国内网络说明：** Dockerfile 已配置阿里云 APT 镜像、TUNA pip 镜像，APT 和 pip 安装无需代理。但以下资源仍需访问境外（需代理）：
+> - Google Chrome / Chromium（arm64）
+> - noVNC、websockify（GitHub）
+> - pyenv（GitHub）
+
+#### 使用代理构建
+
+若本机已运行 v2ray/clash 等代理（HTTP 代理监听 `127.0.0.1:8118`），使用 `--network host` 让构建容器直接访问宿主机代理：
+
+```bash
+# 代理配置（按实际调整）
+PROXY_HOST="127.0.0.1"
+HTTP_PORT="8118"
+HTTP_PROXY_URL="http://${PROXY_HOST}:${HTTP_PORT}"
+
+docker build --network host \
+  --build-arg HTTP_PROXY=${HTTP_PROXY_URL} \
+  --build-arg HTTPS_PROXY=${HTTP_PROXY_URL} \
+  --build-arg http_proxy=${HTTP_PROXY_URL} \
+  --build-arg https_proxy=${HTTP_PROXY_URL} \
+  -t sandbox-ubuntu:latest images/ubuntu/
+```
+
+> `--network host` 使构建阶段的 `RUN` 命令与宿主机共享网络栈，从而能访问 `127.0.0.1` 上监听的本地代理。
 
 ### 2. 安装并配置 SandboxHub
 

@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
     proxy_router.set_registry(registry)
 
     # 预热 pool（后台，不阻塞启动）
-    for sandbox_type in ("ubuntu",):
+    for sandbox_type in settings.sandbox_types:
         target = settings.pool_size_for_type(sandbox_type)
         if target > 0:
             logger.info(f"预热 pool | type={sandbox_type} | target={target}")
