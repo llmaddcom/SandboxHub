@@ -13,9 +13,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse as FastAPIFileResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from ..tools import EditTool, ToolError
+from ..tools import EditTool, MatchError, ToolError
 
 MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
 
@@ -64,6 +65,10 @@ class ReplaceRequest(BaseModel):
     path: str = Field(..., description="文件的绝对路径", examples=["/home/user/test.py"])
     old_str: str = Field(..., description="要替换的原始字符串")
     new_str: str | None = Field(default=None, description="替换后的新字符串（为空则删除原字符串）")
+    replace_all: bool = Field(
+        default=False,
+        description="是否替换全部匹配（默认仅替换唯一匹配；为 false 时命中多处会返回 400）",
+    )
 
 
 class InsertRequest(BaseModel):
@@ -167,27 +172,59 @@ async def create_file(request: CreateRequest):
 async def replace_in_file(request: ReplaceRequest):
     """在文件中进行字符串替换。
 
-    查找文件中的 old_str 并替换为 new_str。
-    old_str 在文件中必须是唯一的，否则替换将失败。
+    查找文件中的 old_str 并替换为 new_str，采用严格度递减的多级容错匹配链
+    （精确 → 行尾/缩进 trim → Unicode 归一化 → 块锚定），命中即止。
+
+    失败时返回结构化 400，body 至少含人类可读 `detail` 与机器可读 `reason`：
+    - `not_found`: old_str 未找到（含已尝试的容错级别）
+    - `not_unique`: old_str 不唯一（含命中处数与行号，建议扩大上下文或用 replace_all）
+    - `disproportionate`: 匹配跨度异常被拒
+    - `path_error`: 文件不存在 / 不可读 / 路径非法
 
     参数:
-        request: 包含文件路径、原字符串和新字符串的请求体
+        request: 包含文件路径、原字符串、新字符串及 replace_all 的请求体
 
     返回:
         FileResponse: 包含替换结果和编辑片段
     """
     try:
         tool = get_edit_tool()
-        result = await tool.str_replace(request.path, request.old_str, request.new_str)
+        result = await tool.str_replace(
+            request.path, request.old_str, request.new_str, request.replace_all
+        )
         return FileResponse(
             success=True,
             output=result.output,
             error=result.error,
         )
+    except MatchError as e:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": e.detail,
+                "reason": e.reason,
+                **e.info,
+            },
+        )
     except ToolError as e:
-        raise HTTPException(status_code=400, detail=f"字符串替换失败: {e.message}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": f"字符串替换失败: {e.message}",
+                "reason": "path_error",
+            },
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"字符串替换失败: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "detail": f"字符串替换失败: {str(e)}",
+                "reason": "internal_error",
+            },
+        )
 
 
 @router.post("/insert", response_model=FileResponse, summary="在指定行插入内容")

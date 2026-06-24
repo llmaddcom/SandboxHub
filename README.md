@@ -14,6 +14,7 @@ SandboxHub has two components that live in this monorepo:
 |-----------|------|------|
 | **Orchestrator** | `src/` | Manages container lifecycle — warm pool, acquire/release, HTTP proxy |
 | **Ubuntu Image** | `images/ubuntu/` | Ubuntu 22.04 sandbox — virtual desktop, FastAPI tool API, MCP server |
+| **Code Image** | `images/code/` | Headless lightweight sandbox — Python + Node toolchain, dev/office libs, terminal/file/system/process API only (no GUI), sub-second cold start |
 
 ```
 LLM Agent
@@ -49,13 +50,21 @@ SandboxHub adds on top:
 ### 1. Build the sandbox image
 
 ```bash
+# Full desktop image (GUI + browser + skills)
 docker build -t sandbox-ubuntu:latest images/ubuntu/
+
+# Lightweight headless code image (Python + Node + dev/office libs, no GUI)
+# Build context is images/ (shares ubuntu/app code), so -f + context are required:
+docker build -f images/code/Dockerfile -t sandbox-code:latest images
 ```
 
-> **Network note (China):** The Dockerfile uses Aliyun APT mirrors and TUNA pip mirrors — no proxy needed for APT/pip. The following resources still require an overseas connection (proxy recommended):
+> **Network note (China):** Both Dockerfiles use domestic mirrors — TUNA for APT/pip and npmmirror for Node/npm — so no proxy is needed for APT/pip/npm.
+> The **code** image is fully buildable behind the Great Firewall with no proxy. The **ubuntu** image additionally pulls these from overseas (proxy recommended):
 > - Google Chrome / Chromium (arm64)
 > - noVNC, websockify (GitHub)
 > - pyenv (GitHub)
+
+> **Code image toolchain:** Python 3.11 + Node 20 (yarn/pnpm), `git`/`ripgrep`/`jq`/`vim`, build-essential, and daily Python libs (pandas, openpyxl, python-docx/pptx, reportlab, pypdf, matplotlib, markitdown…). Agents can introspect it at runtime via `GET /api/system/env`.
 
 #### Building with a proxy
 

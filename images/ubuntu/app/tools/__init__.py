@@ -13,12 +13,14 @@ from .base import CLIResult, ToolError, ToolFailure, ToolResult
 from .bash import BashTool
 from .computer import ComputerTool
 from .edit import EditTool
+from .matcher import MatchError
 
 __all__ = [
     "BashTool",
     "CLIResult",
     "ComputerTool",
     "EditTool",
+    "MatchError",
     "ToolError",
     "ToolFailure",
     "ToolResult",
