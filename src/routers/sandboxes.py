@@ -3,7 +3,8 @@
 沙盒生命周期路由
 
 职责：暴露 acquire/release/status/list/ping 接口。
-acquire 优先复用已有 sandbox，其次从 warm pool 取，最后冷启动兜底。
+acquire 优先复用已有 sandbox（复用前体检，容器已死则驱逐重建、对调用方透明自愈），
+其次从 warm pool 取（出池体检，死容器销毁换下一个），最后冷启动兜底。
 release 触发后台清理，立即返回 ok。
 ping 提供浅检查（registry 状态）和深检查（TCP 可达性）两种健康检查模式。
 """
@@ -17,7 +18,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from src.config import settings
-from src.models import WorkspaceMount
+from src.models import ContainerInfo, WorkspaceMount
 
 router = APIRouter(prefix="/v1/sandboxes")
 
@@ -25,13 +26,15 @@ router = APIRouter(prefix="/v1/sandboxes")
 _registry = None
 _warm_pool = None
 _container_manager = None
+_reconciler = None
 
 
-def set_dependencies(registry, warm_pool, container_manager) -> None:
-    global _registry, _warm_pool, _container_manager
+def set_dependencies(registry, warm_pool, container_manager, reconciler) -> None:
+    global _registry, _warm_pool, _container_manager, _reconciler
     _registry = registry
     _warm_pool = warm_pool
     _container_manager = container_manager
+    _reconciler = reconciler
 
 
 # ── 请求/响应模型 ──────────────────────────────────────────────────────────────
@@ -86,11 +89,20 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
     3. 兜底：冷启动新容器
     后台异步补充 pool，不阻塞返回。
     """
-    # 1. 复用（已分配的容器，无论挂载与否，直接复用——挂载随容器持续存在）
+    # 1. 复用（已分配的容器，无论挂载与否，直接复用——挂载随容器持续存在）。
+    #    复用前体检：容器可能已被 docker restart/OOM/手动删除干掉，registry 只是内存
+    #    记录感知不到；死沙盒就地驱逐销毁，落到下面的全新分配（对调用方透明自愈）。
     existing = await _registry.find_active(req.user_id, req.role_id)
     if existing:
-        logger.debug(f"复用 sandbox | id={existing.sandbox_id} | user={req.user_id}")
-        return AcquireResponse(sandbox_id=existing.sandbox_id, status="ready")
+        if await _container_manager.is_healthy(existing.container_info.container_ip):
+            _registry.touch(existing.sandbox_id)
+            logger.debug(f"复用 sandbox | id={existing.sandbox_id} | user={req.user_id}")
+            return AcquireResponse(sandbox_id=existing.sandbox_id, status="ready")
+        logger.warning(
+            f"复用沙盒失联，驱逐重建 | id={existing.sandbox_id} "
+            f"| ip={existing.container_info.container_ip} | user={req.user_id}"
+        )
+        await _reconciler.destroy_sandbox(existing)
 
     # 2. 决定是否挂载工作区。请求带 workspace 但本服务无挂载能力（开关关/缺 MinIO 凭据）
     #    时记 warning 并回退为不挂载，避免因配置缺失而让终端整体不可用。
@@ -124,8 +136,8 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
         )
         return AcquireResponse(sandbox_id=record.sandbox_id, status="ready")
 
-    # 4. 非挂载：warm pool 优先，空则兜底冷启动
-    container = await _warm_pool.acquire(req.sandbox_type)
+    # 4. 非挂载：warm pool 优先（出池体检，死容器销毁换下一个），空则兜底冷启动
+    container = await _pop_healthy(req.sandbox_type)
     if container is None:
         logger.warning(f"warm pool 为空，冷启动 | type={req.sandbox_type}")
         try:
@@ -141,6 +153,19 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
 
     logger.info(f"sandbox 已分配 | id={record.sandbox_id} | ip={container.container_ip}")
     return AcquireResponse(sandbox_id=record.sandbox_id, status="ready")
+
+
+async def _pop_healthy(sandbox_type: str) -> Optional[ContainerInfo]:
+    """从 warm pool 弹容器并体检：不健康就销毁再弹下一个，绝不把死容器分配出去。"""
+    while (container := await _warm_pool.acquire(sandbox_type)) is not None:
+        if await _container_manager.is_healthy(container.container_ip):
+            return container
+        logger.warning(
+            f"warm 容器不健康，销毁换下一个 | name={container.container_name} "
+            f"| ip={container.container_ip}"
+        )
+        await _container_manager.remove_container(container.container_id)
+    return None
 
 
 @router.post("/{sandbox_id}/release")
@@ -205,6 +230,9 @@ async def list_sandboxes() -> dict:
                 "role_id": r.role_id,
                 "status": r.status,
                 "sandbox_type": r.container_info.sandbox_type,
+                "container_name": r.container_info.container_name,
+                "acquired_at": r.acquired_at.isoformat(),
+                "last_active_at": r.last_active_at.isoformat(),
             }
             for r in records
         ]

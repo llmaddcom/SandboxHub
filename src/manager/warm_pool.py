@@ -147,6 +147,22 @@ class WarmPool:
         async with self._lock:
             self._pools[container_info.sandbox_type].append(container_info)
 
+    async def remove_by_id(self, container_id: str) -> ContainerInfo | None:
+        """按容器 id 从池中摘除（对账发现容器已死时调用），返回被摘除的 ContainerInfo。
+
+        只摘除、不销毁：容器本体的处置（docker rm）由调用方决定。
+        """
+        async with self._lock:
+            for pool in self._pools.values():
+                for i, c in enumerate(pool):
+                    if c.container_id == container_id:
+                        return pool.pop(i)
+        return None
+
+    def container_ids(self) -> set[str]:
+        """当前在池的全部容器 id，供孤儿对账。"""
+        return {c.container_id for pool in self._pools.values() for c in pool}
+
     def available_count(self, sandbox_type: str) -> int:
         return len(self._pools.get(sandbox_type, []))
 

@@ -2,11 +2,11 @@
 SandboxHub FastAPI 应用入口
 
 lifespan：
-  startup  → 初始化 ContainerManager / Registry / WarmPool
-           → 从 Docker 恢复已运行的受管容器
+  startup  → 初始化 ContainerManager / Registry / WarmPool / Reconciler
+           → 启动恢复：清理已停止/孤儿容器，健康的遗留容器清理复位后收养回 pool
            → 预热 pool 到目标大小
-           → 启动 pool 维护后台任务
-  shutdown → 取消维护任务，关闭所有 httpx 连接池
+           → 启动 pool 维护 + 沙盒对账两个后台任务
+  shutdown → 取消后台任务，清理全部容器，关闭所有 httpx 连接池
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from loguru import logger
 
 from .config import settings
 from .manager.container_manager import ContainerManager
+from .manager.reconciler import SandboxReconciler
 from .manager.registry import SandboxRegistry
 from .manager.warm_pool import WarmPool
 from .routers import proxy as proxy_router
@@ -31,17 +32,14 @@ async def lifespan(app: FastAPI):
     container_manager = ContainerManager()
     registry = SandboxRegistry()
     warm_pool = WarmPool(container_manager)
+    reconciler = SandboxReconciler(registry, warm_pool, container_manager)
 
-    # 恢复已运行的受管容器到 warm pool（仅 warm/未分配状态，不重建 Registry）
-    recovered = container_manager.recover_running_containers()
-    for info in recovered:
-        await warm_pool.restore(info)
-    if recovered:
-        logger.info(f"恢复 {len(recovered)} 个运行中容器到 warm pool")
+    # 启动恢复：处置 Docker 遗留的受管容器（已停止/挂载孤儿销毁，健康 warm 收养回池）
+    await reconciler.startup()
 
     # 注入依赖
-    sandboxes_router.set_dependencies(registry, warm_pool, container_manager)
-    proxy_router.set_registry(registry)
+    sandboxes_router.set_dependencies(registry, warm_pool, container_manager, reconciler)
+    proxy_router.set_dependencies(registry, reconciler)
 
     # 预热 pool（后台，不阻塞启动）
     for sandbox_type in settings.sandbox_types:
@@ -50,18 +48,20 @@ async def lifespan(app: FastAPI):
             logger.info(f"预热 pool | type={sandbox_type} | target={target}")
             asyncio.create_task(warm_pool.ensure_pool(sandbox_type))
 
-    # 启动维护后台任务
+    # 启动后台任务：pool 维护 + 沙盒对账
     maintain_task = asyncio.create_task(warm_pool.maintain_loop())
+    reconcile_task = asyncio.create_task(reconciler.loop())
     logger.info("SandboxHub 启动完成")
 
     yield
 
     # ── shutdown ─────────────────────────────────────────────────────────────
-    maintain_task.cancel()
-    try:
-        await maintain_task
-    except asyncio.CancelledError:
-        pass
+    for task in (maintain_task, reconcile_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     # 并发清理所有容器（warm pool + 已分配），确保无孤儿容器
     allocated_infos = await registry.drain()
@@ -87,9 +87,10 @@ app.include_router(_proxy_api)
 
 @app.get("/v1/health")
 async def health():
-    """健康检查，返回服务状态和 warm pool 状态。"""
+    """健康检查，返回服务状态、warm pool 状态和已分配沙盒数。"""
     pool_status = sandboxes_router._warm_pool.status() if sandboxes_router._warm_pool else {}
-    return {"ok": True, "warm_pool": pool_status}
+    ready = len(sandboxes_router._registry.list_ready()) if sandboxes_router._registry else 0
+    return {"ok": True, "warm_pool": pool_status, "sandboxes_ready": ready}
 
 
 if __name__ == "__main__":

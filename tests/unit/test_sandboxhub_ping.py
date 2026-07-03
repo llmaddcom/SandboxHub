@@ -10,7 +10,7 @@ from src.models import ContainerInfo, SandboxRecord
 def _make_app(registry, container_manager):
     """创建带注入依赖的测试 app"""
     from src.routers import sandboxes as sandboxes_router
-    sandboxes_router.set_dependencies(registry, MagicMock(), container_manager)
+    sandboxes_router.set_dependencies(registry, MagicMock(), container_manager, MagicMock())
     from fastapi import FastAPI
     app = FastAPI()
     app.include_router(sandboxes_router.router)

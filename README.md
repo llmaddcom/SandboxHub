@@ -40,6 +40,7 @@ SandboxHub adds on top:
 - **Warm pool** — pre-warmed containers eliminate cold-start latency (<100ms acquire)
 - **Registry** — tracks allocated containers per `(user_id, role_id)` pair, enables reuse
 - **HTTP proxy layer** — single ingress point; routes all tool calls to the right container
+- **Reconciler** — self-healing lifecycle: health-check on acquire (dead sandboxes evicted and transparently re-created), startup recovery after host/service restarts (stopped containers removed, leftover warm containers reset then re-adopted), periodic sweep that destroys untracked orphan containers and auto-reclaims idle sandboxes
 - **SSE streaming** — `POST /api/terminal/execute/stream` streams stdout in real-time (extends the original polling model)
 - **Multi-arch Dockerfile** — builds on both amd64 (Google Chrome) and arm64 (Chromium)
 

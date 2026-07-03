@@ -16,6 +16,23 @@ class Settings(BaseSettings):
     CONTAINER_LABEL: str = "sandboxhub.managed"
     SANDBOX_API_PORT: int = 8000
     POOL_MAINTAIN_INTERVAL: int = 30  # 秒
+
+    # ── 沙盒对账与兜底回收 ────────────────────────────────────────────────────
+    # 周期对账间隔（秒）：清理已停止/孤儿容器、驱逐失联沙盒、闲置回收。
+    RECONCILE_INTERVAL: int = 60
+    # 已分配沙盒的闲置回收阈值（秒）：超过此时长未被使用（acquire/proxy）即自动回收，
+    # 挂载容器销毁、warm 容器复位回池。0=关闭。调用方按 (user, role) 幂等 acquire，
+    # 回收后下一次工具调用自动重建，对调用方透明。
+    SANDBOX_IDLE_TTL: int = 7200
+    # 孤儿容器的创建宽限（秒）：running 但不在册的受管容器，创建超过此时长才销毁，
+    # 覆盖「容器已创建、尚未登记进 pool/registry」的在途窗口（冷启动+挂载最长约 1 分钟）。
+    ORPHAN_GRACE_SECONDS: int = 300
+
+    # ── 代理转发超时 ─────────────────────────────────────────────────────────
+    # 读超时须大于终端命令的执行预算上限（300s）加回传余量，否则长命令会被代理层
+    # 先掐断成 502，调用方拿不到命令自身的超时结果。
+    PROXY_READ_TIMEOUT: float = 330.0
+    PROXY_CONNECT_TIMEOUT: float = 10.0
     # 容器代理：空=不注入代理。容器内 127.0.0.1 不是宿主，需用 host.docker.internal
     # 或宿主在 docker 网桥上可达的地址，例：http://host.docker.internal:8118
     SANDBOX_HTTP_PROXY: str = ""

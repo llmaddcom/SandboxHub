@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from src.models import ContainerInfo, SandboxRecord
@@ -59,17 +60,61 @@ class SandboxRegistry:
         """
         标记为 released，清除 user_role 索引。
         返回 ContainerInfo 供调用方归还 pool；不存在返回 None。
+        released 记录保留一段时间（见 prune_released）：兼作后台清理在途容器的在册凭据，
+        防止对账把清理中的容器误判为孤儿。
         """
         async with self._lock:
             record = self._by_id.get(sandbox_id)
             if not record:
                 return None
             record.status = "released"
+            record.last_active_at = datetime.now(tz=timezone.utc)
             self._by_user_role.pop((record.user_id, record.role_id), None)
             return record.container_info
 
+    async def evict(self, sandbox_id: str) -> Optional[SandboxRecord]:
+        """
+        彻底移除记录（容器已死/失联/闲置回收时用）。
+
+        与 mark_released 的差别：不保留 released 记录——容器不归还 pool、不需要在册
+        宽限，且要让同 user+role 的下一次 acquire 立即走全新分配。
+        """
+        async with self._lock:
+            record = self._by_id.pop(sandbox_id, None)
+            if not record:
+                return None
+            if self._by_user_role.get((record.user_id, record.role_id)) == sandbox_id:
+                self._by_user_role.pop((record.user_id, record.role_id), None)
+            return record
+
+    def touch(self, sandbox_id: str) -> None:
+        """刷新最近使用时间（acquire 复用 / proxy 转发时调用），供闲置回收判定。"""
+        record = self._by_id.get(sandbox_id)
+        if record is not None:
+            record.last_active_at = datetime.now(tz=timezone.utc)
+
+    async def prune_released(self, max_age_seconds: float) -> int:
+        """移除 released 超过 max_age_seconds 的记录，返回移除数量（内存修剪）。"""
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(seconds=max_age_seconds)
+        async with self._lock:
+            stale = [
+                sid
+                for sid, r in self._by_id.items()
+                if r.status == "released" and r.last_active_at < cutoff
+            ]
+            for sid in stale:
+                self._by_id.pop(sid, None)
+        return len(stale)
+
     def list_all(self) -> list[SandboxRecord]:
         return list(self._by_id.values())
+
+    def list_ready(self) -> list[SandboxRecord]:
+        return [r for r in self._by_id.values() if r.status == "ready"]
+
+    def tracked_container_ids(self) -> set[str]:
+        """所有在册记录（含 released 宽限期内的）指向的容器 id，供孤儿对账。"""
+        return {r.container_info.container_id for r in self._by_id.values()}
 
     async def drain(self) -> list[ContainerInfo]:
         """Return all tracked ContainerInfos and clear the registry. Called on shutdown."""

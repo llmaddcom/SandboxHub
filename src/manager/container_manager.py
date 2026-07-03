@@ -7,8 +7,10 @@ Docker 容器管理器
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 import docker
@@ -17,10 +19,28 @@ import httpx
 from loguru import logger
 
 from src.config import settings
-from src.models import ContainerInfo, SandboxType, WorkspaceMount
+from src.models import ContainerInfo, ManagedContainer, SandboxType, WorkspaceMount
 
 # 挂载容器标签：用于启动恢复时识别并清理孤儿挂载容器（其 registry 映射在重启后已丢失）。
 _MOUNTED_LABEL = "sandboxhub.mounted"
+
+
+def _parse_docker_time(raw: str) -> Optional[datetime]:
+    """解析 Docker 的 Created 时间（形如 2026-07-03T02:03:04.123456789Z，纳秒精度）。
+
+    截到微秒再解析；解析失败返回 None（对账侧视为「刚创建」，宁可晚杀不误杀）。
+    """
+    m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?", raw or "")
+    if not m:
+        return None
+    base, frac = m.groups()
+    micro = (frac or "0")[:6].ljust(6, "0")
+    try:
+        return datetime.strptime(f"{base}.{micro}", "%Y-%m-%dT%H:%M:%S.%f").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
 
 
 class ContainerManager:
@@ -166,32 +186,39 @@ class ContainerManager:
         except Exception as e:
             logger.warning(f"删除容器失败 | id={container_id} | err={e}")
 
-    def _list_managed_sync(self) -> list[dict]:
-        """列出所有 sandboxhub.managed=true 的容器（恢复用）。"""
+    def _list_managed_sync(self) -> list[ManagedContainer]:
+        """列出所有 sandboxhub.managed=true 的容器（含非 running 的），供对账使用。"""
         try:
             containers = self._docker.containers.list(
                 all=True,
                 filters={"label": f"{settings.CONTAINER_LABEL}=true"},
             )
-            result = []
-            for c in containers:
-                if c.status != "running":
-                    continue
-                try:
-                    ip = self._get_container_ip(c)
-                    result.append({
-                        "container_id": c.id,
-                        "container_name": c.name,
-                        "container_ip": ip,
-                        "sandbox_type": c.labels.get("sandboxhub.type", "ubuntu"),
-                        "mounted": c.labels.get(_MOUNTED_LABEL) == "true",
-                    })
-                except RuntimeError:
-                    continue
-            return result
         except Exception as e:
             logger.warning(f"列出管理容器失败: {e}")
             return []
+        result: list[ManagedContainer] = []
+        for c in containers:
+            try:
+                ip = ""
+                if c.status == "running":
+                    try:
+                        ip = self._get_container_ip(c)
+                    except RuntimeError:
+                        ip = ""
+                result.append(
+                    ManagedContainer(
+                        container_id=c.id,
+                        container_name=c.name,
+                        status=c.status,
+                        sandbox_type=c.labels.get("sandboxhub.type", "ubuntu"),
+                        mounted=c.labels.get(_MOUNTED_LABEL) == "true",
+                        created_at=_parse_docker_time(c.attrs.get("Created", "")),
+                        container_ip=ip,
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"读取容器信息失败，本轮跳过 | err={e}")
+        return result
 
     # ── 异步公开接口 ──────────────────────────────────────────────────────────
 
@@ -349,8 +376,9 @@ class ContainerManager:
 
     async def clean_and_reset(self, container_ip: str) -> None:
         """
-        清理 workspace + 重置 bash session（release 后归还 pool 前调用）。
-        失败只记 warning，不中断 pool 归还流程。
+        清理 workspace + 重置 bash session（归还 pool / 启动收养回 pool 前调用）。
+        失败抛 RuntimeError，由调用方销毁容器——上一任租户的文件与会话状态未清干净的
+        容器绝不能回 pool（跨租户串台）。
         """
         api_base = f"http://{container_ip}:{settings.SANDBOX_API_PORT}"
         try:
@@ -361,20 +389,8 @@ class ContainerManager:
                     json={"command": "rm -rf /workspace/* 2>/dev/null; true", "timeout": 10},
                 )
         except Exception as e:
-            logger.warning(f"clean_and_reset 失败 | ip={container_ip} | err={e}")
+            raise RuntimeError(f"clean_and_reset 失败 | ip={container_ip} | err={e}") from e
 
-    def recover_running_containers(self) -> list[ContainerInfo]:
-        """应用启动时从 Docker 恢复运行中的受管容器。
-
-        仅恢复**未挂载**的 warm 容器到 pool；挂载容器是角色专属、其 registry 映射在重启后
-        已丢失，且 pool 复用会造成跨租户串台，故视为孤儿就地销毁，不返回。
-        """
-        raw = self._list_managed_sync()
-        recovered: list[ContainerInfo] = []
-        for r in raw:
-            if r.pop("mounted", False):
-                logger.info(f"清理孤儿挂载容器 | name={r['container_name']}")
-                self._stop_and_remove_sync(r["container_id"])
-                continue
-            recovered.append(ContainerInfo(**r))
-        return recovered
+    async def list_managed(self) -> list[ManagedContainer]:
+        """列出 Docker 侧全部受管容器（含已停止的），供 Reconciler 对账。"""
+        return await asyncio.to_thread(self._list_managed_sync)

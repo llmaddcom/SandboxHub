@@ -1,5 +1,5 @@
 import pytest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from src.manager.registry import SandboxRegistry
 from src.models import ContainerInfo, SandboxRecord
 
@@ -72,6 +72,75 @@ async def test_list_all():
     await reg.register(make_container("172.17.0.5"), user_id="u1", role_id="r1")
     await reg.register(make_container("172.17.0.6"), user_id="u2", role_id="r2")
     assert len(reg.list_all()) == 2
+
+
+@pytest.mark.asyncio
+async def test_evict_removes_record_entirely():
+    reg = SandboxRegistry()
+    record = await reg.register(make_container(), user_id="u1", role_id="r1")
+    evicted = await reg.evict(record.sandbox_id)
+    assert evicted is record
+    assert await reg.get(record.sandbox_id) is None
+    assert await reg.find_active("u1", "r1") is None
+    assert reg.list_all() == []
+
+
+@pytest.mark.asyncio
+async def test_evict_unknown_returns_none():
+    reg = SandboxRegistry()
+    assert await reg.evict("nonexistent") is None
+
+
+@pytest.mark.asyncio
+async def test_evict_keeps_newer_mapping_for_same_user_role():
+    """旧记录 evict 时不能误删同 user+role 已重建的新映射。"""
+    reg = SandboxRegistry()
+    old = await reg.register(make_container("172.17.0.5"), user_id="u1", role_id="r1")
+    new = await reg.register(make_container("172.17.0.6"), user_id="u1", role_id="r1")
+    await reg.evict(old.sandbox_id)
+    assert await reg.find_active("u1", "r1") is new
+
+
+@pytest.mark.asyncio
+async def test_touch_refreshes_last_active():
+    reg = SandboxRegistry()
+    record = await reg.register(make_container(), user_id="u1", role_id="r1")
+    record.last_active_at = datetime.now(tz=timezone.utc) - timedelta(hours=1)
+    reg.touch(record.sandbox_id)
+    assert (datetime.now(tz=timezone.utc) - record.last_active_at).total_seconds() < 5
+
+
+@pytest.mark.asyncio
+async def test_prune_released_removes_stale_keeps_ready():
+    reg = SandboxRegistry()
+    ready = await reg.register(make_container("172.17.0.5"), user_id="u1", role_id="r1")
+    stale = await reg.register(make_container("172.17.0.6"), user_id="u2", role_id="r2")
+    await reg.mark_released(stale.sandbox_id)
+    stale.last_active_at = datetime.now(tz=timezone.utc) - timedelta(seconds=700)
+    removed = await reg.prune_released(600)
+    assert removed == 1
+    assert await reg.get(stale.sandbox_id) is None
+    assert await reg.get(ready.sandbox_id) is ready
+
+
+@pytest.mark.asyncio
+async def test_prune_released_keeps_recent_released():
+    reg = SandboxRegistry()
+    record = await reg.register(make_container(), user_id="u1", role_id="r1")
+    await reg.mark_released(record.sandbox_id)
+    removed = await reg.prune_released(600)
+    assert removed == 0
+    assert await reg.get(record.sandbox_id) is record
+
+
+@pytest.mark.asyncio
+async def test_tracked_container_ids_includes_released():
+    reg = SandboxRegistry()
+    a = await reg.register(make_container("172.17.0.5"), user_id="u1", role_id="r1")
+    await reg.register(make_container("172.17.0.6"), user_id="u2", role_id="r2")
+    await reg.mark_released(a.sandbox_id)
+    assert reg.tracked_container_ids() == {"abc123"}  # 两条记录 container_id 相同
+    assert len(reg.list_ready()) == 1
 
 
 @pytest.mark.asyncio
