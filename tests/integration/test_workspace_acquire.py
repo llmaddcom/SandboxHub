@@ -41,8 +41,12 @@ def app_mocks():
 
     cm = MagicMock()
     cm.run_container = AsyncMock(return_value=_container(mounted=True))
+    cm.is_healthy = AsyncMock(return_value=True)
 
-    sandboxes_router.set_dependencies(registry, warm_pool, cm)
+    reconciler = MagicMock()
+    reconciler.destroy_sandbox = AsyncMock()
+
+    sandboxes_router.set_dependencies(registry, warm_pool, cm, reconciler)
     app = FastAPI()
     app.include_router(sandboxes_router.router)
     return app, registry, warm_pool, cm

@@ -40,6 +40,7 @@ SandboxHub 在此基础上新增：
 - **预热池（Warm Pool）** — 预先创建容器，消除冷启动，acquire 延迟 <100ms
 - **注册表（Registry）** — 按 `(user_id, role_id)` 跟踪已分配容器，支持复用
 - **HTTP 代理层** — 统一入口，将所有工具调用路由到对应容器
+- **对账器（Reconciler）** — 自愈式生命周期管理：acquire 复用前体检（死沙盒驱逐并透明重建）、宿主/服务重启后的启动恢复（清理已停止容器、遗留 warm 容器复位后收养回池）、周期对账（销毁不在册的孤儿容器、闲置沙盒自动回收）
 - **SSE 流式输出** — `POST /api/terminal/execute/stream` 实时推送 stdout（扩展原始轮询模型）
 - **多架构 Dockerfile** — 同时支持 amd64（Google Chrome）和 arm64（Chromium）
 

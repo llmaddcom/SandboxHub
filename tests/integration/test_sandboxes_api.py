@@ -54,9 +54,15 @@ def app_with_mocks():
 
     container_manager = MagicMock()
     container_manager.run_container = AsyncMock(return_value=make_container())
+    container_manager.is_healthy = AsyncMock(return_value=True)
+    container_manager.remove_container = AsyncMock()
 
-    sandboxes_router.set_dependencies(registry, warm_pool, container_manager)
-    proxy_router.set_registry(registry)
+    reconciler = MagicMock()
+    reconciler.destroy_sandbox = AsyncMock()
+    reconciler.evict_if_dead = AsyncMock(return_value=False)
+
+    sandboxes_router.set_dependencies(registry, warm_pool, container_manager, reconciler)
+    proxy_router.set_dependencies(registry, reconciler)
 
     app = FastAPI()
     app.include_router(sandboxes_router.router)
@@ -156,6 +162,63 @@ async def test_proxy_404_for_unknown_sandbox(app_with_mocks):
         resp = await client.get("/v1/sandboxes/nonexistent/proxy/api/terminal/execute")
 
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_acquire_evicts_dead_sandbox_and_reallocates(app_with_mocks):
+    """复用体检失败：死沙盒驱逐销毁，落到全新分配（对调用方透明自愈）。"""
+    app, registry, warm_pool, container_manager = app_with_mocks
+    existing = make_record("sb_dead")
+    registry.find_active = AsyncMock(return_value=existing)
+    # 第一次体检：复用的沙盒已死；第二次体检：pool 弹出的新容器健康
+    container_manager.is_healthy = AsyncMock(side_effect=[False, True])
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/sandboxes/acquire", json={"user_id": "u1", "role_id": "r1"})
+
+    assert resp.status_code == 200
+    assert resp.json()["sandbox_id"] != "sb_dead"
+    sandboxes_router._reconciler.destroy_sandbox.assert_awaited_once_with(existing)
+    warm_pool.acquire.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_acquire_skips_dead_pool_container(app_with_mocks):
+    """出池体检失败：死容器销毁，继续弹下一个健康的分配出去。"""
+    app, registry, warm_pool, container_manager = app_with_mocks
+    dead = make_container("172.17.0.66")
+    dead.container_id = "cid_dead"
+    healthy = make_container("172.17.0.5")
+    warm_pool.acquire = AsyncMock(side_effect=[dead, healthy])
+    container_manager.is_healthy = AsyncMock(side_effect=[False, True])
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post("/v1/sandboxes/acquire", json={"user_id": "u1", "role_id": "r1"})
+
+    assert resp.status_code == 200
+    container_manager.remove_container.assert_awaited_once_with("cid_dead")
+    registry.register.assert_awaited_once()
+    assert registry.register.call_args.args[0] is healthy
+
+
+@pytest.mark.asyncio
+async def test_proxy_touches_activity_and_triggers_evict_on_502(app_with_mocks):
+    """转发刷新活跃时间；转发失败(502)后台触发即时体检驱逐。"""
+    app, registry, _, _ = app_with_mocks
+    from unittest.mock import patch
+    from fastapi import Response
+
+    with patch(
+        "src.routers.proxy.forward",
+        new=AsyncMock(return_value=Response(content="{}", status_code=502)),
+    ):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post("/v1/sandboxes/sb_abc123/proxy/api/terminal/execute")
+        await asyncio.sleep(0)
+
+    assert resp.status_code == 502
+    registry.touch.assert_called_once_with("sb_abc123")
+    proxy_router._reconciler.evict_if_dead.assert_awaited_once_with("sb_abc123")
 
 
 @pytest.mark.asyncio

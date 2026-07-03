@@ -109,6 +109,33 @@ async def test_restore_multiple_types_populate_distinct_pools(mock_manager):
 
 
 @pytest.mark.asyncio
+async def test_remove_by_id_pops_matching_container(mock_manager):
+    pool = WarmPool(mock_manager)
+    a = make_container("172.17.0.5")
+    b = make_container("172.17.0.6")
+    pool._pools["ubuntu"].extend([a, b])
+    removed = await pool.remove_by_id(a.container_id)
+    assert removed is a
+    assert pool.available_count("ubuntu") == 1
+    # 只摘除不销毁
+    mock_manager.remove_container.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_remove_by_id_unknown_returns_none(mock_manager):
+    pool = WarmPool(mock_manager)
+    assert await pool.remove_by_id("nonexistent") is None
+
+
+@pytest.mark.asyncio
+async def test_container_ids_lists_all_pools(mock_manager):
+    pool = WarmPool(mock_manager)
+    pool._pools["ubuntu"].append(make_container("172.17.0.5"))
+    pool._pools["code"].append(make_container("172.17.0.6"))
+    assert pool.container_ids() == {"cid_172.17.0.5", "cid_172.17.0.6"}
+
+
+@pytest.mark.asyncio
 async def test_drain_removes_all_warm_containers(mock_manager):
     pool = WarmPool(mock_manager)
     pool._pools["ubuntu"].append(make_container("172.17.0.10"))
