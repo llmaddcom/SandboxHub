@@ -141,14 +141,6 @@ RUN python -m pip install --upgrade pip==23.1.2 setuptools==58.0.4 wheel==0.40.0
 COPY app/requirements.txt /root/computer_use_demo/requirements.txt
 RUN python -m pip install -r /root/computer_use_demo/requirements.txt
 
-# ===== 9a. matplotlib 中文开箱即用（issue #3，与 code 镜像同配置）=====
-# 默认 sans-serif 链路含 CJK 字体；构建期预热字体缓存并验证 CJK 字体可被解析。
-RUN mkdir -p /root/.config/matplotlib && \
-    printf 'font.family: sans-serif\nfont.sans-serif: Noto Sans CJK SC, Noto Sans CJK JP, WenQuanYi Zen Hei, DejaVu Sans\naxes.unicode_minus: False\n' \
-      > /root/.config/matplotlib/matplotlibrc && \
-    python -c "from matplotlib import font_manager as fm; \
-print('CJK font:', fm.findfont(fm.FontProperties(family=['Noto Sans CJK SC', 'WenQuanYi Zen Hei']), fallback_to_default=False))"
-
 # ===== 9b. Node.js Playwright（pdf skill render_cover.js 使用）=====
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/ms-playwright
 RUN npm install -g playwright && \
@@ -168,6 +160,25 @@ RUN mkdir -p /tmp/nuget-warmup && \
       > /tmp/nuget-warmup/warmup.csproj && \
     dotnet restore /tmp/nuget-warmup/warmup.csproj && \
     rm -rf /tmp/nuget-warmup
+
+# ===== 9e. 中文环境补齐：时区 / emoji 字体 / matplotlib 中文开箱即用（issue #3）=====
+# 置于重型层（playwright/dotnet/nuget）之后，改动本层不打爆前面的构建缓存。
+# - tzdata + Asia/Shanghai：国内业务时间/日期正确
+# - fonts-noto-color-emoji：Chrome 截图中 emoji 不再豆腐块
+# - matplotlibrc：默认 sans-serif 链含 CJK 字体（与 code 镜像同配置），构建期
+#   findfont(fallback_to_default=False) 验证 CJK 字体可被解析，缺失即构建失败
+RUN apt-get update && \
+    apt-get -y install --no-install-recommends tzdata fonts-noto-color-emoji && \
+    ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone && \
+    fc-cache -f && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /root/.config/matplotlib && \
+    printf 'font.family: sans-serif\nfont.sans-serif: Noto Sans CJK SC, Noto Sans CJK JP, WenQuanYi Zen Hei, DejaVu Sans\naxes.unicode_minus: False\n' \
+      > /root/.config/matplotlib/matplotlibrc && \
+    python -c "from matplotlib import font_manager as fm; \
+print('CJK font:', fm.findfont(fm.FontProperties(family=['Noto Sans CJK SC', 'WenQuanYi Zen Hei']), fallback_to_default=False))"
+ENV TZ=Asia/Shanghai
 
 # ===== 10. 代码与入口配置 =====
 COPY scripts/ /root/
