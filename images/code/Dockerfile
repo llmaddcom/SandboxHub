@@ -36,7 +36,8 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
 # - git/curl/wget/openssh-client：拉取代码与远程交互（编码 Agent 必备）
 # - ripgrep/jq/less/tree/vim/nano/zip/unzip：日常检索与编辑（codex/opencode 重度依赖 rg）
 # - rclone/fuse3：工作区 MinIO 挂载（容器内 rclone mount 需 fusermount3 与 /dev/fuse）
-# - fonts-wqy-zenhei：matplotlib/reportlab 生成图表/PDF 时的中文字体（避免方块乱码）
+# - fonts-noto-cjk/fonts-wqy-zenhei：matplotlib/reportlab 生成图表/PDF 时的中文字体
+#   （两套并装：Noto 覆盖全、WenQuanYi 兜底 .ttc 兼容性，见下方 matplotlib 默认字体配置）
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget gnupg \
         git openssh-client \
@@ -44,7 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config xz-utils \
         ripgrep jq less tree vim nano zip unzip procps \
         rclone fuse3 \
-        fonts-wqy-zenhei && \
+        fonts-noto-cjk fonts-wqy-zenhei && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ===== 3. Node.js 20.x（从 npmmirror CDN 国内镜像下载，多架构）=====
@@ -73,6 +74,16 @@ RUN python -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/
 COPY ubuntu/app/requirements-base.txt /app/requirements-base.txt
 COPY ubuntu/app/requirements-code.txt /app/requirements-code.txt
 RUN python -m pip install -r /app/requirements-code.txt
+
+# ===== 5b. matplotlib 中文开箱即用（issue #3）=====
+# 默认 sans-serif 链路含 CJK 字体，中文图无需运行时自救；构建期预热字体缓存并用
+# findfont(fallback_to_default=False) 验证 CJK 字体确实可被 matplotlib 解析——
+# 字体缺失/发现不到时构建直接失败，防止「声称预装、实际豆腐块」的漂移再次发生。
+RUN mkdir -p /root/.config/matplotlib && \
+    printf 'font.family: sans-serif\nfont.sans-serif: Noto Sans CJK SC, Noto Sans CJK JP, WenQuanYi Zen Hei, DejaVu Sans\naxes.unicode_minus: False\n' \
+      > /root/.config/matplotlib/matplotlibrc && \
+    python -c "from matplotlib import font_manager as fm; \
+print('CJK font:', fm.findfont(fm.FontProperties(family=['Noto Sans CJK SC', 'WenQuanYi Zen Hei']), fallback_to_default=False))"
 
 # ===== 6. 复用与 desktop 同一套 app 代码（profile=code 时不加载 GUI 路由/依赖）=====
 COPY ubuntu/app/ /app/computer_use_demo/

@@ -141,6 +141,14 @@ RUN python -m pip install --upgrade pip==23.1.2 setuptools==58.0.4 wheel==0.40.0
 COPY app/requirements.txt /root/computer_use_demo/requirements.txt
 RUN python -m pip install -r /root/computer_use_demo/requirements.txt
 
+# ===== 9a. matplotlib 中文开箱即用（issue #3，与 code 镜像同配置）=====
+# 默认 sans-serif 链路含 CJK 字体；构建期预热字体缓存并验证 CJK 字体可被解析。
+RUN mkdir -p /root/.config/matplotlib && \
+    printf 'font.family: sans-serif\nfont.sans-serif: Noto Sans CJK SC, Noto Sans CJK JP, WenQuanYi Zen Hei, DejaVu Sans\naxes.unicode_minus: False\n' \
+      > /root/.config/matplotlib/matplotlibrc && \
+    python -c "from matplotlib import font_manager as fm; \
+print('CJK font:', fm.findfont(fm.FontProperties(family=['Noto Sans CJK SC', 'WenQuanYi Zen Hei']), fallback_to_default=False))"
+
 # ===== 9b. Node.js Playwright（pdf skill render_cover.js 使用）=====
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/ms-playwright
 RUN npm install -g playwright && \
