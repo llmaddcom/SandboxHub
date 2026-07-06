@@ -50,6 +50,15 @@ SandboxHub adds on top:
 
 ### 1. Build the sandbox image
 
+Preferred: the build script (tags both `latest` and the version from `images/ubuntu/app/VERSION`):
+
+```bash
+scripts/build-images.sh          # build code + ubuntu
+scripts/build-images.sh code     # code only
+```
+
+Manual builds:
+
 ```bash
 # Full desktop image (GUI + browser + skills)
 docker build -t sandbox-ubuntu:latest images/ubuntu/
@@ -58,6 +67,11 @@ docker build -t sandbox-ubuntu:latest images/ubuntu/
 # Build context is images/ (shares ubuntu/app code), so -f + context are required:
 docker build -f images/code/Dockerfile -t sandbox-code:latest images
 ```
+
+> **Image version reconciliation (deployment-drift guard):** when changing app code under `images/`, bump
+> `images/ubuntu/app/VERSION` and rebuild. Containers report their `app_version` via `GET /api/system/health`;
+> the reconciler periodically compares it against the repo's `images/ubuntu/app/VERSION` and logs a
+> `镜像版本漂移` warning on mismatch — "code merged but image never rebuilt" no longer drifts silently (issue #6).
 
 > **Network note (China):** Both Dockerfiles use domestic mirrors — TUNA for APT/pip and npmmirror for Node/npm — so no proxy is needed for APT/pip/npm.
 > The **code** image is fully buildable behind the Great Firewall with no proxy. The **ubuntu** image additionally pulls these from overseas (proxy recommended):
@@ -235,7 +249,8 @@ Full API docs available at `http://localhost:8000/docs` inside a running contain
 | `MINIO_ENDPOINT` | _(empty)_ | MinIO `host:port` (no scheme) for the rclone S3 remote; empty disables mounting |
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | _(empty)_ | MinIO credentials passed to the container's rclone |
 | `MINIO_SECURE` | `false` | `true` = use https for MinIO |
-| `RCLONE_VFS_CACHE_MODE` | `writes` | rclone VFS cache mode for the mount |
+| `RCLONE_VFS_CACHE_MODE` | `full` | rclone VFS cache mode; `full` avoids EIO on rename-over (`sed -i`) inside the write-back window (issue #9) |
+| `RCLONE_VFS_CACHE_MAX_SIZE` | `2G` | Local VFS cache size cap (reads are cached in `full` mode) |
 | `RCLONE_VFS_WRITE_BACK` | `1s` | Delay before a closed file is uploaded to MinIO |
 | `RCLONE_DIR_CACHE_TIME` | `2s` | Directory listing cache (MinIO→container visibility lag) |
 

@@ -282,7 +282,9 @@ class ContainerManager:
         """启动容器内 rclone mount（后台进程）。同步方法，在 asyncio.to_thread 中调用。
 
         rclone 的 S3(MinIO) remote 经 ``RCLONE_CONFIG_MINIO_*`` 环境变量内联，凭据不落盘。
-        ``--vfs-cache-mode writes`` + 短 ``--vfs-write-back`` 使文件关闭后近实时回写 MinIO；
+        ``--vfs-cache-mode full``（默认）对 rename/并发读写支持最完整——writes 模式下
+        写回窗口内的 rename-over（sed -i 等）会报 EIO（issue #9）；``--vfs-cache-max-size``
+        限制本地缓存体积。短 ``--vfs-write-back`` 使文件关闭后近实时回写 MinIO；
         ``--dir-cache-time`` 短使 MinIO 侧新增对象较快在容器内可见。容器与 rclone 均 root，
         无需 ``--allow-other``。
         """
@@ -293,6 +295,7 @@ class ContainerManager:
             f"mkdir -p {mount_path} && "
             f"rclone mount {remote} {mount_path} "
             f"--vfs-cache-mode {settings.RCLONE_VFS_CACHE_MODE} "
+            f"--vfs-cache-max-size {settings.RCLONE_VFS_CACHE_MAX_SIZE} "
             f"--vfs-write-back {settings.RCLONE_VFS_WRITE_BACK} "
             f"--dir-cache-time {settings.RCLONE_DIR_CACHE_TIME} "
             f"--poll-interval {settings.RCLONE_DIR_CACHE_TIME} "

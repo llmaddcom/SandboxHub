@@ -3,6 +3,8 @@ SandboxHub 配置
 
 职责：从 .env 加载全部配置项，提供全局单例 settings。
 """
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 
 
@@ -52,9 +54,14 @@ class Settings(BaseSettings):
     MINIO_ACCESS_KEY: str = ""
     MINIO_SECRET_KEY: str = ""
     MINIO_SECURE: bool = False        # True=https
-    # rclone VFS 写回策略：writes=仅写文件走本地缓存并在关闭后回写，平衡一致性与吞吐。
-    RCLONE_VFS_CACHE_MODE: str = "writes"
+    # rclone VFS 缓存策略：full=读写都走本地缓存，是 rclone 对 rename/并发读写支持
+    # 最完整的模式。writes 模式下，对尚在写回窗口内的文件做 rename-over（sed -i /
+    # mv 覆盖——模型批量替换的高频手段）会撞上 VFS 与 S3 后端的一致性竞态，报
+    # Input/output error（issue #9）；刚写入文件的 ls 偶发 EIO 同源（issue #3 附带）。
+    RCLONE_VFS_CACHE_MODE: str = "full"
     RCLONE_VFS_WRITE_BACK: str = "1s"  # 文件关闭后回写 MinIO 的延迟（越小越接近实时）
+    # full 模式会缓存读数据，需给缓存体积上限，防止大文件读放大占满容器磁盘。
+    RCLONE_VFS_CACHE_MAX_SIZE: str = "2G"
     RCLONE_DIR_CACHE_TIME: str = "2s"  # 目录列表缓存时长（影响 MinIO→容器可见延迟）
     # 挂载就绪探测：mountpoint 检测的轮询次数与间隔（秒）。
     MOUNT_READY_RETRIES: int = 20
@@ -78,6 +85,20 @@ class Settings(BaseSettings):
 
     def dns_servers(self) -> list[str]:
         return [s.strip() for s in self.SANDBOX_DNS.split(",") if s.strip()]
+
+    @property
+    def expected_app_version(self) -> str:
+        """仓库声明的沙盒 app 版本（images/ubuntu/app/VERSION）。
+
+        容器 app 经 /api/system/health 报告自身版本（镜像构建时 COPY 同一文件），
+        两者不一致即「代码已合、镜像未重建」的部署漂移（issue #6），由 reconciler
+        周期对账并告警。读不到（非源码部署）返回空串 = 关闭对账。
+        """
+        path = Path(__file__).resolve().parent.parent / "images" / "ubuntu" / "app" / "VERSION"
+        try:
+            return path.read_text().strip()
+        except OSError:
+            return ""
 
     @property
     def mount_ready(self) -> bool:

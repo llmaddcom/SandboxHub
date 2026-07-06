@@ -19,6 +19,7 @@ import psutil
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from .. import APP_VERSION
 from ..tools import ToolError
 from ..tools.run import run
 
@@ -38,6 +39,7 @@ def get_computer_tool():
 class HealthResponse(BaseModel):
     status: str = Field(description="服务状态")
     message: str = Field(description="状态描述信息")
+    app_version: str = Field(description="容器内 app 版本（来自镜像内 VERSION 文件），供部署漂移对账")
 
 
 class WaitRequest(BaseModel):
@@ -98,10 +100,11 @@ class SystemInfoResponse(BaseModel):
 
 @router.get("/health", response_model=HealthResponse, summary="健康检查")
 async def health_check():
-    """检查服务是否正常运行。"""
+    """检查服务是否正常运行，并暴露 app 版本供镜像漂移对账。"""
     return HealthResponse(
         status="healthy",
         message="沙盒操作服务运行正常",
+        app_version=APP_VERSION,
     )
 
 
