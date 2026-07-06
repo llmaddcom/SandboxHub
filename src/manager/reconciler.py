@@ -141,6 +141,18 @@ class SandboxReconciler:
                 )
                 await self._evict_record(record)
 
+        # 3b) 在池但容器已从 Docker 消失（如被手动 docker rm -f）：摘除池记录，
+        #     否则 maintain 以为池是满的不再补充、acquire 才能兜底发现。
+        #     取新鲜列表防「刚建好尚未入池」的误摘：容器总是先创建成功才入池，
+        #     在池的容器必然已存在于 Docker，新列表缺失即真消失。
+        fresh_ids = {c.container_id for c in await self._manager.list_managed()}
+        for cid in self._pool.container_ids() - fresh_ids:
+            removed = await self._pool.remove_by_id(cid)
+            if removed is not None:
+                logger.warning(
+                    f"warm 容器已消失，摘除池记录 | name={removed.container_name}"
+                )
+
         # 4) 闲置超时的已分配沙盒：自动回收（挂载容器销毁、warm 容器复位回池）。
         #    调用方（createrole）按 (user, role) 幂等 acquire，回收对其透明。
         if settings.SANDBOX_IDLE_TTL > 0:

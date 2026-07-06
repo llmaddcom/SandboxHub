@@ -13,9 +13,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     SANDBOX_PROFILE=code \
     HOME=/root \
-    # slim 镜像无 locale 包，C.UTF-8 内置且可正确处理 UTF-8（中文文件名/内容）
-    LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8 \
+    # 中文环境：locale 由下方 locales 包生成（与 desktop 镜像一致），时区固定东八区
+    LANG=zh_CN.UTF-8 \
+    LC_ALL=zh_CN.UTF-8 \
+    TZ=Asia/Shanghai \
     NODE_VERSION=20.18.0 \
     NPM_CONFIG_REGISTRY=https://registry.npmmirror.com \
     PATH=/usr/local/bin:$PATH
@@ -36,8 +37,9 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
 # - git/curl/wget/openssh-client：拉取代码与远程交互（编码 Agent 必备）
 # - ripgrep/jq/less/tree/vim/nano/zip/unzip：日常检索与编辑（codex/opencode 重度依赖 rg）
 # - rclone/fuse3：工作区 MinIO 挂载（容器内 rclone mount 需 fusermount3 与 /dev/fuse）
-# - fonts-noto-cjk/fonts-wqy-zenhei：matplotlib/reportlab 生成图表/PDF 时的中文字体
-#   （两套并装：Noto 覆盖全、WenQuanYi 兜底 .ttc 兼容性，见下方 matplotlib 默认字体配置）
+# - fonts-noto-cjk/fonts-wqy-*：matplotlib/reportlab 生成图表/PDF 时的中文字体
+#   （多套并装：Noto 覆盖全、WenQuanYi 黑体/微米黑兜底，见下方 matplotlib 默认字体配置）
+# - locales/tzdata：zh_CN.UTF-8 locale 与 Asia/Shanghai 时区（国内业务时间/日期正确）
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget gnupg \
         git openssh-client \
@@ -45,7 +47,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config xz-utils \
         ripgrep jq less tree vim nano zip unzip procps \
         rclone fuse3 \
-        fonts-noto-cjk fonts-wqy-zenhei && \
+        locales tzdata \
+        fonts-noto-cjk fonts-wqy-zenhei fonts-wqy-microhei && \
+    sed -i 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen && \
+    locale-gen && \
+    ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone && \
+    fc-cache -f && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ===== 3. Node.js 20.x（从 npmmirror CDN 国内镜像下载，多架构）=====
