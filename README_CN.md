@@ -50,6 +50,15 @@ SandboxHub 在此基础上新增：
 
 ### 1. 构建沙盒镜像
 
+推荐用构建脚本（同时打 `latest` 与版本标签，版本取自 `images/ubuntu/app/VERSION`）：
+
+```bash
+scripts/build-images.sh          # 构建 code + ubuntu
+scripts/build-images.sh code     # 只构建 code
+```
+
+也可手动构建：
+
 ```bash
 # 完整桌面镜像（GUI + 浏览器 + 技能）
 docker build -t sandbox-ubuntu:latest images/ubuntu/
@@ -58,6 +67,10 @@ docker build -t sandbox-ubuntu:latest images/ubuntu/
 # 构建上下文为 images/（复用 ubuntu/app 代码），故必须 -f 指定 Dockerfile 并以 images 为上下文：
 docker build -f images/code/Dockerfile -t sandbox-code:latest images
 ```
+
+> **镜像版本对账（防部署漂移）：** 改动 `images/` 下的 app 代码时请同步更新 `images/ubuntu/app/VERSION` 并重建镜像。
+> 容器经 `GET /api/system/health` 上报自身 `app_version`，SandboxHub 的 reconciler 周期比对该版本与仓库
+> `images/ubuntu/app/VERSION`，不一致时输出 `镜像版本漂移` 告警——「代码已合、镜像未重建」不再静默（issue #6）。
 
 > **国内网络说明：** 两个 Dockerfile 均已配置国内镜像 —— APT/pip 用 TUNA、Node/npm 用 npmmirror，APT/pip/npm 安装无需代理。
 > **code** 镜像可在墙内全程无代理构建；**ubuntu** 镜像还需从境外拉取以下资源（建议代理）：

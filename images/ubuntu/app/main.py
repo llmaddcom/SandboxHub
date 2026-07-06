@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import APP_VERSION
 from .routers import (
     file as file_router,
     process as process_router,
@@ -130,6 +131,7 @@ async def root():
     return {
         "service": "沙盒操作服务",
         "version": "2.0.0",
+        "app_version": APP_VERSION,
         "profile": PROFILE,
         "docs": "/docs",
         "endpoints": endpoints,

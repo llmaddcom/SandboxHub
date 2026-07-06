@@ -77,6 +77,16 @@ class PingResponse(BaseModel):
     reachable: Optional[bool] = None
 
 
+def _unavailable_detail(message: str, reason: str) -> dict:
+    """503 的结构化 detail：附池容量/在用数快照，便于调用方区分限流与宕机（issue #4）。"""
+    return {
+        "message": message,
+        "reason": reason,
+        "warm_pool": _warm_pool.status() if _warm_pool else {},
+        "sandboxes_ready": len(_registry.list_ready()) if _registry else 0,
+    }
+
+
 # ── 接口 ──────────────────────────────────────────────────────────────────────
 
 @router.post("/acquire", response_model=AcquireResponse)
@@ -128,7 +138,12 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
             )
         except Exception as e:
             logger.error(f"挂载容器冷启动失败 | type={req.sandbox_type} | err={e}")
-            raise HTTPException(status_code=503, detail=f"mounted cold start failed: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=_unavailable_detail(
+                    f"mounted cold start failed: {e}", "mounted_cold_start_failed"
+                ),
+            )
         record = await _registry.register(container, req.user_id, req.role_id)
         logger.info(
             f"挂载 sandbox 已分配 | id={record.sandbox_id} | ip={container.container_ip} "
@@ -144,7 +159,10 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
             container = await _container_manager.run_container(req.sandbox_type)
         except Exception as e:
             logger.error(f"冷启动失败 | type={req.sandbox_type} | err={e}")
-            raise HTTPException(status_code=503, detail=f"cold start failed: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=_unavailable_detail(f"cold start failed: {e}", "cold_start_failed"),
+            )
 
     record = await _registry.register(container, req.user_id, req.role_id)
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+import httpx
 from loguru import logger
 
 from src.config import settings
@@ -44,6 +45,8 @@ class SandboxReconciler:
         self._registry = registry
         self._pool = warm_pool
         self._manager = container_manager
+        # 已完成版本对账的容器 id（探测成功即记录，避免每轮重复请求；随容器消失修剪）
+        self._version_checked: set[str] = set()
 
     # ── 启动恢复 ─────────────────────────────────────────────────────────────
 
@@ -99,6 +102,10 @@ class SandboxReconciler:
                 await self.reconcile_once()
             except Exception as e:
                 logger.warning(f"沙盒对账失败，下一轮重试 | err={e}")
+            try:
+                await self.check_version_drift()
+            except Exception as e:
+                logger.warning(f"镜像版本对账失败，下一轮重试 | err={e}")
 
     async def reconcile_once(self) -> None:
         managed = await self._manager.list_managed()
@@ -150,6 +157,54 @@ class SandboxReconciler:
 
         # 5) released 记录修剪（内存有界）。
         await self._registry.prune_released(_RELEASED_RECORD_TTL)
+
+    # ── 镜像版本对账（issue #6：防「代码已合、镜像未重建」的静默漂移）────────
+
+    async def check_version_drift(self) -> None:
+        """比对运行中容器上报的 app 版本与仓库声明版本（images/ubuntu/app/VERSION）。
+
+        容器 app 随镜像 COPY 了同一份 VERSION 文件并经 /api/system/health 上报；
+        不一致（含旧镜像无该字段）说明运行中的镜像落后于仓库代码，告警提示重建。
+        每个容器只探测一次（探测成功即记账），不给容器 API 制造周期性压力。
+        """
+        expected = settings.expected_app_version
+        if not expected:
+            return
+        managed = await self._manager.list_managed()
+        alive_ids = {c.container_id for c in managed}
+        self._version_checked &= alive_ids  # 修剪已消失容器，集合有界
+
+        for c in managed:
+            if (
+                c.status != "running"
+                or not c.container_ip
+                or c.container_id in self._version_checked
+            ):
+                continue
+            reported = await self._probe_app_version(c.container_ip)
+            if reported is None:
+                continue  # 容器暂不可达，下一轮再试
+            self._version_checked.add(c.container_id)
+            if reported != expected:
+                logger.warning(
+                    f"镜像版本漂移 | name={c.container_name} | 容器 app={reported} "
+                    f"| 仓库={expected} | 运行中的镜像早于当前代码，"
+                    f"请执行 scripts/build-images.sh 重建镜像并回收在跑沙盒"
+                )
+
+    async def _probe_app_version(self, container_ip: str) -> str | None:
+        """读取容器 /api/system/health 上报的 app_version；不可达返回 None。
+
+        旧镜像的 health 无 app_version 字段，返回 "unknown"（视为漂移）。
+        """
+        url = f"http://{container_ip}:{settings.SANDBOX_API_PORT}/api/system/health"
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                return str(resp.json().get("app_version") or "unknown")
+        except Exception:
+            return None
 
     # ── 即时体检（proxy 失败 / acquire 复用时触发） ──────────────────────────
 

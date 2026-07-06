@@ -106,6 +106,7 @@ class EditTool:
         old_str: str,
         new_str: str | None = None,
         replace_all: bool = False,
+        context: str | None = None,
     ) -> ToolResult:
         """在文件中进行字符串替换。
 
@@ -114,6 +115,8 @@ class EditTool:
             old_str: 要替换的原始字符串
             new_str: 替换后的新字符串（None 表示删除）
             replace_all: 是否替换全部匹配（默认仅替换唯一匹配）
+            context: 可选定位提示（如函数/类名行）；old_str 命中多处时
+                优先取 context 之后的第一处
 
         返回:
             CLIResult: 包含替换结果和编辑片段的结果
@@ -126,7 +129,7 @@ class EditTool:
         self._validate_path("str_replace", _path)
         if old_str is None:
             raise ToolError("字符串替换操作必须提供 old_str 参数")
-        return self._str_replace(_path, old_str, new_str, replace_all)
+        return self._str_replace(_path, old_str, new_str, replace_all, context)
 
     async def insert(self, path: str, insert_line: int, insert_text: str) -> ToolResult:
         """在文件指定行插入内容。
@@ -228,16 +231,24 @@ class EditTool:
         )
 
     def _str_replace(
-        self, path: Path, old_str: str, new_str: str | None, replace_all: bool = False
+        self,
+        path: Path,
+        old_str: str,
+        new_str: str | None,
+        replace_all: bool = False,
+        context: str | None = None,
     ):
-        """字符串替换的内部实现。"""
-        # 读取文件内容并规范化制表符
-        file_content = self._read_file(path).expandtabs()
-        old_str = old_str.expandtabs()
-        new_str = new_str.expandtabs() if new_str is not None else ""
+        """字符串替换的内部实现。
+
+        原文保真：不做任何全局 expandtabs——文件中与本次编辑无关的 tab
+        （Makefile 配方行、Go 缩进、TSV 等）绝不被改写；old_str 与文件间的
+        tab/空格差异由匹配链的 tab_normalized 策略在「仅比较」层面容错。
+        """
+        file_content = self._read_file(path)
+        new_str = new_str if new_str is not None else ""
 
         # 通过多级容错匹配链定位替换区间（未找到/不唯一/跨度异常时抛 MatchError）
-        spans, strategy = find_replacement_spans(file_content, old_str, replace_all)
+        spans, strategy = find_replacement_spans(file_content, old_str, replace_all, context)
 
         # 执行替换
         new_file_content = apply_spans(file_content, spans, new_str)
@@ -265,9 +276,8 @@ class EditTool:
         return CLIResult(output=success_msg)
 
     def _insert(self, path: Path, insert_line: int, new_str: str):
-        """行插入的内部实现。"""
-        file_text = self._read_file(path).expandtabs()
-        new_str = new_str.expandtabs()
+        """行插入的内部实现。原文保真：不展开制表符，插入文本按原样写入。"""
+        file_text = self._read_file(path)
         file_text_lines = file_text.split("\n")
         n_lines_file = len(file_text_lines)
 

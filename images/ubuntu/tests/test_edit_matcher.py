@@ -55,6 +55,23 @@ def test_nbsp_normalized():
     assert strategy == "unicode_normalized"
 
 
+def test_tab_space_difference_tolerated():
+    # 文件用 tab 缩进，old_str 用等效空格书写 —— tab_normalized 命中，写回保留原文 tab
+    content = "all:\n\techo hi\n"
+    old = "all:\n        echo hi"  # \t expandtabs 后为 8 空格
+    spans, strategy = find_replacement_spans(content, old)
+    assert strategy == "tab_normalized"
+
+
+def test_unrelated_tabs_never_expanded():
+    # 编辑 Makefile 的一处，其余配方行的 tab 必须原样保留（issue #8）
+    content = "all:\n\techo hi\n\nclean:\n\trm -f out\n"
+    spans, strategy = find_replacement_spans(content, "echo hi")
+    out = apply_spans(content, spans, "echo bye")
+    assert out == "all:\n\techo bye\n\nclean:\n\trm -f out\n"
+    assert "\trm -f out" in out  # 无关行的 tab 未被展开
+
+
 def test_block_anchor_middle_line_drift():
     # 首尾行锚定一致，中间行有细微差异 —— 块锚定命中
     content = "def run():\n    x = compute_value(a, b)\n    return x\n"
@@ -88,6 +105,60 @@ def test_not_found_lists_tried_strategies():
     assert ei.value.reason == "not_found"
     assert "exact" in ei.value.info["tried"]
     assert "block_anchor" in ei.value.info["tried"]
+    assert "file_read" not in ei.value.detail  # 该工具已不存在，文案不得引用
+
+
+def test_not_found_returns_closest_region():
+    # old_str 与文件某处相似但不匹配 —— not_found 应回传最相似位置的真实片段
+    content = (
+        "import os\n\n"
+        "def main():\n"
+        "    value = compute(1, 2)\n"
+        "    print(value)\n"
+        "    return value\n"
+    )
+    old = "def main():\n    value = compute(1, 2, 3)\n    print(val)\n    return val"
+    with pytest.raises(MatchError) as ei:
+        find_replacement_spans(content, old)
+    assert ei.value.reason == "not_found"
+    closest = ei.value.info["closest"]
+    assert closest["line"] == 3
+    assert "compute(1, 2)" in closest["snippet"]
+    assert closest["snippet"] in ei.value.detail
+
+
+def test_not_found_no_closest_when_dissimilar():
+    with pytest.raises(MatchError) as ei:
+        find_replacement_spans("alpha\nbeta\n", "zzzz\nqqqq")
+    assert "closest" not in ei.value.info
+
+
+def test_context_disambiguates_not_unique():
+    content = (
+        "def a():\n"
+        "    x = 1\n"
+        "    return x\n\n"
+        "def b():\n"
+        "    x = 1\n"
+        "    return x\n"
+    )
+    # 无 context：两处命中 → not_unique
+    with pytest.raises(MatchError) as ei:
+        find_replacement_spans(content, "    x = 1")
+    assert ei.value.reason == "not_unique"
+    # 带 context：取 def b() 之后的第一处
+    spans, _ = find_replacement_spans(content, "    x = 1", context="def b():")
+    out = apply_spans(content, spans, "    x = 2")
+    assert out == (
+        "def a():\n    x = 1\n    return x\n\ndef b():\n    x = 2\n    return x\n"
+    )
+
+
+def test_context_not_matching_falls_back_to_not_unique():
+    content = "x\nx\n"
+    with pytest.raises(MatchError) as ei:
+        find_replacement_spans(content, "x", context="def nowhere():")
+    assert ei.value.reason == "not_unique"
 
 
 def test_empty_old_str_rejected():
@@ -191,3 +262,51 @@ def test_endpoint_delete_via_empty_new_str(client, tmp_path):
     )
     assert resp.status_code == 200
     assert (tmp_path / "e.txt").read_text() == "keep\n"
+
+
+def test_endpoint_makefile_tabs_preserved(client, tmp_path):
+    # issue #8：编辑 Makefile 一处，全文件 tab 不得被展开成空格
+    makefile = "all: build\n\techo hi\n\nbuild:\n\tgcc -o out main.c\n"
+    path = _write(tmp_path, "Makefile", makefile)
+    resp = client.post(
+        "/api/file/replace",
+        json={"path": path, "old_str": "echo hi", "new_str": "echo done"},
+    )
+    assert resp.status_code == 200
+    text = (tmp_path / "Makefile").read_text()
+    assert text == "all: build\n\techo done\n\nbuild:\n\tgcc -o out main.c\n"
+
+
+def test_endpoint_insert_preserves_tabs(client, tmp_path):
+    path = _write(tmp_path, "m.mk", "all:\n\techo hi\n")
+    resp = client.post(
+        "/api/file/insert",
+        json={"path": path, "insert_line": 2, "insert_text": "\techo bye"},
+    )
+    assert resp.status_code == 200
+    assert (tmp_path / "m.mk").read_text() == "all:\n\techo hi\n\techo bye\n"
+
+
+def test_endpoint_not_found_includes_closest(client, tmp_path):
+    path = _write(
+        tmp_path, "f.py", "def main():\n    value = compute(1, 2)\n    return value\n"
+    )
+    resp = client.post(
+        "/api/file/replace",
+        json={"path": path, "old_str": "def main():\n    value = compute(9, 9)\n    return val", "new_str": "x"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["reason"] == "not_found"
+    assert body["closest"]["line"] == 1
+    assert "compute(1, 2)" in body["closest"]["snippet"]
+
+
+def test_endpoint_context_param(client, tmp_path):
+    path = _write(tmp_path, "g.py", "def a():\n    x = 1\n\ndef b():\n    x = 1\n")
+    resp = client.post(
+        "/api/file/replace",
+        json={"path": path, "old_str": "    x = 1", "new_str": "    x = 2", "context": "def b():"},
+    )
+    assert resp.status_code == 200
+    assert (tmp_path / "g.py").read_text() == "def a():\n    x = 1\n\ndef b():\n    x = 2\n"

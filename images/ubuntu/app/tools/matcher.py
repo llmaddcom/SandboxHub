@@ -4,16 +4,21 @@
 
 1. exact              —— 精确逐字符相等
 2. rstrip_line        —— 逐行右侧 trim（容忍行尾空白）
-3. strip_line         —— 逐行两侧 trim（容忍缩进差异）
-4. unicode_normalized —— Unicode 归一化（花引号/破折号/不间断空格 → ASCII）后精确
-5. block_anchor       —— ≥3 行块锚定首尾行 + 中间行相似度（容忍块内细微差异）
+3. tab_normalized     —— 逐行 expandtabs 后右侧 trim（容忍 tab/空格书写差异）
+4. strip_line         —— 逐行两侧 trim（容忍缩进差异）
+5. unicode_normalized —— Unicode 归一化（花引号/破折号/不间断空格 → ASCII）后精确
+6. block_anchor       —— ≥3 行块锚定首尾行 + 中间行相似度（容忍块内细微差异）
 
 两道防止「容错过度」的保险：
 - 唯一性强制：命中多处且非 replace_all 时拒绝（not_unique）。
 - 跨度保险：模糊匹配跨度远大于 old_str 时拒绝（disproportionate）。
 
 匹配函数返回的是在「原始 content 上的字符区间」，调用方按区间做替换，
-因此即便比较时做了 trim/归一化，写回的也是原文实际内容之外的部分保持不变。
+因此即便比较时做了 trim/expandtabs/归一化，写回时原文实际内容之外的部分保持不变
+（特别是：文件中与本次编辑无关的 tab 绝不会被展开成空格）。
+
+匹配全部失败（not_found）时，用整块相似度在文件中定位「最相似的位置」，
+随错误回传行号与真实片段，让调用方一轮即可基于实际内容重新构造 old_str。
 """
 
 from difflib import SequenceMatcher
@@ -22,6 +27,7 @@ from difflib import SequenceMatcher
 STRATEGY_LABELS: dict[str, str] = {
     "exact": "精确匹配",
     "rstrip_line": "行尾空白容错",
+    "tab_normalized": "Tab 归一化",
     "strip_line": "缩进容错",
     "unicode_normalized": "Unicode 归一化",
     "block_anchor": "块锚定相似匹配",
@@ -31,6 +37,13 @@ STRATEGY_LABELS: dict[str, str] = {
 _BLOCK_SIMILARITY_THRESHOLD = 0.65
 # block_anchor 允许的块大小相对偏差（±25%）
 _BLOCK_SIZE_TOLERANCE = 0.25
+
+# not_found 时「最相似位置」的最低相似度门槛（低于此不回传，避免误导）
+_CLOSEST_MIN_RATIO = 0.4
+# 最相似片段前后附带的上下文行数
+_CLOSEST_CONTEXT_LINES = 2
+# 超过此行数的文件跳过相似度扫描（防止极端大文件拖慢错误路径）
+_CLOSEST_MAX_LINES = 50_000
 
 # 长度保持的 Unicode → ASCII 归一化映射（每个字符映射为恰好 1 个 ASCII 字符，
 # 因此在归一化后的文本中找到的下标可直接用于原始文本）。
@@ -202,6 +215,8 @@ def _block_anchor_spans(content: str, old_str: str) -> list[tuple[int, int]]:
 _STRATEGIES = [
     ("exact", _exact_spans),
     ("rstrip_line", lambda c, o: _line_window_spans(c, o, str.rstrip)),
+    # 比较时逐行 expandtabs（写回仍是原文），容忍 old_str 与文件间 tab/空格书写差异
+    ("tab_normalized", lambda c, o: _line_window_spans(c, o, lambda l: l.expandtabs().rstrip())),
     ("strip_line", lambda c, o: _line_window_spans(c, o, str.strip)),
     ("unicode_normalized", _unicode_spans),
     ("block_anchor", _block_anchor_spans),
@@ -221,12 +236,78 @@ def _occurrence_lines(content: str, spans: list[tuple[int, int]]) -> list[int]:
     return [content[: s].count("\n") + 1 for s, _ in spans]
 
 
+def _closest_region(content: str, old_str: str) -> dict | None:
+    """定位与 old_str 整块最相似的行窗口，供 not_found 时回传真实片段。
+
+    对每个同行数窗口做「逐行 strip 后拼接」的整块相似度比较（对标 codex
+    seek_sequence 的思路），取相似度最高且达门槛的窗口，返回
+    {line, snippet, similarity}；无达标窗口返回 None。
+    """
+    old_lines, _ = _split_old_lines(old_str)
+    old_norm = "\n".join(l.strip() for l in old_lines)
+    if not old_norm.strip():
+        return None
+
+    content_lines, _ = _line_offsets(content)
+    n, m = len(content_lines), len(old_lines)
+    if n > _CLOSEST_MAX_LINES:
+        return None
+
+    sm = SequenceMatcher()
+    sm.set_seq2(old_norm)  # SequenceMatcher 对 seq2 有缓存，窗口内容走 seq1
+    best_ratio, best_i = 0.0, -1
+    for i in range(max(1, n - m + 1)):
+        cand = "\n".join(l.strip() for l in content_lines[i: i + m])
+        sm.set_seq1(cand)
+        if sm.real_quick_ratio() <= best_ratio or sm.quick_ratio() <= best_ratio:
+            continue
+        ratio = sm.ratio()
+        if ratio > best_ratio:
+            best_ratio, best_i = ratio, i
+
+    if best_i < 0 or best_ratio < _CLOSEST_MIN_RATIO:
+        return None
+    start = max(0, best_i - _CLOSEST_CONTEXT_LINES)
+    end = min(n, best_i + m + _CLOSEST_CONTEXT_LINES)
+    return {
+        "line": best_i + 1,
+        "snippet": "\n".join(content_lines[start:end]),
+        "similarity": round(best_ratio, 2),
+    }
+
+
+def _pick_span_after_context(
+    content: str, spans: list[tuple[int, int]], context: str
+) -> tuple[int, int] | None:
+    """not_unique 消歧：取「context 首个非空行命中处」之后的第一个匹配区间。
+
+    context 是调用方透传的定位提示（如 apply_patch 的 @@ 函数/类名头），
+    按「文件行包含 context 行」的宽松语义定位；定位失败返回 None（回落 not_unique）。
+    """
+    ctx_line = next((l.strip() for l in context.split("\n") if l.strip()), "")
+    if not ctx_line:
+        return None
+    content_lines, offsets = _line_offsets(content)
+    for idx, line in enumerate(content_lines):
+        if ctx_line in line:
+            pos = offsets[idx]
+            return next((sp for sp in spans if sp[0] >= pos), None)
+    return None
+
+
 def find_replacement_spans(
-    content: str, old_str: str, replace_all: bool = False
+    content: str,
+    old_str: str,
+    replace_all: bool = False,
+    context: str | None = None,
 ) -> tuple[list[tuple[int, int]], str]:
     """在 content 中定位 old_str 的替换区间。
 
     按策略链严格度递减依次尝试，命中即止。
+
+    参数:
+        context: 可选定位提示（如函数/类名所在行）。命中多处时优先取
+            context 行之后的第一处，替代「扩大上下文重试」的多轮往返。
 
     返回:
         (spans, strategy): spans 为原文中需替换的非重叠字符区间（已排序），
@@ -243,17 +324,25 @@ def find_replacement_spans(
         if not spans:
             continue
 
-        # 保险一：唯一性强制
+        # 保险一：唯一性强制（可被 context 定位提示消歧）
         if len(spans) > 1 and not replace_all:
-            lines = _occurrence_lines(content, spans)
-            raise MatchError(
-                "not_unique",
-                f"old_str 不唯一：经「{STRATEGY_LABELS[name]}」在第 {lines} 行命中 "
-                f"{len(spans)} 处。请扩大上下文使其唯一，或设置 replace_all=true 全部替换。",
-                occurrences=len(spans),
-                lines=lines,
-                strategy=name,
-            )
+            picked = _pick_span_after_context(content, spans, context) if context else None
+            if picked is not None:
+                spans = [picked]
+            else:
+                lines = _occurrence_lines(content, spans)
+                hint = (
+                    f"（context {context!r} 未能定位到唯一命中）" if context else ""
+                )
+                raise MatchError(
+                    "not_unique",
+                    f"old_str 不唯一：经「{STRATEGY_LABELS[name]}」在第 {lines} 行命中 "
+                    f"{len(spans)} 处{hint}。请扩大上下文使其唯一、传入 context 定位提示，"
+                    f"或设置 replace_all=true 全部替换。",
+                    occurrences=len(spans),
+                    lines=lines,
+                    strategy=name,
+                )
 
         # 保险二：跨度保险（仅模糊策略）
         if name in _FUZZY_STRATEGIES:
@@ -272,12 +361,19 @@ def find_replacement_spans(
         return spans, name
 
     tried = "、".join(STRATEGY_LABELS[name] for name, _ in _STRATEGIES)
-    raise MatchError(
-        "not_found",
-        f"old_str 在文件中未找到（已依次尝试：{tried}）。"
-        f"建议先用 file_read 查看文件最新内容后再重试。",
-        tried=[name for name, _ in _STRATEGIES],
-    )
+    detail = f"old_str 在文件中未找到（已依次尝试：{tried}）。"
+    info: dict = {"tried": [name for name, _ in _STRATEGIES]}
+    closest = _closest_region(content, old_str)
+    if closest is not None:
+        detail += (
+            f"最相似的位置在第 {closest['line']} 行"
+            f"（相似度 {closest['similarity']}）：\n{closest['snippet']}\n"
+            "请基于上述文件实际内容重新构造 old_str。"
+        )
+        info["closest"] = closest
+    else:
+        detail += "建议先查看文件最新内容后再重试。"
+    raise MatchError("not_found", detail, **info)
 
 
 def apply_spans(content: str, spans: list[tuple[int, int]], new_str: str) -> str:

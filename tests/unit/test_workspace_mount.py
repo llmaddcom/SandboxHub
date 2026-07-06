@@ -93,6 +93,7 @@ def test_mount_workspace_sync_builds_rclone_command(mock_docker, monkeypatch):
     monkeypatch.setattr(settings, "MINIO_ENDPOINT", "minio:9000")
     monkeypatch.setattr(settings, "MINIO_ACCESS_KEY", "ak")
     monkeypatch.setattr(settings, "MINIO_SECRET_KEY", "sk")
+    monkeypatch.setattr(settings, "RCLONE_VFS_CACHE_MODE", "full")
     container = MagicMock()
     mock_docker.containers.get.return_value = container
     mgr = ContainerManager()
@@ -101,7 +102,9 @@ def test_mount_workspace_sync_builds_rclone_command(mock_docker, monkeypatch):
     call = container.exec_run.call_args
     cmd = call.kwargs["cmd"][-1]
     assert "rclone mount minio:cr-ws/roles/r1 /workspace" in cmd
-    assert "--vfs-cache-mode" in cmd
+    # full 模式：写回窗口内 rename-over（sed -i）在 writes 模式下报 EIO（issue #9）
+    assert "--vfs-cache-mode full" in cmd
+    assert "--vfs-cache-max-size" in cmd
     assert call.kwargs["detach"] is True
     assert call.kwargs["environment"]["RCLONE_CONFIG_MINIO_ACCESS_KEY_ID"] == "ak"
 

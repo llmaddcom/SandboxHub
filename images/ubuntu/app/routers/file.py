@@ -69,6 +69,14 @@ class ReplaceRequest(BaseModel):
         default=False,
         description="是否替换全部匹配（默认仅替换唯一匹配；为 false 时命中多处会返回 400）",
     )
+    context: str | None = Field(
+        default=None,
+        description=(
+            "可选定位提示（如函数/类名所在行，对应补丁语言的 @@ 头）。"
+            "old_str 命中多处时优先取 context 行之后的第一处，用于消歧 not_unique"
+        ),
+        examples=["def main():"],
+    )
 
 
 class InsertRequest(BaseModel):
@@ -176,13 +184,15 @@ async def replace_in_file(request: ReplaceRequest):
     （精确 → 行尾/缩进 trim → Unicode 归一化 → 块锚定），命中即止。
 
     失败时返回结构化 400，body 至少含人类可读 `detail` 与机器可读 `reason`：
-    - `not_found`: old_str 未找到（含已尝试的容错级别）
-    - `not_unique`: old_str 不唯一（含命中处数与行号，建议扩大上下文或用 replace_all）
+    - `not_found`: old_str 未找到（含已尝试的容错级别；若能定位到最相似位置，
+      附 `closest={line, snippet, similarity}` 真实文件片段供一轮自纠）
+    - `not_unique`: old_str 不唯一（含命中处数与行号；可传 `context` 定位提示消歧，
+      或扩大上下文 / 用 replace_all）
     - `disproportionate`: 匹配跨度异常被拒
     - `path_error`: 文件不存在 / 不可读 / 路径非法
 
     参数:
-        request: 包含文件路径、原字符串、新字符串及 replace_all 的请求体
+        request: 包含文件路径、原字符串、新字符串、replace_all 及可选 context 的请求体
 
     返回:
         FileResponse: 包含替换结果和编辑片段
@@ -190,7 +200,11 @@ async def replace_in_file(request: ReplaceRequest):
     try:
         tool = get_edit_tool()
         result = await tool.str_replace(
-            request.path, request.old_str, request.new_str, request.replace_all
+            request.path,
+            request.old_str,
+            request.new_str,
+            request.replace_all,
+            request.context,
         )
         return FileResponse(
             success=True,

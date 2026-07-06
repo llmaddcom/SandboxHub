@@ -240,3 +240,59 @@ async def test_evict_if_dead_noop_for_unknown_sandbox(parts):
     registry, pool, reconciler, manager = parts
     assert await reconciler.evict_if_dead("nonexistent") is False
     manager.remove_container.assert_not_called()
+
+
+# ── 镜像版本对账（issue #6）───────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_version_drift_probes_once_per_container(parts, monkeypatch):
+    _, _, reconciler, manager = parts
+    manager.list_managed.return_value = [make_managed("c1")]
+    monkeypatch.setattr(
+        type(settings), "expected_app_version", property(lambda self: "2026.07.06")
+    )
+    reconciler._probe_app_version = AsyncMock(return_value="2026.06.24")
+
+    await reconciler.check_version_drift()
+    assert reconciler._version_checked == {"c1"}
+
+    # 已记账的容器不再重复探测
+    await reconciler.check_version_drift()
+    reconciler._probe_app_version.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_version_drift_skips_when_no_expected_version(parts, monkeypatch):
+    _, _, reconciler, manager = parts
+    monkeypatch.setattr(type(settings), "expected_app_version", property(lambda self: ""))
+    await reconciler.check_version_drift()
+    manager.list_managed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_version_drift_retries_unreachable_container(parts, monkeypatch):
+    _, _, reconciler, manager = parts
+    manager.list_managed.return_value = [make_managed("c1")]
+    monkeypatch.setattr(
+        type(settings), "expected_app_version", property(lambda self: "2026.07.06")
+    )
+    reconciler._probe_app_version = AsyncMock(return_value=None)  # 容器暂不可达
+
+    await reconciler.check_version_drift()
+    assert reconciler._version_checked == set()  # 未记账，下一轮重试
+
+    reconciler._probe_app_version = AsyncMock(return_value="2026.07.06")
+    await reconciler.check_version_drift()
+    assert reconciler._version_checked == {"c1"}
+
+
+@pytest.mark.asyncio
+async def test_version_checked_pruned_when_container_gone(parts, monkeypatch):
+    _, _, reconciler, manager = parts
+    monkeypatch.setattr(
+        type(settings), "expected_app_version", property(lambda self: "2026.07.06")
+    )
+    reconciler._version_checked = {"gone"}
+    manager.list_managed.return_value = []
+    await reconciler.check_version_drift()
+    assert reconciler._version_checked == set()
