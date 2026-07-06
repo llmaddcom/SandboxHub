@@ -7,6 +7,8 @@ HTTP 透传转发器
 """
 from __future__ import annotations
 
+import json
+
 import httpx
 from fastapi import Request, Response
 from loguru import logger
@@ -83,10 +85,42 @@ async def forward(container_ip: str, path: str, request: Request) -> Response:
             headers=resp_headers,
             media_type=resp.headers.get("content-type"),
         )
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        # 容器不可达（已死/被回收/网络消失）。区分于「命令失败」，给调用方可执行指引；
+        # proxy 路由层看到 502 会触发即时体检，死容器被驱逐，下一次 acquire 自动重建。
+        logger.warning(f"proxy 上游不可达 | ip={container_ip} | path={path} | err={e}")
+        return _error_response(
+            502,
+            error=f"proxy error: {e}",
+            reason="upstream_unreachable",
+            detail=(
+                "沙盒容器不可达（可能已退出或被回收），已触发体检自愈。"
+                "请重新 acquire 获取沙盒后重试本次调用。"
+            ),
+        )
+    except httpx.TimeoutException as e:
+        # 容器可达但响应超时（区别于容器已死，不应触发驱逐）。
+        logger.warning(f"proxy 上游超时 | ip={container_ip} | path={path} | err={e}")
+        return _error_response(
+            504,
+            error=f"proxy error: {e}",
+            reason="upstream_timeout",
+            detail="沙盒容器响应超时（容器仍在运行），请稍后重试或缩短命令执行时间。",
+        )
     except Exception as e:
         logger.warning(f"proxy forward 失败 | ip={container_ip} | path={path} | err={e}")
-        return Response(
-            content=f'{{"error": "proxy error: {e}"}}',
-            status_code=502,
-            media_type="application/json",
+        return _error_response(
+            502,
+            error=f"proxy error: {e}",
+            reason="proxy_error",
+            detail="代理转发失败，已触发沙盒体检。若持续失败请重新 acquire。",
         )
+
+
+def _error_response(status_code: int, **payload: str) -> Response:
+    """构造结构化 JSON 错误响应（json.dumps 保证转义正确，错误信息可含任意字符）。"""
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False),
+        status_code=status_code,
+        media_type="application/json",
+    )
