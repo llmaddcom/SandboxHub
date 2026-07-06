@@ -296,3 +296,23 @@ async def test_version_checked_pruned_when_container_gone(parts, monkeypatch):
     manager.list_managed.return_value = []
     await reconciler.check_version_drift()
     assert reconciler._version_checked == set()
+
+
+@pytest.mark.asyncio
+async def test_pool_entry_pruned_when_container_vanishes(parts):
+    # 容器被 docker rm -f 彻底移除（docker 列表里完全消失）时，池记录须被摘除，
+    # 否则 maintain 认为池是满的、不再补充
+    _, pool, reconciler, manager = parts
+    await pool.restore(make_info("gone"))
+    manager.list_managed.return_value = []
+    await reconciler.reconcile_once()
+    assert pool.container_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_pool_entry_kept_when_container_alive(parts):
+    _, pool, reconciler, manager = parts
+    await pool.restore(make_info("alive"))
+    manager.list_managed.return_value = [make_managed("alive")]
+    await reconciler.reconcile_once()
+    assert pool.container_ids() == {"alive"}
