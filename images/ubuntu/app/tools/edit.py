@@ -313,6 +313,11 @@ class EditTool:
         success_msg += "请检查更改是否符合预期（缩进正确、无重复行等），必要时可再次编辑。"
         return CLIResult(output=success_msg)
 
+    # 编码探测顺序：UTF-8 严格解码优先；失败则尝试 GB18030（GBK/GB2312 超集，
+    # 覆盖国内用户上传的中文 Office/SQL/CSV 等文本常见编码）；最后以 UTF-8 + 替换
+    # 兜底，保证 view/replace 不因编码问题整体失败。
+    _FALLBACK_ENCODINGS: tuple[str, ...] = ("utf-8", "gb18030")
+
     def _read_file(self, path: Path) -> str:
         """从指定路径读取文件内容。
 
@@ -323,12 +328,19 @@ class EditTool:
             文件内容字符串
 
         抛出:
-            ToolError: 如果读取失败
+            ToolError: 如果读取失败（非编码原因，如无权限）
         """
         try:
-            return path.read_text()
+            raw = path.read_bytes()
         except Exception as e:
             raise ToolError(f"读取 {path} 时遇到错误: {e}") from None
+
+        for encoding in self._FALLBACK_ENCODINGS:
+            try:
+                return raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
 
     def _write_file(self, path: Path, file: str):
         """将内容写入指定文件路径。
