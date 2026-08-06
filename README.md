@@ -239,6 +239,10 @@ Full API docs available at `http://localhost:8000/docs` inside a running contain
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SANDBOX_HUB_PORT` | `8088` | SandboxHub service port |
+| `SANDBOX_HUB_HOST` | `0.0.0.0` | Listen address; tighten to `127.0.0.1` or an intranet IP for private deployments |
+| `SANDBOX_HUB_API_KEY` | _(empty)_ | Optional API auth: when set, every request must carry a matching `X-API-Key` header (401 otherwise); `/v1/health` is exempt. Empty = no auth (unchanged behavior) |
+| `SANDBOX_DNS` | _(empty)_ | Custom container DNS (comma-separated, injected via `docker --dns`); when set, `SANDBOX_KEEP_DNS=1` is also injected into containers so the ubuntu entrypoint does not overwrite `resolv.conf` |
+| `SANDBOX_KEEP_DNS` | `false` | `true` = always inject `SANDBOX_KEEP_DNS=1` so containers keep the Docker-injected `resolv.conf` (host `daemon.json` / `--dns`) instead of the ubuntu entrypoint overwriting it with `8.8.8.8`/`1.1.1.1`. Needs a rebuilt image to take effect |
 | `DOCKER_IMAGE_UBUNTU` | `sandbox-ubuntu:latest` | Ubuntu sandbox image name |
 | `WARM_POOL_UBUNTU` | `3` | Pre-warmed Ubuntu containers |
 | `SANDBOX_NETWORK` | `bridge` | Docker network mode |
@@ -253,6 +257,47 @@ Full API docs available at `http://localhost:8000/docs` inside a running contain
 | `RCLONE_VFS_CACHE_MAX_SIZE` | `2G` | Local VFS cache size cap (reads are cached in `full` mode) |
 | `RCLONE_VFS_WRITE_BACK` | `1s` | Delay before a closed file is uploaded to MinIO |
 | `RCLONE_DIR_CACHE_TIME` | `2s` | Directory listing cache (MinIO→container visibility lag) |
+
+See `.env.example` for the full annotated list (reconciler, proxy timeouts, mount probing, etc.).
+
+---
+
+## Offline / Air-gapped Deployment Notes
+
+For private deployments on customer machines without internet access. Build the sandbox
+images on the target machine (or load them via `docker save`/`docker load`) **before**
+going offline — build time requires internet, runtime does not.
+
+**1. Container DNS.** The ubuntu image's entrypoint overwrites `/etc/resolv.conf` with
+`8.8.8.8`/`1.1.1.1` at startup, which shadows any `docker --dns` configuration and makes
+every in-container DNS lookup time out on an offline machine. Fix: set `SANDBOX_DNS` to
+the customer's intranet DNS (or set `SANDBOX_KEEP_DNS=true` to rely on the host's Docker
+DNS config); either one injects `SANDBOX_KEEP_DNS=1` into containers, which the
+entrypoint honors by skipping the overwrite. **This requires an image rebuilt from the
+current `entrypoint.sh`** — older images ignore the variable. The code image never
+overwrites `resolv.conf`, so it needs nothing beyond `--dns`.
+
+**2. In-sandbox `pip install` / `npm install`.** Both images bake in public Chinese
+mirrors: pip is pointed at the Tsinghua PyPI mirror (`pip config set` during build, see
+`images/ubuntu/Dockerfile` and `images/code/Dockerfile`) and npm/yarn/pnpm at
+`registry.npmmirror.com` (`NPM_CONFIG_REGISTRY` env + `npm config set`). Offline, any
+package installation inside a sandbox will fail. There is **no SandboxHub config knob**
+to override these at runtime. Options if the customer has an internal mirror:
+- Per command (works today, agent-driven): `pip install -i http://<mirror>/simple <pkg>`
+  and `npm install --registry=http://<mirror> <pkg>`. Not persistent across containers.
+- Permanent: rebuild the images with the mirror URLs replaced (the pip `config set` /
+  `NPM_CONFIG_REGISTRY` lines in both Dockerfiles), or pre-install everything needed at
+  build time.
+
+**3. Lock down the API.** SandboxHub is an arbitrary-command-execution endpoint. On a
+shared intranet, set `SANDBOX_HUB_API_KEY` (the createrole client sends the matching
+`X-API-Key` header using the same-named env var) and/or bind `SANDBOX_HUB_HOST` to
+`127.0.0.1` when co-located with createrole.
+
+**4. MinIO endpoint.** `MINIO_ENDPOINT` must be reachable *from inside containers*.
+`172.17.0.1:9000` is the host-gateway address of the default `bridge` network; adjust it
+for custom networks or a remote MinIO, and make sure it points at the **same MinIO
+instance** createrole uses.
 
 ---
 

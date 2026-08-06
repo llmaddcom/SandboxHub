@@ -6,8 +6,13 @@
 
 set -e
 
-# 0. DNS 稳定性修复（运行时写入，Docker 会覆盖构建时的 resolv.conf）
-echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee /etc/resolv.conf > /dev/null || true
+# 0. DNS 稳定性修复（运行时写入，Docker 会覆盖构建时的 resolv.conf）。
+#    SANDBOX_KEEP_DNS 非空时跳过覆写，保留 Docker 注入的 resolv.conf（--dns / 宿主
+#    daemon.json）——私有化/离线部署公网 8.8.8.8/1.1.1.1 不可达，覆写会让容器内域名
+#    解析全部超时。SandboxHub 在配置了 SANDBOX_DNS 或 SANDBOX_KEEP_DNS 时自动注入。
+if [ -z "${SANDBOX_KEEP_DNS:-}" ]; then
+    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee /etc/resolv.conf > /dev/null || true
+fi
 
 # 1. 启动虚拟桌面环境（TigerVNC、剪贴板、tint2、openbox）
 ./start_all.sh

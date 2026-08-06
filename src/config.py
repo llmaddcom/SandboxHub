@@ -10,6 +10,11 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     SANDBOX_HUB_PORT: int = 8088
+    # 监听地址：默认 0.0.0.0（保持现状）。私有化部署建议收紧为 127.0.0.1 或指定内网 IP。
+    SANDBOX_HUB_HOST: str = "0.0.0.0"
+    # API 鉴权（可选）：非空时所有请求须带 X-API-Key 头且匹配，否则 401；/v1/health 豁免。
+    # 空 = 完全不鉴权（当前行为）。createrole 客户端用同名 env SANDBOX_HUB_API_KEY 配置。
+    SANDBOX_HUB_API_KEY: str = ""
     SANDBOX_NETWORK: str = "bridge"
     DOCKER_IMAGE_UBUNTU: str = "sandbox-ubuntu:latest"
     DOCKER_IMAGE_CODE: str = "sandbox-code:latest"
@@ -40,6 +45,11 @@ class Settings(BaseSettings):
     SANDBOX_HTTP_PROXY: str = ""
     # 容器自定义 DNS：逗号分隔，空=用 Docker 默认 DNS
     SANDBOX_DNS: str = ""
+    # 保留 Docker 注入的 resolv.conf：ubuntu 镜像 entrypoint 默认把 /etc/resolv.conf 覆写为
+    # 8.8.8.8/1.1.1.1（会顶掉 --dns 注入）。SANDBOX_DNS 非空时自动向容器注入
+    # SANDBOX_KEEP_DNS=1 跳过覆写；此开关允许在不配 SANDBOX_DNS 时也强制保留
+    # （如离线机依赖宿主 daemon.json 的 dns 配置）。false = 保持现有覆写行为。
+    SANDBOX_KEEP_DNS: bool = False
 
     # ── 工作区挂载（云盘 MinIO ↔ 容器互通）────────────────────────────────────
     # acquire 请求体可携带 workspace={bucket,prefix,mount_path}；开启且凭据齐全时，

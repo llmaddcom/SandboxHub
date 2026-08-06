@@ -11,9 +11,11 @@ lifespan：
 from __future__ import annotations
 
 import asyncio
+import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, Request
+from fastapi.responses import JSONResponse
 from loguru import logger
 
 from .config import settings
@@ -77,6 +79,23 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="SandboxHub", version="0.1.0", lifespan=lifespan)
 
+# ── 可选 API 鉴权 ────────────────────────────────────────────────────────────────
+# SANDBOX_HUB_API_KEY 非空时，所有请求须带匹配的 X-API-Key 头，否则 401。
+# 健康检查豁免（供 LB/监控探活）。空 = 完全不鉴权（默认，行为不变）。
+_AUTH_EXEMPT_PATHS = frozenset({"/v1/health"})
+
+
+@app.middleware("http")
+async def _api_key_auth(request: Request, call_next):
+    expected = settings.SANDBOX_HUB_API_KEY
+    if expected and request.url.path not in _AUTH_EXEMPT_PATHS:
+        provided = request.headers.get("X-API-Key", "")
+        if not secrets.compare_digest(provided, expected):
+            return JSONResponse(
+                status_code=401, content={"detail": "invalid or missing X-API-Key"}
+            )
+    return await call_next(request)
+
 app.include_router(sandboxes_router.router)
 
 # proxy router 挂在 /v1/sandboxes 下
@@ -95,5 +114,10 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("src.main:app", host="0.0.0.0", port=8088, reload=False)
+    uvicorn.run(
+        "src.main:app",
+        host=settings.SANDBOX_HUB_HOST,
+        port=settings.SANDBOX_HUB_PORT,
+        reload=False,
+    )
 

@@ -68,3 +68,31 @@ def test_build_container_name(mock_docker):
     name = manager._build_warm_name("ubuntu", 3)
     assert name.startswith("cr-sb-warm-")
     assert "ubuntu" in name
+
+
+# ── SANDBOX_KEEP_DNS 注入（entrypoint 据此跳过 resolv.conf 覆写）─────────────────
+
+
+def test_env_no_keep_dns_by_default(mock_docker, monkeypatch):
+    """默认（无 SANDBOX_DNS、开关关闭）不注入，行为与现状一致。"""
+    monkeypatch.setattr(settings, "SANDBOX_DNS", "")
+    monkeypatch.setattr(settings, "SANDBOX_KEEP_DNS", False)
+    env = ContainerManager()._build_container_env("ubuntu")
+    assert "SANDBOX_KEEP_DNS" not in env
+
+
+def test_env_keep_dns_when_sandbox_dns_configured(mock_docker, monkeypatch):
+    """配置了自定义 DNS（docker --dns）时自动注入，使 --dns 真正生效。"""
+    monkeypatch.setattr(settings, "SANDBOX_DNS", "10.0.0.2,10.0.0.3")
+    monkeypatch.setattr(settings, "SANDBOX_KEEP_DNS", False)
+    for sandbox_type in ("ubuntu", "code"):
+        env = ContainerManager()._build_container_env(sandbox_type)
+        assert env["SANDBOX_KEEP_DNS"] == "1"
+
+
+def test_env_keep_dns_when_forced_by_flag(mock_docker, monkeypatch):
+    """SANDBOX_KEEP_DNS=true 时即使未配 SANDBOX_DNS 也强制注入。"""
+    monkeypatch.setattr(settings, "SANDBOX_DNS", "")
+    monkeypatch.setattr(settings, "SANDBOX_KEEP_DNS", True)
+    env = ContainerManager()._build_container_env("ubuntu")
+    assert env["SANDBOX_KEEP_DNS"] == "1"
