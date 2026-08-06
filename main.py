@@ -9,7 +9,7 @@ from src.config import settings
 if __name__ == "__main__":
     uvicorn.run(
         "src.main:app",
-        host="0.0.0.0",
+        host=settings.SANDBOX_HUB_HOST,
         port=settings.SANDBOX_HUB_PORT,
         reload=False,
     )

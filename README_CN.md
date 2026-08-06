@@ -217,12 +217,50 @@ Ubuntu 容器对外暴露 40+ REST 接口和 30+ MCP 工具，主要分类：
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `SANDBOX_HUB_PORT` | `8088` | SandboxHub 服务端口 |
+| `SANDBOX_HUB_HOST` | `0.0.0.0` | 监听地址；私有化部署建议收紧为 `127.0.0.1` 或内网 IP |
+| `SANDBOX_HUB_API_KEY` | （空）| 可选鉴权：非空时所有请求须带匹配的 `X-API-Key` 头，否则 401；`/v1/health` 豁免。空=不鉴权（行为不变） |
+| `SANDBOX_DNS` | （空）| 容器自定义 DNS（逗号分隔，经 `docker --dns` 注入）；非空时同时注入 `SANDBOX_KEEP_DNS=1`，使 ubuntu 镜像 entrypoint 不覆写 `resolv.conf` |
+| `SANDBOX_KEEP_DNS` | `false` | `true`=始终注入 `SANDBOX_KEEP_DNS=1`，容器保留 Docker 注入的 `resolv.conf`（宿主 `daemon.json`/`--dns`），不被 entrypoint 覆写为 `8.8.8.8`/`1.1.1.1`。需重建镜像后生效 |
 | `DOCKER_IMAGE_UBUNTU` | `sandbox-ubuntu:latest` | Ubuntu 沙盒镜像名 |
 | `WARM_POOL_UBUNTU` | `3` | 预热 Ubuntu 容器数量 |
 | `SANDBOX_NETWORK` | `bridge` | Docker 网络模式 |
 | `SANDBOX_API_PORT` | `8000` | 容器内 FastAPI 端口 |
 | `POOL_MAINTAIN_INTERVAL` | `30` | 池补充检查间隔（秒） |
 | `SANDBOX_HTTP_PROXY` | （空）| 注入容器的 HTTP 代理 |
+
+完整注释版配置清单见 `.env.example`（对账器、代理超时、挂载探测等）。
+
+---
+
+## 离线/私有化部署注意
+
+产品部署到客户内网（断网）机器时的注意事项。沙盒镜像须在断网前于目标机构建好
+（或 `docker save`/`docker load` 导入）——构建期需联网，运行期不需要。
+
+**1. 容器内 DNS。** ubuntu 镜像 entrypoint 启动时会把 `/etc/resolv.conf` 覆写为
+`8.8.8.8`/`1.1.1.1`，顶掉 `docker --dns` 注入的配置，离线机上容器内域名解析全部超时。
+处理：把 `SANDBOX_DNS` 配成客户内网 DNS（或设 `SANDBOX_KEEP_DNS=true` 沿用宿主
+Docker 的 DNS 配置），两者都会向容器注入 `SANDBOX_KEEP_DNS=1`，entrypoint 据此跳过
+覆写。**须用当前 `entrypoint.sh` 重建镜像后才生效**——旧镜像不识别该变量。
+code 镜像从不覆写 `resolv.conf`，只需 `--dns` 即可。
+
+**2. 沙盒内 `pip install` / `npm install`。** 两个镜像都固化了公网国内源：pip 指向
+清华 PyPI 镜像（构建期 `pip config set`，见 `images/ubuntu/Dockerfile` 与
+`images/code/Dockerfile`），npm/yarn/pnpm 指向 `registry.npmmirror.com`
+（`NPM_CONFIG_REGISTRY` 环境变量 + `npm config set`）。断网后沙盒内装包会失败。
+SandboxHub **没有**运行时覆盖这些源的配置旋钮。客户内网有私有源时的选项：
+- 单次命令（现成可用，agent 可自行执行）：`pip install -i http://<mirror>/simple <pkg>`、
+  `npm install --registry=http://<mirror> <pkg>`。跨容器不持久。
+- 永久生效：重建镜像，替换两个 Dockerfile 里的 pip `config set` / `NPM_CONFIG_REGISTRY`
+  为私有源地址；或构建期把所需包全部预装。
+
+**3. 收紧 API 面。** SandboxHub 等价于任意命令执行入口。共享内网上应配置
+`SANDBOX_HUB_API_KEY`（createrole 客户端用同名 env 自动带 `X-API-Key` 头），
+与 createrole 同机部署时可把 `SANDBOX_HUB_HOST` 收紧为 `127.0.0.1`。
+
+**4. MinIO 地址。** `MINIO_ENDPOINT` 必须是「容器内可达」的地址：`172.17.0.1:9000`
+是默认 `bridge` 网络的宿主网关写法，自建网络/异机 MinIO 须相应调整，且必须与
+createrole 侧指向同一 MinIO 实例。
 
 ---
 

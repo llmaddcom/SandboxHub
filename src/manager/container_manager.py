@@ -95,6 +95,11 @@ class ContainerManager:
                 "NO_PROXY": "localhost,127.0.0.1,172.16.0.0/12,10.0.0.0/8",
                 "no_proxy": "localhost,127.0.0.1,172.16.0.0/12,10.0.0.0/8",
             })
+        # DNS 保留开关：配置了 SANDBOX_DNS（经 docker --dns 注入 resolv.conf）或显式开启
+        # SANDBOX_KEEP_DNS 时，通知镜像 entrypoint 跳过 resolv.conf 覆写（ubuntu 镜像
+        # entrypoint 默认覆写为 8.8.8.8/1.1.1.1，会顶掉 --dns 配置，离线机上解析全超时）。
+        if settings.SANDBOX_KEEP_DNS or settings.dns_servers():
+            env["SANDBOX_KEEP_DNS"] = "1"
         return env
 
     # ── Docker 操作（同步，供 to_thread 调用） ────────────────────────────────
