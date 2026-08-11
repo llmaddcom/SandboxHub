@@ -59,6 +59,19 @@ async def test_release_cleans_and_returns_to_pool(mock_manager):
 
 
 @pytest.mark.asyncio
+async def test_release_destroys_env_injected_container(mock_manager):
+    """env 注入容器（可能含租户凭据）release 即销毁，绝不归还共享 pool。"""
+    pool = WarmPool(mock_manager)
+    container = make_container()
+    container.env_injected = True
+    with patch("src.proxy.forwarder.close_client", new_callable=AsyncMock):
+        await pool.release(container)
+    mock_manager.remove_container.assert_awaited_once_with(container.container_id)
+    mock_manager.clean_and_reset.assert_not_awaited()
+    assert pool.available_count("ubuntu") == 0
+
+
+@pytest.mark.asyncio
 async def test_refill_adds_containers_to_pool(mock_manager):
     pool = WarmPool(mock_manager)
     # pool is empty, target size is 2 for this test

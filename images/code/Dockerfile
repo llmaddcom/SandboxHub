@@ -19,6 +19,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Shanghai \
     NODE_VERSION=20.18.0 \
     NPM_CONFIG_REGISTRY=https://registry.npmmirror.com \
+    # playwright：浏览器装到固定路径（不依赖 HOME），下载走 npmmirror 国内镜像
+    # （ENV 持久化，运行时 agent 补装 firefox/webkit 也走镜像源）
+    PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+    PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
     PATH=/usr/local/bin:$PATH
 
 # ===== 1. APT 源替换为清华镜像（Debian bookworm：deb822 与旧式 list 双兼容）=====
@@ -77,11 +81,23 @@ RUN python -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/
     python -m pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn && \
     python -m pip install --upgrade pip setuptools wheel
 
-# ===== 5. Python 依赖：基础运行依赖 + 日常办公/数据处理库（无 GUI/浏览器依赖）=====
+# ===== 5. Python 依赖：基础运行依赖 + 日常办公/数据处理库 + playwright =====
 # 先 COPY 需求文件单独成层，最大化构建缓存命中
 COPY ubuntu/app/requirements-base.txt /app/requirements-base.txt
 COPY ubuntu/app/requirements-code.txt /app/requirements-code.txt
 RUN python -m pip install -r /app/requirements-code.txt
+
+# ===== 5a. playwright headless chromium 预装 =====
+# --with-deps 一并装 chromium 的系统依赖（libnss3/libatk 等）；浏览器二进制经
+# PLAYWRIGHT_DOWNLOAD_HOST 从 npmmirror 下载到 PLAYWRIGHT_BROWSERS_PATH。
+# 构建期真实 launch 一次验证可用（playwright 默认关闭 chromium sandbox，root 可跑）——
+# 装了但起不来的镜像直接构建失败，防「声称预装、实际不可用」的漂移。
+RUN apt-get update && \
+    python -m playwright install --with-deps chromium && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    python -c "from playwright.sync_api import sync_playwright; \
+p = sync_playwright().start(); b = p.chromium.launch(); \
+print('playwright chromium:', b.version); b.close(); p.stop()"
 
 # ===== 5b. matplotlib 中文开箱即用（issue #3）=====
 # 默认 sans-serif 链路含 CJK 字体，中文图无需运行时自救；构建期预热字体缓存并用
@@ -93,7 +109,20 @@ RUN mkdir -p /root/.config/matplotlib && \
     python -c "from matplotlib import font_manager as fm; \
 print('CJK font:', fm.findfont(fm.FontProperties(family=['Noto Sans CJK SC', 'WenQuanYi Zen Hei']), fallback_to_default=False))"
 
-# ===== 6. 复用与 desktop 同一套 app 代码（profile=code 时不加载 GUI 路由/依赖）=====
+# ===== 6. 预装单文件 CLI（issue #15/#16：skillhub / todo 等）=====
+# code/bin/ 下的脚本装进 /usr/local/bin（去 .py 扩展名，须自带 shebang）。
+# CLI 本体由上游仓维护（createrole feat/skillhub-cli、主仓 todo CLI），落地后
+# 丢进该目录即随镜像预装；目录当前仅 README 占位，构建不因此失败。
+COPY code/bin/ /opt/sandbox-cli/
+RUN set -e; for f in /opt/sandbox-cli/*; do \
+        case "$f" in *.md) continue;; esac; \
+        [ -f "$f" ] || continue; \
+        name="$(basename "$f")"; name="${name%.py}"; \
+        install -m 0755 "$f" "/usr/local/bin/$name"; \
+        echo "预装 CLI: $name"; \
+    done
+
+# ===== 7. 复用与 desktop 同一套 app 代码（profile=code 时不加载 GUI 路由/依赖）=====
 COPY ubuntu/app/ /app/computer_use_demo/
 COPY code/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && mkdir -p /workspace

@@ -53,6 +53,11 @@ class AcquireRequest(BaseModel):
     # 可选：携带则请求把该角色云盘挂进容器（见 WorkspaceSpec）。createrole 在开启挂载
     # 开关时随每次 acquire 下发；SandboxHub 缺凭据/总开关关闭时记 warning 并回退为不挂载。
     workspace: Optional[WorkspaceSpec] = None
+    # 可选：注入为容器环境变量（issue #15/#16，如 CR_API_BASE / CR_SANDBOX_TOKEN）。
+    # 仅容器创建时生效：复用同 (user, role) 已有沙盒时忽略（调用方 token 滑动续期，
+    # 首次注入的值持续有效）；首次分配且非空时绕过 warm pool 冷启动（池内容器创建
+    # 时无此 env，Docker 无法向运行中容器补注入）。值可能是凭据，日志只记 key。
+    env: Optional[dict[str, str]] = None
 
 
 class AcquireResponse(BaseModel):
@@ -130,11 +135,20 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
                 f"回退为不挂载 | user={req.user_id} | role={req.role_id}"
             )
 
-    # 3. 挂载容器：专属、不走 warm pool（mount 须在创建时带 FUSE 能力），冷启动。
+    # 3. 环境变量注入（issue #15/#16）：env 只能在容器创建时注入，故非空即冷启动。
+    #    值可能是凭据（scoped token），日志只记 key 数量/名单，绝不打印 value。
+    extra_env = req.env or None
+    if extra_env:
+        logger.info(
+            f"acquire 携带 env 注入 | keys={sorted(extra_env)} "
+            f"| user={req.user_id} | role={req.role_id}"
+        )
+
+    # 4. 挂载容器：专属、不走 warm pool（mount 须在创建时带 FUSE 能力），冷启动。
     if workspace is not None:
         try:
             container = await _container_manager.run_container(
-                req.sandbox_type, workspace=workspace
+                req.sandbox_type, workspace=workspace, extra_env=extra_env
             )
         except Exception as e:
             logger.error(f"挂载容器冷启动失败 | type={req.sandbox_type} | err={e}")
@@ -151,12 +165,16 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
         )
         return AcquireResponse(sandbox_id=record.sandbox_id, status="ready")
 
-    # 4. 非挂载：warm pool 优先（出池体检，死容器销毁换下一个），空则兜底冷启动
-    container = await _pop_healthy(req.sandbox_type)
+    # 5. 非挂载：无 env 时 warm pool 优先（出池体检，死容器销毁换下一个）；
+    #    带 env 时绕过 warm pool（池内容器创建时无该 env），直接冷启动。
+    container = None if extra_env else await _pop_healthy(req.sandbox_type)
     if container is None:
-        logger.warning(f"warm pool 为空，冷启动 | type={req.sandbox_type}")
+        if not extra_env:
+            logger.warning(f"warm pool 为空，冷启动 | type={req.sandbox_type}")
         try:
-            container = await _container_manager.run_container(req.sandbox_type)
+            container = await _container_manager.run_container(
+                req.sandbox_type, extra_env=extra_env
+            )
         except Exception as e:
             logger.error(f"冷启动失败 | type={req.sandbox_type} | err={e}")
             raise HTTPException(

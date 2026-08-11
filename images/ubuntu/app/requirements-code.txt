@@ -1,6 +1,7 @@
 # 轻量 code 沙箱（无 GUI）的 Python 依赖
 # = 基础运行依赖（terminal/file/system/process 路由）+ 日常办公/数据处理常用库
-# 不含 playwright 等浏览器/GUI 依赖（code profile 不加载 browser 路由）。
+#   + playwright（headless chromium 随镜像预装，供 agent 脚本做网页抓取/自动化；
+#     code profile 仍不加载 browser 路由，GUI 桌面栈只在 ubuntu 镜像）。
 # 业务可在运行时通过 pip install 追加（已配置清华 pip 镜像）。
 
 -r requirements-base.txt
@@ -10,6 +11,7 @@ openpyxl>=3.1.0
 XlsxWriter>=3.1.0
 pandas>=2.0.0
 numpy>=1.26.0
+scipy>=1.11.0
 tabulate>=0.9.0
 
 # ── 文档（Word / PPT / PDF）─────────────────────────────────
@@ -17,11 +19,16 @@ python-docx>=1.1.0
 python-pptx>=0.6.23
 reportlab>=4.0.0
 pypdf>=4.0.0
+pdfplumber>=0.11.0
 markitdown[pptx]>=0.1.0
 
 # ── 图像 / 图表 ──────────────────────────────────────────────
 Pillow>=10.0.0
 matplotlib>=3.7.0
+seaborn>=0.13.0
+
+# ── 浏览器自动化（headless，Dockerfile 里随镜像预装 chromium）─
+playwright>=1.45.0
 
 # ── 文本 / 网页 / 网络 ───────────────────────────────────────
 lxml>=5.0.0

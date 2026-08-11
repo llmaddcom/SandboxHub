@@ -23,6 +23,9 @@ from src.models import ContainerInfo, ManagedContainer, SandboxType, WorkspaceMo
 
 # 挂载容器标签：用于启动恢复时识别并清理孤儿挂载容器（其 registry 映射在重启后已丢失）。
 _MOUNTED_LABEL = "sandboxhub.mounted"
+# env 注入容器标签：注入过调用方环境变量（可能含租户凭据）的容器，同挂载容器一样
+# 专属化——不入 warm pool、启动恢复不收养、release 即销毁（env 无法从运行中容器清除）。
+_ENV_LABEL = "sandboxhub.env-injected"
 
 
 def _parse_docker_time(raw: str) -> Optional[datetime]:
@@ -73,7 +76,12 @@ class ContainerManager:
     def _build_mounted_name(self, sandbox_type: str) -> str:
         return f"cr-sb-mnt-{sandbox_type}-{uuid.uuid4().hex[:8]}"
 
-    def _build_container_env(self, sandbox_type: SandboxType) -> dict:
+    def _build_env_name(self, sandbox_type: str) -> str:
+        return f"cr-sb-env-{sandbox_type}-{uuid.uuid4().hex[:8]}"
+
+    def _build_container_env(
+        self, sandbox_type: SandboxType, extra_env: Optional[dict[str, str]] = None
+    ) -> dict:
         # TERM=dumb / PAGER=cat 防止 ANSI 颜色码和交互式分页器污染 LLM 输出
         # 参考 OpenAI Codex unified_exec 的环境变量设计
         env = {
@@ -100,6 +108,10 @@ class ContainerManager:
         # entrypoint 默认覆写为 8.8.8.8/1.1.1.1，会顶掉 --dns 配置，离线机上解析全超时）。
         if settings.SANDBOX_KEEP_DNS or settings.dns_servers():
             env["SANDBOX_KEEP_DNS"] = "1"
+        # 调用方注入的业务环境变量（issue #15/#16：CR_API_BASE、CR_SANDBOX_TOKEN 等）。
+        # 最后合并、允许覆盖默认值；值可能含凭据，任何日志只记 key 不记 value。
+        if extra_env:
+            env.update(extra_env)
         return env
 
     # ── Docker 操作（同步，供 to_thread 调用） ────────────────────────────────
@@ -109,6 +121,7 @@ class ContainerManager:
         sandbox_type: SandboxType,
         name: str,
         workspace: Optional[WorkspaceMount] = None,
+        extra_env: Optional[dict[str, str]] = None,
     ) -> tuple[str, str]:
         """
         docker run，等待 IP，返回 (container_id, container_ip)。
@@ -116,6 +129,7 @@ class ContainerManager:
 
         ``workspace`` 非空时，容器额外获得 FUSE 能力（``SYS_ADMIN`` + ``/dev/fuse``）以便
         容器内 rclone 挂载 MinIO，并打上挂载标签供启动恢复识别。
+        ``extra_env`` 为调用方注入的环境变量（仅创建时生效，值不写日志）。
         """
         image = settings.image_for_type(sandbox_type)
         # 清理同名残留
@@ -130,6 +144,8 @@ class ContainerManager:
         }
         if workspace is not None:
             labels[_MOUNTED_LABEL] = "true"
+        if extra_env:
+            labels[_ENV_LABEL] = "true"
 
         run_kwargs = dict(
             image=image,
@@ -139,7 +155,7 @@ class ContainerManager:
             shm_size="2g",
             # 让容器用 host.docker.internal 指向宿主，代理 URL 不必写死网段
             extra_hosts={"host.docker.internal": "host-gateway"},
-            environment=self._build_container_env(sandbox_type),
+            environment=self._build_container_env(sandbox_type, extra_env),
             labels=labels,
         )
         # 桌面镜像跑 Chrome 需放开 seccomp；轻量 code 镜像无此需求，保持默认 seccomp
@@ -219,6 +235,7 @@ class ContainerManager:
                         mounted=c.labels.get(_MOUNTED_LABEL) == "true",
                         created_at=_parse_docker_time(c.attrs.get("Created", "")),
                         container_ip=ip,
+                        env_injected=c.labels.get(_ENV_LABEL) == "true",
                     )
                 )
             except Exception as e:
@@ -232,6 +249,7 @@ class ContainerManager:
         sandbox_type: SandboxType,
         slot: int = 0,
         workspace: Optional[WorkspaceMount] = None,
+        extra_env: Optional[dict[str, str]] = None,
     ) -> ContainerInfo:
         """
         启动新容器，等待健康检查，返回 ContainerInfo。
@@ -239,15 +257,18 @@ class ContainerManager:
 
         ``workspace`` 非空时：容器带 FUSE 能力启动，健康后在容器内用 rclone 把
         MinIO ``bucket/prefix`` 挂到 ``mount_path``；挂载失败即销毁容器并抛错。
+        ``extra_env`` 非空时：键值对注入为容器环境变量（issue #15/#16，仅创建时
+        生效；值可能是凭据，日志绝不打印 value）。
         """
         mounted = workspace is not None
-        name = (
-            self._build_mounted_name(sandbox_type)
-            if mounted
-            else self._build_warm_name(sandbox_type, slot)
-        )
+        if mounted:
+            name = self._build_mounted_name(sandbox_type)
+        elif extra_env:
+            name = self._build_env_name(sandbox_type)
+        else:
+            name = self._build_warm_name(sandbox_type, slot)
         container_id, ip = await asyncio.to_thread(
-            self._run_container_sync, sandbox_type, name, workspace
+            self._run_container_sync, sandbox_type, name, workspace, extra_env
         )
         # 等待 API 就绪
         if not await self.wait_healthy(ip):
@@ -273,6 +294,7 @@ class ContainerManager:
             sandbox_type=sandbox_type,
             mounted=mounted,
             mount_path=workspace.mount_path if mounted else "/workspace",
+            env_injected=bool(extra_env),
         )
 
     # ── 工作区挂载（容器内 rclone over MinIO/S3）─────────────────────────────
