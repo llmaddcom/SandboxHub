@@ -14,7 +14,7 @@ SandboxHub has two components that live in this monorepo:
 |-----------|------|------|
 | **Orchestrator** | `src/` | Manages container lifecycle — warm pool, acquire/release, HTTP proxy |
 | **Ubuntu Image** | `images/ubuntu/` | Ubuntu 22.04 sandbox — virtual desktop, FastAPI tool API, MCP server |
-| **Code Image** | `images/code/` | Headless lightweight sandbox — Python + Node toolchain, dev/office libs, terminal/file/system/process API only (no GUI), sub-second cold start |
+| **Code Image** | `images/code/` | Headless lightweight sandbox — Python + Node toolchain, dev/office libs, playwright headless chromium, terminal/file/system/process API only (no GUI), sub-second cold start |
 
 ```
 LLM Agent
@@ -171,6 +171,26 @@ unmount) on release — never recycled and never `rm -rf`'d (which would delete 
 If credentials are missing or `WORKSPACE_MOUNT_ENABLED=false`, the `workspace` field is ignored
 (logged as a warning) and an ordinary unmounted container is returned. Requires `rclone` + `fuse3`
 in the image (both bundled) and the host permitting `/dev/fuse` + `SYS_ADMIN` for the container.
+
+#### Acquire with injected environment variables (issue #15/#16)
+
+```bash
+curl -X POST http://localhost:8088/v1/sandboxes/acquire \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u1", "role_id": "r1", "sandbox_type": "code",
+       "env": {"CR_API_BASE": "http://host.docker.internal:8011", "CR_SANDBOX_TOKEN": "..."}}'
+```
+
+Key/value pairs in `env` are injected as container environment variables at creation time
+(e.g. for in-sandbox CLIs like `skillhub` / `todo` calling back to the backend). Semantics:
+
+- **Creation-time only** — ignored when reusing an existing sandbox for the same
+  `(user_id, role_id)` (callers use sliding-renewal tokens, so the initially injected value stays valid);
+- **Bypasses the warm pool** — pooled containers were created without these vars and Docker
+  cannot inject env into a running container, so a first allocation with `env` cold-starts;
+- **Tenant-dedicated** — values may be credentials: the container is destroyed on release
+  (never returned to the shared pool), and logs record env keys only, never values;
+- Omitting `env` keeps the exact current behavior.
 
 ### Execute a terminal command
 

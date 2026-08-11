@@ -14,7 +14,7 @@ SandboxHub 包含两个组件，共同维护在本 monorepo 中：
 |------|------|------|
 | **编排层** | `src/` | 管理容器生命周期 — 预热池、acquire/release、HTTP 代理 |
 | **Ubuntu 镜像** | `images/ubuntu/` | Ubuntu 22.04 沙盒 — 虚拟桌面、FastAPI 工具接口、MCP 服务 |
-| **Code 镜像** | `images/code/` | 无 GUI 轻量沙盒 — Python + Node 工具链、开发/办公库，仅终端/文件/系统/进程接口，秒级冷启动 |
+| **Code 镜像** | `images/code/` | 无 GUI 轻量沙盒 — Python + Node 工具链、开发/办公库、playwright headless chromium，仅终端/文件/系统/进程接口，秒级冷启动 |
 
 ```
 LLM Agent
@@ -149,6 +149,26 @@ curl -X POST http://localhost:8088/v1/sandboxes/acquire \
 ```
 
 从预热池返回，耗时 <100ms。若相同 `(user_id, role_id)` 已有容器分配，则直接复用。
+
+#### 携带环境变量注入（issue #15/#16）
+
+```bash
+curl -X POST http://localhost:8088/v1/sandboxes/acquire \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u1", "role_id": "r1", "sandbox_type": "code",
+       "env": {"CR_API_BASE": "http://host.docker.internal:8011", "CR_SANDBOX_TOKEN": "..."}}'
+```
+
+`env` 里的键值对在容器创建时注入为环境变量（供 `skillhub` / `todo` 等沙盒内 CLI
+回连后端）。语义约束：
+
+- **仅创建时生效**：复用同 `(user_id, role_id)` 已有沙盒时忽略该字段（调用方 token
+  滑动续期，首次注入的值持续有效）；
+- **绕过预热池**：池内容器创建时没有这些 env，Docker 无法向运行中容器补注入，
+  故带 `env` 的首次分配走冷启动；
+- **专属化**：值可能是租户凭据，该容器 release 即销毁、不归还共享池，日志只记
+  key 不记 value；
+- 缺省（无 `env` 字段）行为与现状完全一致。
 
 ### 执行终端命令
 

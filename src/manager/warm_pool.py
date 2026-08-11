@@ -46,9 +46,20 @@ class WarmPool:
 
         挂载容器例外：它是角色专属、且 /workspace 是 MinIO 实时挂载——绝不能 rm -rf
         （会删 MinIO 数据），也不能归还共享 pool（跨租户串台）。故先卸载再销毁。
+        env 注入容器同理：环境变量（可能含租户 scoped token）无法从运行中容器清除，
+        归还共享 pool 会把凭据泄漏给下一个租户，故 release 即销毁。
         """
         if container_info.mounted:
             await self._destroy_mounted(container_info)
+            return
+        if container_info.env_injected:
+            try:
+                from src.proxy.forwarder import close_client
+                await close_client(container_info.container_ip)
+            except Exception:
+                pass
+            await self._manager.remove_container(container_info.container_id)
+            logger.info(f"env 注入容器已销毁（不入池）| ip={container_info.container_ip}")
             return
         try:
             await self._manager.clean_and_reset(container_info.container_ip)

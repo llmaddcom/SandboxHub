@@ -58,8 +58,13 @@ class SandboxReconciler:
             if c.status != "running":
                 logger.info(f"清理已停止的受管容器 | name={c.container_name} | status={c.status}")
                 await self._manager.remove_container(c.container_id)
-            elif c.mounted:
-                logger.info(f"清理孤儿挂载容器 | name={c.container_name}")
+            elif c.mounted or c.env_injected:
+                # 挂载容器与 env 注入容器都是租户专属：重启后 registry 映射已丢失，
+                # 不可收养回共享 pool（env 里可能有上一租户凭据），直接清理。
+                logger.info(
+                    f"清理孤儿专属容器 | name={c.container_name} "
+                    f"| mounted={c.mounted} | env_injected={c.env_injected}"
+                )
                 await self._manager.remove_container(c.container_id)
             elif await self._adopt_warm(c):
                 adopted += 1

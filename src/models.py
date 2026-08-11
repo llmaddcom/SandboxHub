@@ -35,6 +35,10 @@ class ContainerInfo:
     # 对挂载点做 rm -rf（会误删 MinIO 数据），只卸载后销毁。
     mounted: bool = False
     mount_path: str = "/workspace"
+    # 是否注入过调用方环境变量（issue #15/#16，值可能是租户 scoped token）。
+    # 注入的 env 无法从运行中容器清除，故该容器同样不入 warm pool、释放即销毁，
+    # 防止凭据泄漏给下一个租户。
+    env_injected: bool = False
 
 
 @dataclass
@@ -65,3 +69,4 @@ class ManagedContainer:
     mounted: bool
     created_at: Optional[datetime]  # Docker Created 时间；解析失败为 None（视为刚创建）
     container_ip: str = ""  # 仅 running 且拿得到 IP 时非空
+    env_injected: bool = False  # 注入过租户 env 的容器：启动恢复不收养回池，直接销毁

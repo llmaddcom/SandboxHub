@@ -51,6 +51,8 @@ def app_with_mocks():
     warm_pool.acquire = AsyncMock(return_value=make_container())
     warm_pool.ensure_pool = AsyncMock()
     warm_pool.release = AsyncMock()
+    # 503 的结构化 detail（issue #4）会带池状态快照，须可 JSON 序列化
+    warm_pool.status = MagicMock(return_value={"ubuntu": {"available": 0}})
 
     container_manager = MagicMock()
     container_manager.run_container = AsyncMock(return_value=make_container())
@@ -128,7 +130,9 @@ async def test_acquire_cold_start_failure_returns_503(app_with_mocks):
         resp = await client.post("/v1/sandboxes/acquire", json={"user_id": "u1", "role_id": "r1"})
 
     assert resp.status_code == 503
-    assert "cold start failed" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert "cold start failed" in detail["message"]
+    assert detail["reason"] == "cold_start_failed"
 
 
 @pytest.mark.asyncio
