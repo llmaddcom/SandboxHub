@@ -7,9 +7,10 @@
 
 - 单文件、零第三方依赖（仅 Python 标准库），自带 shebang（`#!/usr/bin/env python3`）；
 - 本体由上游仓维护并随版本同步到这里：
-  - `skillhub` — createrole 仓 `server/infrastructure/skills/builtin/skillhub/scripts/skillhub.py`
-    （分支 `feat/skillhub-cli`，见 issue #15）；
-  - `todo` — createrole 主仓待办事项 CLI（见 issue #16，llmaddcom/createrole#358）。
+  - `skillhub` — createrole 仓（dev）`server/infrastructure/skills/builtin/skillhub/scripts/skillhub.py`
+    （见 issue #15/#18）；
+  - `todo` — createrole 仓（dev）`server/infrastructure/skills/builtin/todo/scripts/todo.py`
+    （见 issue #19，llmaddcom/createrole#362）。
 - 更新脚本后须 bump `images/ubuntu/app/VERSION` 并重建镜像。
 
-`.md` 文件会被构建脚本跳过，本 README 仅作占位与说明。
+`.md` 文件会被构建脚本跳过。
