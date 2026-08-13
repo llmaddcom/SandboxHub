@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """skillhub —— 产品内技能商城 CLI（沙盒内使用，零第三方依赖）。
 
-数字人在沙盒终端里发现/安装商城技能的入口：
+数字人在沙盒终端里发现/安装商城技能的入口（镜像预装为 ``skillhub`` 命令）：
 
-    python3 /workspace/skills/skillhub/scripts/skillhub.py search 表格
-    python3 /workspace/skills/skillhub/scripts/skillhub.py install excel-helper
+    skillhub search 表格
+    skillhub install excel-helper
 
 服务端半边是后端 agent 面路由 ``/agent/market/*``；凭据（后端基址 + 短时 scoped token）
 由后端在沙盒 acquire 时写进 ``/workspace/.skillhub/credentials.json``，也可用环境变量

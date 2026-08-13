@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """todo —— 待办事项 CLI（沙盒内使用，零第三方依赖）。
 
-数字人在沙盒终端里管理自己待办事项的入口：
+数字人在沙盒终端里管理自己待办事项的入口（镜像预装为 ``todo`` 命令）：
 
-    python3 /workspace/skills/todo/scripts/todo.py list
-    python3 /workspace/skills/todo/scripts/todo.py add "给领导订明早的机票"
-    python3 /workspace/skills/todo/scripts/todo.py add "提醒开周会" --repeat weekly --weekdays 0 --time 09:30
-    python3 /workspace/skills/todo/scripts/todo.py done 3f2a
+    todo list
+    todo add "给领导订明早的机票"
+    todo add "提醒开周会" --repeat weekly --weekdays 0 --time 09:30
+    todo done 3f2a
 
 服务端半边是后端 agent 面路由 ``/agent/todo/*``；凭据（后端基址 + 短时 scoped token，
 与 skillhub 共用同一枚）由后端在沙盒 acquire 时写进 ``/workspace/.skillhub/credentials.json``，

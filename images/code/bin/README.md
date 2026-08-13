@@ -6,11 +6,11 @@
 要求：
 
 - 单文件、零第三方依赖（仅 Python 标准库），自带 shebang（`#!/usr/bin/env python3`）；
-- 本体由上游仓维护并随版本同步到这里：
-  - `skillhub` — createrole 仓（dev）`server/infrastructure/skills/builtin/skillhub/scripts/skillhub.py`
-    （见 issue #15/#18）；
-  - `todo` — createrole 仓（dev）`server/infrastructure/skills/builtin/todo/scripts/todo.py`
-    （见 issue #19，llmaddcom/createrole#362）。
+- 本体由上游仓维护并随版本同步到这里（上游统一在 createrole 仓（dev）
+  `server/infrastructure/sandbox_cli/<name>.py`，技能目录已瘦身为纯 SKILL.md，见 issue #20）：
+  - `skillhub` — `server/infrastructure/sandbox_cli/skillhub.py`（见 issue #15/#18）；
+  - `todo` — `server/infrastructure/sandbox_cli/todo.py`（见 issue #19，llmaddcom/createrole#362）；
+  - `memory` — `server/infrastructure/sandbox_cli/memory.py`（只读，见 issue #20，llmaddcom/createrole#366）。
 - 更新脚本后须 bump `images/ubuntu/app/VERSION` 并重建镜像。
 
 `.md` 文件会被构建脚本跳过。
