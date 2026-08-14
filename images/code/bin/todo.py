@@ -9,7 +9,7 @@
     todo done 3f2a
 
 服务端半边是后端 agent 面路由 ``/agent/todo/*``；凭据（后端基址 + 短时 scoped token，
-与 skillhub 共用同一枚）由后端在沙盒 acquire 时写进 ``/workspace/.skillhub/credentials.json``，
+与 skillhub 共用同一枚）由后端在沙盒 acquire 时写进容器本地 ``~/.config/createrole/credentials.json``，
 也可用环境变量 ``CR_API_BASE`` / ``CR_SANDBOX_TOKEN`` 覆盖（镜像预装 + env 注入后走环境变量）。
 """
 
@@ -23,7 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_CREDENTIALS_FILE = "/workspace/.skillhub/credentials.json"
+DEFAULT_CREDENTIALS_FILE = os.path.expanduser("~/.config/createrole/credentials.json")
 TIMEOUT_SECONDS = 20
 
 # 容器内直连宿主后端，不走任何代理（env 里的 http_proxy 等一律忽略）。
@@ -40,7 +40,7 @@ def _load_credentials() -> tuple[str, str]:
     token = os.environ.get("CR_SANDBOX_TOKEN", "").strip()
     if api_base and token:
         return api_base, token
-    path = os.environ.get("CR_SKILLHUB_CREDENTIALS", DEFAULT_CREDENTIALS_FILE)
+    path = os.environ.get("CR_CREDENTIALS_FILE", DEFAULT_CREDENTIALS_FILE)
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
