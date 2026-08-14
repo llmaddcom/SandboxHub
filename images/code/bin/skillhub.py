@@ -7,7 +7,7 @@
     skillhub install excel-helper
 
 服务端半边是后端 agent 面路由 ``/agent/market/*``；凭据（后端基址 + 短时 scoped token）
-由后端在沙盒 acquire 时写进 ``/workspace/.skillhub/credentials.json``，也可用环境变量
+由后端在沙盒 acquire 时写进容器本地 ``~/.config/createrole/credentials.json``，也可用环境变量
 ``CR_API_BASE`` / ``CR_SANDBOX_TOKEN`` 覆盖（P1 镜像预装 + env 注入后走环境变量）。
 
 安装是服务端直写云盘（不经容器文件系统），rclone 挂载约 1 秒后在
@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_CREDENTIALS_FILE = "/workspace/.skillhub/credentials.json"
+DEFAULT_CREDENTIALS_FILE = os.path.expanduser("~/.config/createrole/credentials.json")
 DEFAULT_SKILLS_DIR = "/workspace/skills"
 TIMEOUT_SECONDS = 20
 
@@ -42,7 +42,7 @@ def _load_credentials() -> tuple[str, str]:
     token = os.environ.get("CR_SANDBOX_TOKEN", "").strip()
     if api_base and token:
         return api_base, token
-    path = os.environ.get("CR_SKILLHUB_CREDENTIALS", DEFAULT_CREDENTIALS_FILE)
+    path = os.environ.get("CR_CREDENTIALS_FILE", DEFAULT_CREDENTIALS_FILE)
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
