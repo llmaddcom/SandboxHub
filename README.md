@@ -182,7 +182,7 @@ curl -X POST http://localhost:8088/v1/sandboxes/acquire \
 ```
 
 Key/value pairs in `env` are injected as container environment variables at creation time
-(e.g. for in-sandbox CLIs like `skillhub` / `todo` calling back to the backend). Semantics:
+(e.g. for in-sandbox CLIs like `skills` / `todo` calling back to the backend). Semantics:
 
 - **Creation-time only** — ignored when reusing an existing sandbox for the same
   `(user_id, role_id)` (callers use sliding-renewal tokens, so the initially injected value stays valid);

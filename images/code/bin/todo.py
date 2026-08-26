@@ -9,7 +9,7 @@
     todo done 3f2a
 
 服务端半边是后端 agent 面路由 ``/agent/todo/*``；凭据（后端基址 + 短时 scoped token，
-与 skillhub 共用同一枚）由后端在沙盒 acquire 时写进容器本地 ``~/.config/createrole/credentials.json``，
+与 skills 共用同一枚）由后端在沙盒 acquire 时写进容器本地 ``~/.config/createrole/credentials.json``，
 也可用环境变量 ``CR_API_BASE`` / ``CR_SANDBOX_TOKEN`` 覆盖（镜像预装 + env 注入后走环境变量）。
 """
 

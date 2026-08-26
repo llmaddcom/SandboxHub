@@ -8,7 +8,7 @@
     memory list
 
 服务端半边是后端 agent 面路由 ``/agent/memory/*``；凭据（后端基址 + 短时 scoped
-token，与 skillhub / todo 共用同一枚）由后端在沙盒 acquire 时写进容器本地
+token，与 skills / todo 共用同一枚）由后端在沙盒 acquire 时写进容器本地
 ``~/.config/createrole/credentials.json``（不落云盘），也可用环境变量
 ``CR_API_BASE`` / ``CR_SANDBOX_TOKEN`` 覆盖。
 """

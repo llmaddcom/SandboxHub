@@ -159,7 +159,7 @@ curl -X POST http://localhost:8088/v1/sandboxes/acquire \
        "env": {"CR_API_BASE": "http://host.docker.internal:8011", "CR_SANDBOX_TOKEN": "..."}}'
 ```
 
-`env` 里的键值对在容器创建时注入为环境变量（供 `skillhub` / `todo` 等沙盒内 CLI
+`env` 里的键值对在容器创建时注入为环境变量（供 `skills` / `todo` 等沙盒内 CLI
 回连后端）。语义约束：
 
 - **仅创建时生效**：复用同 `(user_id, role_id)` 已有沙盒时忽略该字段（调用方 token
