@@ -23,7 +23,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # （ENV 持久化，运行时 agent 补装 firefox/webkit 也走镜像源）
     PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
     PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright \
-    PATH=/usr/local/bin:$PATH
+    # /usr/local/bin 前置遮蔽同名系统命令；$HOME/.local/bin 追加到末尾，让第三方按教程
+    # 装进 ~/.local/bin 的工具可用且不遮蔽预装 CLI（issue #24，容器 HOME=/root）
+    PATH=/usr/local/bin:$PATH:/root/.local/bin
 
 # ===== 1. APT 源替换为清华镜像（Debian bookworm：deb822 与旧式 list 双兼容）=====
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
@@ -109,9 +111,9 @@ RUN mkdir -p /root/.config/matplotlib && \
     python -c "from matplotlib import font_manager as fm; \
 print('CJK font:', fm.findfont(fm.FontProperties(family=['Noto Sans CJK SC', 'WenQuanYi Zen Hei']), fallback_to_default=False))"
 
-# ===== 6. 预装单文件 CLI（issue #15/#16：skillhub / todo 等）=====
+# ===== 6. 预装单文件 CLI（issue #15/#16/#24：skills / todo / memory）=====
 # code/bin/ 下的脚本装进 /usr/local/bin（去 .py 扩展名，须自带 shebang）。
-# CLI 本体由上游仓维护（createrole feat/skillhub-cli、主仓 todo CLI），落地后
+# CLI 本体由上游仓维护（createrole 仓 server/infrastructure/sandbox_cli/），落地后
 # 丢进该目录即随镜像预装；目录当前仅 README 占位，构建不因此失败。
 COPY code/bin/ /opt/sandbox-cli/
 RUN set -e; for f in /opt/sandbox-cli/*; do \

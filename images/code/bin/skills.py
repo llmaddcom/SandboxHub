@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""skillhub —— 产品内技能商城 CLI（沙盒内使用，零第三方依赖）。
+"""skills —— 产品内技能面 CLI（沙盒内使用，零第三方依赖）。
 
-数字人在沙盒终端里发现/安装商城技能的入口（镜像预装为 ``skillhub`` 命令）：
+数字人在沙盒终端里发现/安装商城技能、查看本地全量技能的统一入口（镜像预装为
+``skills`` 命令；#387 由 ``skillhub`` 改名——与第三方 skillhub.cn 的同名 CLI 冲突，且
+``skill`` 单数撞 procps 的进程信号命令）：
 
-    skillhub search 表格
-    skillhub install excel-helper
+    skills search 表格        # 商城搜索
+    skills install excel-helper
+    skills list               # 本地全量技能索引（不访问网络，接替原 skills/INDEX.md）
 
 服务端半边是后端 agent 面路由 ``/agent/market/*``；凭据（后端基址 + 短时 scoped token）
 由后端在沙盒 acquire 时写进容器本地 ``~/.config/createrole/credentials.json``，也可用环境变量
@@ -93,7 +96,7 @@ def _request(method: str, path: str, *, payload: dict | None = None) -> dict:
 
 def _print_entries(items: list[dict]) -> None:
     if not items:
-        print("没有找到匹配的技能。换个关键词试试，或直接 skillhub search 看全量货架。")
+        print("没有找到匹配的技能。换个关键词试试，或直接 skills search 看全量货架。")
         return
     for item in items:
         official = "[官方] " if item.get("official") else ""
@@ -102,7 +105,7 @@ def _print_entries(items: list[dict]) -> None:
         desc = (item.get("description") or "").strip().replace("\n", " ")
         if desc:
             print(f"    {desc}")
-    print(f"\n共 {len(items)} 个。安装: skillhub install <slug>")
+    print(f"\n共 {len(items)} 个。安装: skills install <slug>")
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -148,7 +151,23 @@ def _read_frontmatter_description(skill_md_path: str) -> str:
     return ""
 
 
+# 索引行内描述的截断长度（与 system 常驻清单回退口径一致）。
+_MAX_LIST_DESC_LEN = 240
+
+
+def _one_line(text: str) -> str:
+    text = " ".join(text.split())
+    if len(text) > _MAX_LIST_DESC_LEN:
+        return text[: _MAX_LIST_DESC_LEN - 1] + "…"
+    return text
+
+
 def cmd_list(args: argparse.Namespace) -> None:
+    """本地全量技能索引：每行「名称 + 单行钩子句 + SKILL.md 路径」。
+
+    这是「拉取才是权威」的全量兜底路径——system 常驻清单截断/召回零命中时模型跑一次
+    本命令即可看到全部技能；故只读本地文件，不依赖网络与凭据。
+    """
     root = args.dir
     if not os.path.isdir(root):
         raise CliError(f"技能目录不存在: {root}")
@@ -158,17 +177,18 @@ def cmd_list(args: argparse.Namespace) -> None:
         if os.path.isfile(os.path.join(root, n, "SKILL.md"))
     )
     if not names:
-        print("本地还没有技能。用 skillhub search 逛逛商城。")
+        print("本地还没有技能。用 skills search 逛逛商城。")
         return
     for name in names:
-        desc = _read_frontmatter_description(os.path.join(root, name, "SKILL.md"))
-        print(f"{name}    {desc}" if desc else name)
-    print(f"\n共 {len(names)} 个（本地 {root}）")
+        path = os.path.join(root, name, "SKILL.md")
+        desc = _one_line(_read_frontmatter_description(path))
+        print(f"- {name}: {desc} (file: {path})" if desc else f"- {name} (file: {path})")
+    print(f"\n共 {len(names)} 个（本地 {root}）。使用某技能前先读其 SKILL.md 全文。")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="skillhub", description="产品内技能商城 CLI：搜索/安装技能到自己的角色"
+        prog="skills", description="技能面 CLI：搜索/安装商城技能，list 看本地全量技能索引"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -185,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     install.add_argument("--version", type=int, default=None, help="指定版本号")
     install.set_defaults(func=cmd_install)
 
-    list_cmd = sub.add_parser("list", help="列出本地已有技能（不访问网络）")
+    list_cmd = sub.add_parser("list", help="本地全量技能索引：名称 + 用途 + SKILL.md 路径（不访问网络）")
     list_cmd.add_argument("--dir", default=DEFAULT_SKILLS_DIR, help="技能目录")
     list_cmd.set_defaults(func=cmd_list)
 
@@ -193,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args.func(args)
     except CliError as exc:
-        print(f"skillhub: {exc}", file=sys.stderr)
+        print(f"skills: {exc}", file=sys.stderr)
         return 1
     return 0
 
