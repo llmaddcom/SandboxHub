@@ -63,8 +63,7 @@ async def lifespan(app: FastAPI):
     yield
 
     print("正在关闭沙盒操作服务...")
-    if bash._session is not None:
-        bash._session.stop()
+    bash.close()
 
 
 # 创建 FastAPI 应用实例
