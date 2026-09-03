@@ -1,0 +1,61 @@
+# =============================================================================
+# SandboxHub 系统调优（system tier）——本仓工程的唯一可写位置（issue #28，对齐 createrole#400）。
+# 进 git，改动走 PR。
+#
+# 这里放「必须代码管理」的运行参数：镜像名、预热池、对账/回收周期、代理超时、rclone 挂载策略。
+# 取值：本文件 > 代码默认（src/config.py SYSTEM_KNOBS）；缺键 / null / 坏值仅该项回退代码
+# 默认并告警。没有 env 覆盖口：同名旧 ENV 已退役，启动期告警并忽略。
+#
+# 不在这里的：连接地址、账号密码、密钥、本机与网络属性（.env，见 .env.example）。
+# 本文件须恰好声明全部系统键（tests/unit/test_system_config.py 对账）。
+# 机器差异（GPU 机 vs 开发机的镜像名 / 预热数）走分支或 PR，不走现场 env。
+# =============================================================================
+
+image:
+  # desktop profile：完整 GUI / computer-use
+  ubuntu: "sandbox-ubuntu:latest"
+  # code profile：轻量无 GUI，仅终端 / 文件
+  code: "sandbox-code:latest"
+
+warm_pool:
+  # 预热容器数（0 = 不预热，acquire 时冷启动）。每个 ubuntu 容器 shm 2G + 桌面栈内存占用可观。
+  ubuntu: 1
+  code: 0
+  # 预热池补齐检查间隔（秒）
+  maintain_interval: 30
+
+sandbox:
+  # 容器内沙盒 FastAPI 端口，与镜像 entrypoint 一致，一般不要改
+  api_port: 8000
+  # 已分配沙盒的闲置回收阈值（秒）：超时未用（acquire/proxy）即回收——挂载容器销毁、
+  # warm 容器复位回池；调用方按 (user, role) 幂等 acquire，回收后下次调用自动重建。0 = 关闭。
+  idle_ttl: 7200
+
+reconcile:
+  # 周期对账间隔（秒）：清理已停止 / 孤儿容器、驱逐失联沙盒、闲置回收
+  interval: 60
+  # 孤儿容器创建宽限（秒）：running 但不在册的受管容器，创建超过此时长才销毁，
+  # 覆盖「容器已创建、尚未登记进 pool/registry」的在途窗口（冷启动 + 挂载最长约 1 分钟）
+  orphan_grace_seconds: 300
+
+proxy:
+  # 读超时（秒）：须大于终端命令执行预算上限（300s）+ 回传余量，否则长命令被代理层掐断成 502
+  read_timeout: 330.0
+  # 连接超时（秒）
+  connect_timeout: 10.0
+
+workspace:
+  # 工作区挂载总开关（云盘 MinIO ↔ 容器互通；连接信息 MINIO_* 在 .env）
+  mount_enabled: true
+  # rclone VFS 缓存模式：full 对 rename / 并发读写支持最完整；writes 模式下写回窗口内的
+  # rename-over（sed -i / mv 覆盖）会报 EIO（issue #9），勿改回 writes
+  rclone_vfs_cache_mode: "full"
+  # full 模式本地读缓存体积上限（防大文件读放大占满容器磁盘）
+  rclone_vfs_cache_max_size: "2G"
+  # 文件关闭后回写 MinIO 的延迟（越小越接近实时）
+  rclone_vfs_write_back: "1s"
+  # 目录列表缓存时长（影响 MinIO → 容器可见延迟）
+  rclone_dir_cache_time: "2s"
+  # 挂载就绪探测：mountpoint 轮询次数与间隔（秒）
+  mount_ready_retries: 20
+  mount_ready_interval: 0.5

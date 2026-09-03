@@ -105,15 +105,20 @@ docker build --network host \
 ```bash
 pip install -e .
 
-cp .env.example .env   # 按需编辑
+cp .env.example .env   # 只填连接 / 密钥 / 本机项
 ```
 
-主要 `.env` 配置项：
+配置分两个家（issue #28，对齐 createrole#400）：
+
+- `.env`（不进 git）：本机、网络、MinIO 连接、API Key——新部署只需填这一份。
+- `config/system.yaml`（进 git，改动走 PR）：镜像名、预热池、对账回收、代理超时、rclone 挂载策略。
+  取值 文件 > 代码默认；缺键 / 坏值仅该项回退并告警；**没有 env 覆盖口**，同名旧 ENV 启动期告警并忽略。
 
 ```env
-DOCKER_IMAGE_UBUNTU=sandbox-ubuntu:latest
-WARM_POOL_UBUNTU=3
 SANDBOX_HUB_PORT=8088
+MINIO_ENDPOINT=172.17.0.1:9000
+MINIO_ACCESS_KEY=...
+MINIO_SECRET_KEY=...
 ```
 
 ### 3. 启动 SandboxHub
@@ -234,21 +239,43 @@ Ubuntu 容器对外暴露 40+ REST 接口和 30+ MCP 工具，主要分类：
 
 ## 配置项
 
+### `.env`：部署接入（本机 / 网络 / 对象存储连接 / 密钥）
+
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `SANDBOX_HUB_PORT` | `8088` | SandboxHub 服务端口 |
 | `SANDBOX_HUB_HOST` | `0.0.0.0` | 监听地址；私有化部署建议收紧为 `127.0.0.1` 或内网 IP |
-| `SANDBOX_HUB_API_KEY` | （空）| 可选鉴权：非空时所有请求须带匹配的 `X-API-Key` 头，否则 401；`/v1/health` 豁免。空=不鉴权（行为不变） |
+| `SANDBOX_HUB_PORT` | `8088` | SandboxHub 服务端口 |
+| `CONTAINER_LABEL` | `sandboxhub.managed` | 受管容器标签（同机多实例隔离用） |
+| `SANDBOX_NETWORK` | `bridge` | 容器所在 Docker 网络 |
+| `SANDBOX_HTTP_PROXY` | （空）| 注入 ubuntu 容器的出网代理；宿主代理须写容器可达地址（`host.docker.internal`） |
 | `SANDBOX_DNS` | （空）| 容器自定义 DNS（逗号分隔，经 `docker --dns` 注入）；非空时同时注入 `SANDBOX_KEEP_DNS=1`，使 ubuntu 镜像 entrypoint 不覆写 `resolv.conf` |
-| `SANDBOX_KEEP_DNS` | `false` | `true`=始终注入 `SANDBOX_KEEP_DNS=1`，容器保留 Docker 注入的 `resolv.conf`（宿主 `daemon.json`/`--dns`），不被 entrypoint 覆写为 `8.8.8.8`/`1.1.1.1`。需重建镜像后生效 |
-| `DOCKER_IMAGE_UBUNTU` | `sandbox-ubuntu:latest` | Ubuntu 沙盒镜像名 |
-| `WARM_POOL_UBUNTU` | `3` | 预热 Ubuntu 容器数量 |
-| `SANDBOX_NETWORK` | `bridge` | Docker 网络模式 |
-| `SANDBOX_API_PORT` | `8000` | 容器内 FastAPI 端口 |
-| `POOL_MAINTAIN_INTERVAL` | `30` | 池补充检查间隔（秒） |
-| `SANDBOX_HTTP_PROXY` | （空）| 注入容器的 HTTP 代理 |
+| `SANDBOX_KEEP_DNS` | `false` | `true`=始终注入 `SANDBOX_KEEP_DNS=1`，容器保留 Docker 注入的 `resolv.conf`（宿主 `daemon.json`/`--dns`）。需重建镜像后生效 |
+| `MINIO_ENDPOINT` | （空）| MinIO `host:port`（不含 scheme），写**容器内可达**地址（默认 bridge 网桥宿主为 `172.17.0.1`）；空=不具备挂载能力 |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | （空）| MinIO 凭据（经环境变量内联传给容器内 rclone，不落盘）；须与 createrole 侧指向同一实例 |
+| `MINIO_SECURE` | `false` | `true`=https 访问 MinIO |
+| `SANDBOX_HUB_API_KEY` | （空）| 可选鉴权：非空时所有请求须带匹配的 `X-API-Key` 头，否则 401；`/v1/health` 豁免。空=不鉴权 |
 
-完整注释版配置清单见 `.env.example`（对账器、代理超时、挂载探测等）。
+### `config/system.yaml`：系统调优（进 git，改动走 PR）
+
+| 键 | 默认值 | 说明 |
+|----|--------|------|
+| `image.ubuntu` / `image.code` | `sandbox-ubuntu:latest` / `sandbox-code:latest` | 两种 profile 的镜像名 |
+| `warm_pool.ubuntu` / `warm_pool.code` | `3` / `0`（本仓线上 ubuntu=1） | 预热容器数，0=不预热 |
+| `warm_pool.maintain_interval` | `30` | 预热池补齐检查间隔（秒） |
+| `sandbox.api_port` | `8000` | 容器内 FastAPI 端口，与镜像 entrypoint 一致 |
+| `sandbox.idle_ttl` | `7200` | 已分配沙盒闲置回收阈值（秒），0=关闭 |
+| `reconcile.interval` | `60` | 周期对账间隔（秒） |
+| `reconcile.orphan_grace_seconds` | `300` | 孤儿容器创建宽限（秒） |
+| `proxy.read_timeout` / `proxy.connect_timeout` | `330` / `10` | 代理转发超时（秒）；读超时须大于终端命令预算 300s |
+| `workspace.mount_enabled` | `true` | 工作区挂载总开关 |
+| `workspace.rclone_vfs_cache_mode` | `full` | rclone VFS 缓存模式；`full` 避免写回窗口内 rename-over 报 EIO（issue #9） |
+| `workspace.rclone_vfs_cache_max_size` | `2G` | VFS 本地缓存体积上限 |
+| `workspace.rclone_vfs_write_back` | `1s` | 文件关闭后回写 MinIO 的延迟 |
+| `workspace.rclone_dir_cache_time` | `2s` | 目录列表缓存时长（MinIO→容器可见延迟） |
+| `workspace.mount_ready_retries` / `mount_ready_interval` | `20` / `0.5` | 挂载就绪探测轮询次数与间隔（秒） |
+
+系统键声明在 `src/config.py` 的 `SYSTEM_KNOBS`，`tests/unit/test_system_config.py` 对账 yaml 不缺不多。
+机器差异（GPU 机 vs 开发机的镜像名 / 预热数）走分支或 PR，不走现场 env。
 
 ---
 
@@ -329,7 +356,7 @@ SandboxHub/
            "debian": self.DOCKER_IMAGE_DEBIAN,   # 新增
        }
    ```
-3. 在 `.env` 中添加 `WARM_POOL_<TYPE>=N`
+3. 在 `src/config.py` 声明 `DOCKER_IMAGE_<TYPE>` / `WARM_POOL_<TYPE>` 字段并加进 `SYSTEM_KNOBS`，在 `config/system.yaml` 的 `image` / `warm_pool` 段填值（对账测试会兜底）
 4. Registry、Router、Proxy 无需改动
 
 ---
