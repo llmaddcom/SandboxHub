@@ -106,15 +106,21 @@ docker build --network host \
 ```bash
 pip install -e .
 
-cp .env.example .env   # edit as needed
+cp .env.example .env   # connection / secret / host-local items only
 ```
 
-Key `.env` settings:
+Configuration lives in two homes (issue #28, mirroring createrole#400):
+
+- `.env` (not in git): host, network, MinIO connection, API key — a fresh deployment only fills this file.
+- `config/system.yaml` (in git, changed via PR): image names, warm pool, reconcile/reclaim, proxy timeouts, rclone mount policy.
+  Precedence: file > code default; a missing/invalid key falls back per key with a warning; **no env override** — the retired
+  same-named env vars are warned about and ignored at startup.
 
 ```env
-DOCKER_IMAGE_UBUNTU=sandbox-ubuntu:latest
-WARM_POOL_UBUNTU=3
 SANDBOX_HUB_PORT=8088
+MINIO_ENDPOINT=172.17.0.1:9000
+MINIO_ACCESS_KEY=...
+MINIO_SECRET_KEY=...
 ```
 
 ### 3. Start SandboxHub
@@ -256,29 +262,43 @@ Full API docs available at `http://localhost:8000/docs` inside a running contain
 
 ## Configuration
 
+### `.env`: deployment (host / network / object-storage connection / secrets)
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SANDBOX_HUB_PORT` | `8088` | SandboxHub service port |
 | `SANDBOX_HUB_HOST` | `0.0.0.0` | Listen address; tighten to `127.0.0.1` or an intranet IP for private deployments |
-| `SANDBOX_HUB_API_KEY` | _(empty)_ | Optional API auth: when set, every request must carry a matching `X-API-Key` header (401 otherwise); `/v1/health` is exempt. Empty = no auth (unchanged behavior) |
-| `SANDBOX_DNS` | _(empty)_ | Custom container DNS (comma-separated, injected via `docker --dns`); when set, `SANDBOX_KEEP_DNS=1` is also injected into containers so the ubuntu entrypoint does not overwrite `resolv.conf` |
-| `SANDBOX_KEEP_DNS` | `false` | `true` = always inject `SANDBOX_KEEP_DNS=1` so containers keep the Docker-injected `resolv.conf` (host `daemon.json` / `--dns`) instead of the ubuntu entrypoint overwriting it with `8.8.8.8`/`1.1.1.1`. Needs a rebuilt image to take effect |
-| `DOCKER_IMAGE_UBUNTU` | `sandbox-ubuntu:latest` | Ubuntu sandbox image name |
-| `WARM_POOL_UBUNTU` | `3` | Pre-warmed Ubuntu containers |
-| `SANDBOX_NETWORK` | `bridge` | Docker network mode |
-| `SANDBOX_API_PORT` | `8000` | Port exposed by the container's FastAPI |
-| `POOL_MAINTAIN_INTERVAL` | `30` | Seconds between pool replenishment checks |
-| `SANDBOX_HTTP_PROXY` | _(empty)_ | HTTP proxy injected into containers |
-| `WORKSPACE_MOUNT_ENABLED` | `true` | Master switch for the MinIO workspace mount feature |
-| `MINIO_ENDPOINT` | _(empty)_ | MinIO `host:port` (no scheme) for the rclone S3 remote; empty disables mounting |
-| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | _(empty)_ | MinIO credentials passed to the container's rclone |
+| `SANDBOX_HUB_PORT` | `8088` | SandboxHub service port |
+| `CONTAINER_LABEL` | `sandboxhub.managed` | Label on managed containers (isolates multiple instances on one host) |
+| `SANDBOX_NETWORK` | `bridge` | Docker network the containers join |
+| `SANDBOX_HTTP_PROXY` | _(empty)_ | Egress proxy injected into ubuntu containers; a host proxy must use a container-reachable address (`host.docker.internal`) |
+| `SANDBOX_DNS` | _(empty)_ | Custom container DNS (comma-separated, injected via `docker --dns`); when set, `SANDBOX_KEEP_DNS=1` is also injected so the ubuntu entrypoint does not overwrite `resolv.conf` |
+| `SANDBOX_KEEP_DNS` | `false` | `true` = always inject `SANDBOX_KEEP_DNS=1` so containers keep the Docker-injected `resolv.conf` (host `daemon.json` / `--dns`). Needs a rebuilt image |
+| `MINIO_ENDPOINT` | _(empty)_ | MinIO `host:port` (no scheme), **reachable from inside containers** (default bridge gateway is `172.17.0.1`); empty disables mounting |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | _(empty)_ | MinIO credentials passed inline to the container's rclone; must point at the same instance createrole uses |
 | `MINIO_SECURE` | `false` | `true` = use https for MinIO |
-| `RCLONE_VFS_CACHE_MODE` | `full` | rclone VFS cache mode; `full` avoids EIO on rename-over (`sed -i`) inside the write-back window (issue #9) |
-| `RCLONE_VFS_CACHE_MAX_SIZE` | `2G` | Local VFS cache size cap (reads are cached in `full` mode) |
-| `RCLONE_VFS_WRITE_BACK` | `1s` | Delay before a closed file is uploaded to MinIO |
-| `RCLONE_DIR_CACHE_TIME` | `2s` | Directory listing cache (MinIO→container visibility lag) |
+| `SANDBOX_HUB_API_KEY` | _(empty)_ | Optional auth: when set, every request must carry a matching `X-API-Key` header (401 otherwise); `/v1/health` is exempt |
 
-See `.env.example` for the full annotated list (reconciler, proxy timeouts, mount probing, etc.).
+### `config/system.yaml`: system tuning (in git, changed via PR)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `image.ubuntu` / `image.code` | `sandbox-ubuntu:latest` / `sandbox-code:latest` | Image name per profile |
+| `warm_pool.ubuntu` / `warm_pool.code` | `3` / `0` (this repo's live box: ubuntu=1) | Pre-warmed containers, 0 = cold start on acquire |
+| `warm_pool.maintain_interval` | `30` | Seconds between pool replenishment checks |
+| `sandbox.api_port` | `8000` | FastAPI port inside the container; matches the image entrypoint |
+| `sandbox.idle_ttl` | `7200` | Idle reclaim threshold for allocated sandboxes (seconds), 0 = off |
+| `reconcile.interval` | `60` | Reconciler period (seconds) |
+| `reconcile.orphan_grace_seconds` | `300` | Grace period before an unregistered running container is destroyed |
+| `proxy.read_timeout` / `proxy.connect_timeout` | `330` / `10` | Proxy timeouts (seconds); read timeout must exceed the 300s terminal budget |
+| `workspace.mount_enabled` | `true` | Master switch for the MinIO workspace mount |
+| `workspace.rclone_vfs_cache_mode` | `full` | rclone VFS cache mode; `full` avoids EIO on rename-over inside the write-back window (issue #9) |
+| `workspace.rclone_vfs_cache_max_size` | `2G` | Local VFS cache size cap |
+| `workspace.rclone_vfs_write_back` | `1s` | Delay before a closed file is uploaded to MinIO |
+| `workspace.rclone_dir_cache_time` | `2s` | Directory listing cache (MinIO→container visibility lag) |
+| `workspace.mount_ready_retries` / `mount_ready_interval` | `20` / `0.5` | Mountpoint readiness probe attempts and interval (seconds) |
+
+System keys are declared in `SYSTEM_KNOBS` (`src/config.py`); `tests/unit/test_system_config.py` checks the yaml declares
+exactly that set. Per-machine differences (image names / pool sizes on a GPU box vs. a dev box) go through a branch or PR, not env.
 
 ---
 
@@ -366,7 +386,7 @@ SandboxHub/
            "debian": self.DOCKER_IMAGE_DEBIAN,   # new
        }
    ```
-3. Add `WARM_POOL_<TYPE>=N` to `.env`
+3. Declare `DOCKER_IMAGE_<TYPE>` / `WARM_POOL_<TYPE>` fields in `src/config.py`, add them to `SYSTEM_KNOBS`, and set the values under `image` / `warm_pool` in `config/system.yaml` (the reconciliation test enforces this)
 4. No changes needed to Registry, Router, or Proxy
 
 ---
