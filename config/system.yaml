@@ -39,7 +39,8 @@ reconcile:
   orphan_grace_seconds: 300
 
 proxy:
-  # 读超时（秒）：须大于终端命令执行预算上限（300s）+ 回传余量，否则长命令被代理层掐断成 502
+  # 读超时（秒）：须大于终端单次请求最长时长（旧契约 timeout 上限 300s；job 契约 wait 上限 120s）
+  # + 回传余量，否则长命令被代理层掐断成 502。命令本身的时长不受此限（job 分段长轮询）
   read_timeout: 330.0
   # 连接超时（秒）
   connect_timeout: 10.0

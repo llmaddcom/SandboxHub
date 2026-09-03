@@ -29,8 +29,9 @@ def _get_client(container_ip: str) -> httpx.AsyncClient:
     if container_ip not in _client_pool:
         _client_pool[container_ip] = httpx.AsyncClient(
             base_url=f"http://{container_ip}:{settings.SANDBOX_API_PORT}",
-            # 读超时须覆盖终端命令的最大执行预算（300s）+ 回传余量，否则长命令被
-            # 代理层先掐断成 502；建连超时独立收紧，让「容器已死」快速失败。
+            # 读超时须覆盖终端单次请求的最长时长（旧契约 timeout 上限 300s；job 契约
+            # wait 上限 120s，issue #30）+ 回传余量，否则长命令被代理层先掐断成 502；
+            # 建连超时独立收紧，让「容器已死」快速失败。
             timeout=httpx.Timeout(
                 settings.PROXY_READ_TIMEOUT, connect=settings.PROXY_CONNECT_TIMEOUT
             ),

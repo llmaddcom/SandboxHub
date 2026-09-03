@@ -1,33 +1,60 @@
 """
-终端工具模块 - 提供 Bash 终端会话管理和命令执行功能。
+终端工具模块 - 持久会话 + job 化命令执行（issue #30，承接 createrole#367）。
 
-本模块实现了一个异步的 Bash 终端会话，支持：
-- 启动和停止终端会话
-- 在终端中执行命令并获取输出
-- 命令执行超时控制（可配置，默认 30s，最大 300s）
-- 输出截断（50KB 上限，防止大输出撑爆内存）
-- 崩溃自动重建（session 进程退出或超时后自动恢复）
-- 会话重启功能
+模型：
+- 每条命令是一个 job：独立进程组（setsid）运行，stdout/stderr 合并直写
+  ``/tmp/cr-jobs/<job_id>.log``（模型可 tail/grep），Python 侧不缓冲输出。
+- 「持久会话」= 跨 job 传递的 cwd + 导出环境：job 结束时（EXIT trap）把 ``pwd``
+  与 ``env -0`` 落盘，下一个 job 以此为起点。``cd``/``export``/``source venv``
+  因而跨调用保留；shell 函数/别名/未导出变量不跨越（与 tmux 相比是可接受的差异）。
+- 同一时刻只跑一个 job（会话语义）；running 时再提交 → SessionBusy。
+- ``timeout``：无默认、无上限。到期先 SIGINT，宽限后 SIGKILL 整个进程组。
+- ``wait``：调用方单次最多等待秒数（默认 30，上限 120），到点先返回 running。
+- 兼容旧形态：``BashTool.execute(command, timeout)`` 阻塞至结束（默认 30s、最大
+  300s 超时），返回 ToolResult。
 """
 
 import asyncio
 import os
-import shlex
-import uuid
+import secrets
+import signal
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from .base import CLIResult, ToolError, ToolResult
 
+# ---- job 契约参数 ----
+DEFAULT_WAIT = 30.0
+MAX_WAIT = 120.0
+KILL_GRACE = 5.0          # timeout 到期：SIGINT → 等这么久 → SIGKILL
+JOB_DIR = Path(os.getenv("CR_JOB_DIR", "/tmp/cr-jobs"))
+MAX_JOB_RECORDS = 200     # 内存保留的 job 记录数（日志文件不删）
+
+# ---- 旧契约参数（BashTool.execute / execute_stream）----
 DEFAULT_TIMEOUT = 30.0
 MAX_TIMEOUT = 300.0
-OUTPUT_MAX_BYTES = 50 * 1024  # 50KB
 
-TRUNCATION_NOTICE = "\n[...输出已在 50KB 处截断...]"
-
-# StreamReader 缓冲区上限（需大于 OUTPUT_MAX_BYTES，防止 LimitOverrunError）
-_STREAM_LIMIT = 256 * 1024  # 256KB
-
+# ---- 输出截断（响应体口径；日志文件全量）----
 HEAD_BYTES = 25 * 1024   # 25 KB
 TAIL_BYTES = 25 * 1024   # 25 KB
+
+STATUS_RUNNING = "running"
+STATUS_EXITED = "exited"
+STATUS_KILLED = "killed"
+
+_SIGNALS = {"INT": signal.SIGINT, "KILL": signal.SIGKILL, "TERM": signal.SIGTERM}
+
+# 不跨 job 传递的环境变量（由 shell 自行维护）
+_ENV_SKIP = {"_", "PWD", "OLDPWD", "SHLVL"}
+
+# job 包装脚本：$1 = 状态文件基名；EXIT trap 保证 exit / 报错 / SIGINT 后仍能保存状态
+_WRAPPER = (
+    '__cr_state="$1"; set --; '
+    '__cr_save() { pwd -P > "$__cr_state.cwd" 2>/dev/null; env -0 > "$__cr_state.env" 2>/dev/null; }; '
+    "trap __cr_save EXIT; "
+    '. "$__cr_state.sh"'
+)
 
 
 def _head_tail_truncate(text: str) -> str:
@@ -43,289 +70,386 @@ def _head_tail_truncate(text: str) -> str:
     )
 
 
-class BashSession:
-    """Bash 终端会话管理类。
+def _read_span(path: Path, start: int, end: int) -> str:
+    """读取日志 [start, end) 并按 head/tail 口径截断；大文件只读首尾，不整读。"""
+    length = max(0, end - start)
+    if length == 0:
+        return ""
+    try:
+        with open(path, "rb") as f:
+            if length <= HEAD_BYTES + TAIL_BYTES:
+                f.seek(start)
+                return f.read(length).decode(errors="replace")
+            f.seek(start)
+            head = f.read(HEAD_BYTES)
+            f.seek(end - TAIL_BYTES)
+            tail = f.read(TAIL_BYTES)
+    except OSError:
+        return ""
+    omitted = length - HEAD_BYTES - TAIL_BYTES
+    return (
+        head.decode(errors="replace")
+        + f"\n[...{omitted} bytes 已省略...]\n"
+        + tail.decode(errors="replace")
+    )
 
-    管理一个持久化的 bash 进程，支持连续执行命令。
-    使用哨兵字符串来检测命令执行完成。
 
-    属性:
-        command: 使用的 shell 命令（默认 /bin/bash）
-        _sentinel: 用于检测命令完成的哨兵字符串（每个实例唯一 UUID）
-        _lock: 并发保护锁，防止多请求同时操作同一 bash 进程
-    """
+def _new_job_id() -> str:
+    """时间有序的 job id：j_ + 48bit 毫秒时间戳 + 80bit 随机（Crockford base32，26 位）。"""
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    value = (int(time.time() * 1000) << 80) | secrets.randbits(80)
+    out = []
+    for _ in range(26):
+        out.append(alphabet[value & 31])
+        value >>= 5
+    return "j_" + "".join(reversed(out))
 
-    _started: bool
-    _process: asyncio.subprocess.Process
 
-    command: str = "/bin/bash"
+class SessionBusy(ToolError):
+    """会话正在跑另一个 job。"""
 
-    def __init__(self, timeout: float = DEFAULT_TIMEOUT):
-        self._started = False
-        self._timeout = min(timeout, MAX_TIMEOUT)
-        # 每实例唯一哨兵，防止命令输出恰好包含哨兵字符串
-        self._sentinel = f"__SENT_{uuid.uuid4().hex}__"
-        self._ec_prefix = f"__EC{self._sentinel}__"
-        # 并发保护锁
-        self._lock = asyncio.Lock()
+    def __init__(self, job: "Job"):
+        super().__init__(f"会话忙：job {job.id} 仍在运行，请先 wait 或 kill")
+        self.job = job
 
-    async def start(self):
-        """启动 bash 会话进程。
 
-        如果会话已经启动，则跳过。
-        创建一个新的子进程，配置 stdin/stdout/stderr 管道。
-        """
-        if self._started:
-            return
+@dataclass
+class Job:
+    id: str
+    command: str
+    log_path: Path
+    state_base: Path
+    timeout: float | None
+    status: str = STATUS_RUNNING
+    exit_code: int | None = None
+    kill_reason: str | None = None      # "timeout" | "kill:INT" | "restart" ...
+    started_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
+    process: asyncio.subprocess.Process | None = None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    _kill_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-        self._process = await asyncio.create_subprocess_shell(
-            self.command,
-            preexec_fn=os.setsid,
-            shell=True,
-            bufsize=0,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=_STREAM_LIMIT,
+    @property
+    def finished(self) -> bool:
+        return self.done.is_set()
+
+    def log_size(self) -> int:
+        try:
+            return self.log_path.stat().st_size
+        except OSError:
+            return 0
+
+    def read(self, start: int, end: int | None = None) -> tuple[str, int]:
+        """读 [start, end or size)，返回 (截断后的文本, 新 cursor)。"""
+        size = self.log_size()
+        end = size if end is None else min(end, size)
+        start = min(max(start, 0), end)
+        return _read_span(self.log_path, start, end), end
+
+
+class JobSession:
+    """持久会话：串行跑 job，跨 job 传递 cwd / 导出环境。"""
+
+    def __init__(self, cwd: str | None = None, env: dict[str, str] | None = None):
+        self._initial_cwd = cwd or os.getcwd()
+        self._initial_env = dict(env if env is not None else os.environ)
+        self.cwd = self._initial_cwd
+        self.env = dict(self._initial_env)
+        self.jobs: dict[str, Job] = {}
+        self.current: Job | None = None
+        self._notes: list[str] = []
+        JOB_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------ 提交
+    async def start_job(self, command: str, timeout: float | None = None) -> Job:
+        """启动一个 job；会话忙则抛 SessionBusy。"""
+        if not command:
+            raise ToolError("未提供命令。")
+        if timeout is not None and timeout <= 0:
+            raise ToolError("timeout 必须大于 0。")
+        if self.current is not None and not self.current.finished:
+            raise SessionBusy(self.current)
+
+        job_id = _new_job_id()
+        base = JOB_DIR / job_id
+        job = Job(
+            id=job_id,
+            command=command,
+            log_path=base.with_suffix(".log"),
+            state_base=base,
+            timeout=timeout,
         )
+        base.with_suffix(".sh").write_text(command + "\n")
 
-        self._started = True
+        cwd = self.cwd
+        if not os.path.isdir(cwd):
+            self._notes.append(f"⚠️ 上次工作目录 {cwd} 已不存在，已回退到 {self._initial_cwd}")
+            cwd = self.cwd = self._initial_cwd
 
-    def stop(self):
-        """终止 bash 会话进程。
-
-        抛出:
-            ToolError: 如果会话尚未启动
-        """
-        if not self._started:
-            raise ToolError("会话尚未启动。")
-        if self._process.returncode is not None:
-            return
-        self._process.terminate()
-
-    async def run(self, command: str, timeout: float | None = None):
-        """Execute command. Timeout kills only the inner subprocess; session survives."""
-        if not self._started:
-            raise ToolError("会话尚未启动。")
-        if self._process.returncode is not None:
-            return ToolResult(
-                system="工具需要重启",
-                error=f"bash 已退出，返回码为 {self._process.returncode}",
+        log_fd = os.open(job.log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            job.process = await asyncio.create_subprocess_exec(
+                "/bin/bash", "-c", _WRAPPER, "_", str(base),
+                cwd=cwd,
+                env=self.env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=log_fd,
+                start_new_session=True,  # 独立进程组：kill 可整组回收
             )
+        finally:
+            os.close(log_fd)
 
-        effective_timeout = self._timeout if timeout is None else min(timeout, MAX_TIMEOUT)
+        self.current = job
+        self.jobs[job_id] = job
+        self._prune()
+        asyncio.get_running_loop().create_task(self._supervise(job))
+        return job
 
-        assert self._process.stdin
-        assert self._process.stdout
-        assert self._process.stderr
-
-        async with self._lock:
-            # Wrap: inner timeout kills user command; outer bash always prints sentinel
-            stdin_cmd = (
-                f"timeout {effective_timeout}s bash -c {shlex.quote(command)}; "
-                f"__ec_sb=$?; "
-                f"printf '\\n{self._ec_prefix}%s\\n{self._sentinel}\\n' $__ec_sb\n"
-            )
-            self._process.stdin.write(stdin_cmd.encode())
-            await self._process.stdin.drain()
-
-            sentinel_bytes = f"{self._sentinel}\n".encode()
-
-            try:
-                raw = await self._process.stdout.readuntil(sentinel_bytes)
-            except asyncio.LimitOverrunError:
-                # Output exceeded StreamReader buffer — drain until sentinel, return notice
-                sentinel_b = self._sentinel.encode()
-                tail = b""
-                while True:
-                    chunk = await self._process.stdout.read(4096)
-                    if not chunk:
-                        break
-                    combined = tail + chunk
-                    if sentinel_b in combined:
-                        break
-                    tail = combined[-(len(sentinel_b) - 1):]  # keep overlap window
-                return CLIResult(
-                    output=f"[输出超过 {_STREAM_LIMIT // 1024}KB 缓冲区上限，已截断]{TRUNCATION_NOTICE}",
-                    error="",
-                )
-
-            # Parse: strip sentinel line, then extract EC_PREFIX line
-            decoded = raw.decode(errors="replace")
-            sentinel_idx = decoded.rfind(self._sentinel)
-            content = decoded[:sentinel_idx].rstrip("\n")
-
-            ec_idx = content.rfind(self._ec_prefix)
-            if ec_idx >= 0:
-                ec_str = content[ec_idx + len(self._ec_prefix):].strip()
-                try:
-                    exit_code = int(ec_str)
-                except ValueError:
-                    exit_code = -1
-                output = content[:ec_idx].rstrip("\n")
+    async def _supervise(self, job: Job) -> None:
+        proc = job.process
+        assert proc is not None
+        try:
+            if job.timeout is None:
+                await proc.wait()
             else:
-                exit_code = 0
-                output = content
+                try:
+                    await asyncio.wait_for(proc.wait(), job.timeout)
+                except asyncio.TimeoutError:
+                    await self._terminate(job, "timeout")
+                    await proc.wait()
+        finally:
+            rc = proc.returncode
+            # 信号致死按 shell 惯例记 128+N（SIGINT→130，SIGKILL→137）
+            job.exit_code = 128 - rc if rc is not None and rc < 0 else rc
+            job.status = STATUS_KILLED if job.kill_reason else STATUS_EXITED
+            job.finished_at = time.time()
+            self._load_state(job)
+            job.done.set()
+            if job.kill_reason:
+                # 被终止的 job：包装 bash 退出不代表进程组已清空（非交互 shell 的后台
+                # 子进程默认忽略 SIGINT），宽限后 SIGKILL 扫尾整个组
+                asyncio.get_running_loop().create_task(self._sweep_group(job))
 
-            # stderr — non-blocking read after command completes
-            error = ""
-            try:
-                async with asyncio.timeout(0.1):
-                    raw_err = await self._process.stderr.read(OUTPUT_MAX_BYTES + 1)
-                    error = raw_err.decode(errors="replace").rstrip("\n")
-            except asyncio.TimeoutError:
-                pass
-
-            # HeadTailBuffer truncation
-            output = _head_tail_truncate(output)
-            error = _head_tail_truncate(error)
-
-            # Timeout notice (exit code 124 = timeout)
-            if exit_code == 124:
-                notice = f"[命令已超时 ({effective_timeout}s)，进程已终止，session 继续可用]"
-                output = f"{notice}\n{output}".strip()
-
-        return CLIResult(output=output, error=error)
-
-    async def run_stream(self, command: str, timeout: float | None = None):
-        """Yield stdout chunks line-by-line as command runs; yield done when complete.
-
-        Yields dicts:
-            {"type": "stdout", "chunk": str}  — each stdout line as it arrives
-            {"type": "stderr", "chunk": str}  — full stderr after completion (if any)
-            {"type": "done"}                  — command finished
-        """
-        if not self._started:
-            raise ToolError("会话尚未启动。")
-        if self._process.returncode is not None:
-            yield {"type": "stderr", "chunk": f"bash 已退出，返回码为 {self._process.returncode}"}
-            yield {"type": "done"}
+    async def _sweep_group(self, job: Job) -> None:
+        if not self._group_alive(job):
             return
+        await asyncio.sleep(KILL_GRACE)
+        try:
+            os.killpg(job.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
-        effective_timeout = self._timeout if timeout is None else min(timeout, MAX_TIMEOUT)
+    @staticmethod
+    def _group_alive(job: Job) -> bool:
+        try:
+            os.killpg(job.process.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
 
-        assert self._process.stdin
-        assert self._process.stdout
-        assert self._process.stderr
+    async def _terminate(self, job: Job, reason: str) -> None:
+        """SIGINT 整个进程组，宽限后 SIGKILL。"""
+        proc = job.process
+        assert proc is not None
+        job.kill_reason = job.kill_reason or reason
+        self._signal_group(job, signal.SIGINT)
+        try:
+            await asyncio.wait_for(asyncio.shield(proc.wait()), KILL_GRACE)
+        except asyncio.TimeoutError:
+            self._signal_group(job, signal.SIGKILL)
 
-        async with self._lock:
-            stdin_cmd = (
-                f"timeout {effective_timeout}s bash -c {shlex.quote(command)}; "
-                f"__ec_sb=$?; "
-                f"printf '\\n{self._ec_prefix}%s\\n{self._sentinel}\\n' $__ec_sb\n"
-            )
-            self._process.stdin.write(stdin_cmd.encode())
-            await self._process.stdin.drain()
+    @staticmethod
+    def _signal_group(job: Job, sig: signal.Signals) -> None:
+        proc = job.process
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
 
-            try:
-                async with asyncio.timeout(effective_timeout + 10):
-                    while True:
-                        line_bytes = await self._process.stdout.readline()
-                        if not line_bytes:
-                            break
-                        line = line_bytes.decode(errors="replace")
-                        if line.rstrip("\n") == self._sentinel:
-                            break
-                        if line.startswith(self._ec_prefix):
-                            continue
-                        yield {"type": "stdout", "chunk": line}
-            except asyncio.TimeoutError:
-                yield {"type": "stderr", "chunk": f"[命令超时 ({effective_timeout}s)]"}
+    def _load_state(self, job: Job) -> None:
+        """job 结束后读取其落盘的 cwd / env 作为下一个 job 的起点。"""
+        try:
+            cwd = job.state_base.with_suffix(".cwd").read_text().strip()
+            if cwd:
+                self.cwd = cwd
+        except OSError:
+            pass
+        try:
+            raw = job.state_base.with_suffix(".env").read_bytes()
+        except OSError:
+            return
+        if not raw:
+            return
+        env: dict[str, str] = {}
+        for item in raw.split(b"\0"):
+            if not item or b"=" not in item:
+                continue
+            k, v = item.decode(errors="replace").split("=", 1)
+            if k in _ENV_SKIP:
+                continue
+            env[k] = v
+        if env:
+            self.env = env
 
-            # Non-blocking stderr drain after command completes
-            try:
-                async with asyncio.timeout(0.1):
-                    raw_err = await self._process.stderr.read(OUTPUT_MAX_BYTES + 1)
-                    error = raw_err.decode(errors="replace").rstrip("\n")
-                    if error:
-                        yield {"type": "stderr", "chunk": error}
-            except asyncio.TimeoutError:
-                pass
+    def _prune(self) -> None:
+        if len(self.jobs) <= MAX_JOB_RECORDS:
+            return
+        for jid in list(self.jobs):
+            if len(self.jobs) <= MAX_JOB_RECORDS:
+                break
+            j = self.jobs[jid]
+            if j.finished and j is not self.current:
+                del self.jobs[jid]
 
-            yield {"type": "done"}
+    # ------------------------------------------------------------------ 查询/控制
+    def get(self, job_id: str) -> Job:
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise ToolError(f"未知 job：{job_id}")
+        return job
+
+    @staticmethod
+    async def wait(job: Job, wait: float) -> None:
+        """最多等 wait 秒直到 job 结束。"""
+        if job.finished or wait <= 0:
+            return
+        try:
+            await asyncio.wait_for(job.done.wait(), wait)
+        except asyncio.TimeoutError:
+            pass
+
+    async def kill(self, job: Job, sig: str = "INT", reason: str | None = None) -> None:
+        """向 job 的进程组发信号；已结束的 job 无操作。"""
+        if job.finished:
+            return
+        try:
+            signum = _SIGNALS[sig.upper()]
+        except KeyError:
+            raise ToolError(f"不支持的信号：{sig}（可选 INT / TERM / KILL）")
+        async with job._kill_lock:
+            job.kill_reason = job.kill_reason or reason or f"kill:{sig.upper()}"
+            self._signal_group(job, signum)
+
+    async def reset(self) -> None:
+        """kill 当前 job（SIGKILL），cwd / env 恢复到会话初始值。"""
+        if self.current is not None and not self.current.finished:
+            self.current.kill_reason = self.current.kill_reason or "restart"
+            self._signal_group(self.current, signal.SIGKILL)
+            await self.current.done.wait()
+        self.cwd = self._initial_cwd
+        self.env = dict(self._initial_env)
+        self.current = None
+
+    def pop_notes(self) -> str | None:
+        if not self._notes:
+            return None
+        notes, self._notes = self._notes, []
+        return "\n".join(notes)
 
 
 class BashTool:
-    """Bash 终端工具类。
-
-    封装 BashSession，提供命令执行和会话重启的高级接口。
-    自动检测崩溃的 session 并重建。
-    """
-
-    _session: BashSession | None
+    """终端工具：job 契约（submit / wait / kill）+ 旧契约（execute / execute_stream）。"""
 
     def __init__(self):
-        self._session = None
+        self._session: JobSession | None = None
+
+    @property
+    def session(self) -> JobSession:
+        if self._session is None:
+            self._session = JobSession()
+        return self._session
+
+    # ------------------------------------------------------------------ job 契约
+    async def submit(self, command: str, wait: float = DEFAULT_WAIT, timeout: float | None = None) -> Job:
+        """提交命令并最多等 wait 秒（上限 MAX_WAIT）。会话忙抛 SessionBusy。"""
+        job = await self.session.start_job(command, timeout=timeout)
+        await self.session.wait(job, min(max(wait, 0.0), MAX_WAIT))
+        return job
+
+    def get_job(self, job_id: str) -> Job:
+        return self.session.get(job_id)
+
+    async def wait(self, job_id: str, wait: float = DEFAULT_WAIT) -> Job:
+        job = self.session.get(job_id)
+        await self.session.wait(job, min(max(wait, 0.0), MAX_WAIT))
+        return job
+
+    async def kill(self, job_id: str, sig: str = "INT") -> Job:
+        job = self.session.get(job_id)
+        await self.session.kill(job, sig)
+        # 给进程一点时间退出，让 kill 响应里尽量直接带 killed 终态
+        await self.session.wait(job, 1.0)
+        return job
+
+    def pop_notes(self) -> str | None:
+        return self.session.pop_notes()
+
+    # ------------------------------------------------------------------ 旧契约
+    async def _start_legacy(self, command: str, timeout: float | None) -> tuple[Job, float]:
+        effective = DEFAULT_TIMEOUT if timeout is None else min(timeout, MAX_TIMEOUT)
+        session = self.session
+        # 旧调用方可能并发提交：排队等待前一个 job 结束（与旧版加锁串行行为一致）
+        while session.current is not None and not session.current.finished:
+            await session.current.done.wait()
+        job = await session.start_job(command, timeout=effective)
+        return job, effective
+
+    async def execute_job(self, command: str, timeout: float | None = None) -> tuple[Job, ToolResult]:
+        """旧契约：阻塞至命令结束（默认 30s、最大 300s 超时），返回 (Job, ToolResult)。"""
+        job, effective = await self._start_legacy(command, timeout)
+        await job.done.wait()
+        output, _ = job.read(0)
+        if job.kill_reason == "timeout":
+            notice = f"[命令已超时 ({effective:g}s)，进程已终止，session 继续可用]"
+            output = f"{notice}\n{output}".strip()
+        return job, CLIResult(output=output, error="", system=self.pop_notes())
 
     async def execute(self, command: str, timeout: float | None = None) -> ToolResult:
-        """执行一条 bash 命令。
+        """旧契约：阻塞至命令结束（默认 30s、最大 300s 超时），返回 ToolResult。"""
+        _, result = await self.execute_job(command, timeout)
+        return result
 
-        如果会话尚未启动，会自动创建并启动。
-        如果会话已崩溃或上次超时，会自动重建并在结果中告知 LLM。
-
-        参数:
-            command: 要执行的 bash 命令
-            timeout: 命令超时秒数（可选），None 使用默认值
-
-        返回:
-            ToolResult: 包含命令输出和错误信息的结果
-
-        抛出:
-            ToolError: 如果未提供命令
-        """
+    def close(self) -> None:
+        """服务关闭：SIGKILL 仍在跑的 job 进程组。"""
         if self._session is None:
-            self._session = BashSession()
-            await self._session.start()
-
-        # 检测 session 崩溃，自动重建并警告 LLM
-        if self._session._started and (
-            self._session._process.returncode is not None
-        ):
-            self._session.stop()
-            self._session = BashSession()
-            await self._session.start()
-            result = await self._session.run(command, timeout=timeout)
-            return ToolResult(
-                output=result.output,
-                error=result.error,
-                system="⚠️ bash session 已重建（进程崩溃）。工作目录已重置为 $HOME，环境变量已清空。",
-            )
-
-        return await self._session.run(command, timeout=timeout)
+            return
+        job = self._session.current
+        if job is not None and not job.finished:
+            job.kill_reason = job.kill_reason or "shutdown"
+            JobSession._signal_group(job, signal.SIGKILL)
 
     async def execute_stream(self, command: str, timeout: float | None = None):
-        """Stream command output; yields same event dicts as BashSession.run_stream().
-
-        Auto-creates session on first call. Detects crashed session and rebuilds it,
-        yielding a warning event before streaming the command.
-        """
-        if self._session is None:
-            self._session = BashSession()
-            await self._session.start()
-
-        if self._session._started and self._session._process.returncode is not None:
-            self._session.stop()
-            self._session = BashSession()
-            await self._session.start()
-            yield {
-                "type": "stderr",
-                "chunk": "⚠️ bash session 已重建（进程崩溃）。工作目录已重置为 $HOME，环境变量已清空。",
-            }
-
-        async for event in self._session.run_stream(command, timeout=timeout):
-            yield event
+        """旧契约 SSE：按行推送日志增量；事件 {"type": "stdout"|"stderr"|"done"}。"""
+        job, effective = await self._start_legacy(command, timeout)
+        note = self.pop_notes()
+        if note:
+            yield {"type": "stderr", "chunk": note}
+        cursor = 0
+        pending = b""
+        while True:
+            finished = job.finished
+            size = job.log_size()
+            if size > cursor:
+                with open(job.log_path, "rb") as f:
+                    f.seek(cursor)
+                    pending += f.read(size - cursor)
+                cursor = size
+                *lines, pending = pending.split(b"\n")
+                for line in lines:
+                    yield {"type": "stdout", "chunk": line.decode(errors="replace") + "\n"}
+            if finished:
+                break
+            await self.session.wait(job, 0.2)
+        if pending:
+            yield {"type": "stdout", "chunk": pending.decode(errors="replace")}
+        if job.kill_reason == "timeout":
+            yield {"type": "stderr", "chunk": f"[命令超时 ({effective:g}s)]"}
+        yield {"type": "done"}
 
     async def restart(self) -> ToolResult:
-        """重启终端会话。
-
-        停止当前会话（如果存在），然后创建并启动新会话。
-
-        返回:
-            ToolResult: 包含重启成功信息的结果
-        """
-        if self._session:
-            self._session.stop()
-        self._session = BashSession()
-        await self._session.start()
-
+        """重启终端会话：kill 当前 job，cwd / env 恢复初始值。"""
+        await self.session.reset()
         return ToolResult(system="终端会话已重启。")

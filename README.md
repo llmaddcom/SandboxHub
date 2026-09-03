@@ -41,6 +41,7 @@ SandboxHub adds on top:
 - **Registry** — tracks allocated containers per `(user_id, role_id)` pair, enables reuse
 - **HTTP proxy layer** — single ingress point; routes all tool calls to the right container
 - **Reconciler** — self-healing lifecycle: health-check on acquire (dead sandboxes evicted and transparently re-created), startup recovery after host/service restarts (stopped containers removed, leftover warm containers reset then re-adopted), periodic sweep that destroys untracked orphan containers and auto-reclaims idle sandboxes
+- **Job-based terminal** — `execute(wait)` / `wait(cursor)` / `kill`: commands run as jobs in a persistent session (cwd / exported env survive across calls), callers long-poll in chunks, no default timeout and no upper bound (issue #30); full output lands in `/tmp/cr-jobs/<job_id>.log`
 - **SSE streaming** — `POST /api/terminal/execute/stream` streams stdout in real-time (extends the original polling model)
 - **Multi-arch Dockerfile** — builds on both amd64 (Google Chrome) and arm64 (Chromium)
 
@@ -198,13 +199,48 @@ Key/value pairs in `env` are injected as container environment variables at crea
   (never returned to the shared pool), and logs record env keys only, never values;
 - Omitting `env` keeps the exact current behavior.
 
-### Execute a terminal command
+### Execute a terminal command (job contract)
+
+Commands run as **jobs** inside a persistent session: `cd` / `export` / `source venv` carry over
+to the next call. `wait` (default 30, server cap 120) bounds how long *this request* blocks;
+`timeout` is the command's total time limit — **no default, no upper bound**, omit it and the
+command runs until it finishes. Full output is written to `log_path` inside the container
+(`tail` / `grep` it from the sandbox); the `output` field is head/tail-truncated at 25 KB + 25 KB.
+
+```bash
+# submit; returns after ≤60s with the job state so far
+curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/execute \
+  -H "Content-Type: application/json" \
+  -d '{"command": "pip install openai-whisper", "wait": 60}'
+# → {"job_id": "j_01K…", "status": "running", "exit_code": null, "output": "…so far…",
+#    "cursor": 4096, "log_path": "/tmp/cr-jobs/j_01K….log", "kill_reason": null, "success": true}
+
+# long-poll: incremental output from `cursor`; returns immediately once the job has ended
+curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/wait \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "j_01K…", "cursor": 4096, "wait": 60}'
+# → {"job_id": "j_01K…", "status": "exited", "exit_code": 0, "output": "…", "cursor": 9120, …}
+
+# stop it (the caller does this when the user cancels the turn)
+curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/kill \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "j_01K…", "signal": "INT"}'     # INT | TERM | KILL
+# → {"status": "killed", "exit_code": 130, "kill_reason": "kill:INT", …}
+```
+
+`status` is `running | exited | killed`; `kill_reason` is `timeout`, `kill:<SIG>`, or `restart`.
+One job runs at a time — submitting while another job is still running returns **409** with the
+running `job_id`. `POST /api/terminal/restart` kills the running job and resets cwd / env.
+
+**Legacy form** (kept for a transition period): a body **without `wait`** blocks until the command
+ends, with `timeout` defaulting to 30s (max 300s), and the response still carries
+`success` / `output` / `error` / `system` (plus the job fields):
 
 ```bash
 curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/execute \
   -H "Content-Type: application/json" \
   -d '{"command": "ls /workspace", "timeout": 30}'
-# → {"success": true, "output": "...", "error": null}
+# → {"success": true, "output": "...", "error": "", "status": "exited", "exit_code": 0, …}
 ```
 
 ### Stream terminal output (SSE)
@@ -247,7 +283,7 @@ The Ubuntu container exposes 40+ REST endpoints and 30+ MCP tools. Key categorie
 
 | Category | Endpoints | Description |
 |----------|-----------|-------------|
-| Terminal | `/api/terminal/execute`, `/execute/stream` | Bash commands, PTY session, SSE streaming |
+| Terminal | `/api/terminal/execute`, `/wait`, `/kill`, `/restart`, `/execute/stream` | Job-based bash execution in a persistent session, long-poll, kill, SSE streaming |
 | Screen | `/api/screen/screenshot`, `/screenshot/region` | Full-screen or region capture |
 | Mouse | `/api/mouse/click`, `/move`, `/drag`, `/scroll` | Pixel-level mouse control |
 | Keyboard | `/api/keyboard/key`, `/type` | Key press, text input |
@@ -289,7 +325,7 @@ Full API docs available at `http://localhost:8000/docs` inside a running contain
 | `sandbox.idle_ttl` | `7200` | Idle reclaim threshold for allocated sandboxes (seconds), 0 = off |
 | `reconcile.interval` | `60` | Reconciler period (seconds) |
 | `reconcile.orphan_grace_seconds` | `300` | Grace period before an unregistered running container is destroyed |
-| `proxy.read_timeout` / `proxy.connect_timeout` | `330` / `10` | Proxy timeouts (seconds); read timeout must exceed the 300s terminal budget |
+| `proxy.read_timeout` / `proxy.connect_timeout` | `330` / `10` | Proxy timeouts (seconds); read timeout must exceed the longest single terminal request (legacy `timeout` cap 300s; job-contract `wait` cap 120s) |
 | `workspace.mount_enabled` | `true` | Master switch for the MinIO workspace mount |
 | `workspace.rclone_vfs_cache_mode` | `full` | rclone VFS cache mode; `full` avoids EIO on rename-over inside the write-back window (issue #9) |
 | `workspace.rclone_vfs_cache_max_size` | `2G` | Local VFS cache size cap |

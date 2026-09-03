@@ -41,6 +41,7 @@ SandboxHub 在此基础上新增：
 - **注册表（Registry）** — 按 `(user_id, role_id)` 跟踪已分配容器，支持复用
 - **HTTP 代理层** — 统一入口，将所有工具调用路由到对应容器
 - **对账器（Reconciler）** — 自愈式生命周期管理：acquire 复用前体检（死沙盒驱逐并透明重建）、宿主/服务重启后的启动恢复（清理已停止容器、遗留 warm 容器复位后收养回池）、周期对账（销毁不在册的孤儿容器、闲置沙盒自动回收）
+- **job 化终端** — `execute(wait)` / `wait(cursor)` / `kill`：命令作为 job 在持久会话里跑（cwd / 导出环境跨调用保留），调用方分段长轮询取结果，无默认超时、无上限（issue #30）；全量输出落 `/tmp/cr-jobs/<job_id>.log`
 - **SSE 流式输出** — `POST /api/terminal/execute/stream` 实时推送 stdout（扩展原始轮询模型）
 - **多架构 Dockerfile** — 同时支持 amd64（Google Chrome）和 arm64（Chromium）
 
@@ -175,13 +176,46 @@ curl -X POST http://localhost:8088/v1/sandboxes/acquire \
   key 不记 value；
 - 缺省（无 `env` 字段）行为与现状完全一致。
 
-### 执行终端命令
+### 执行终端命令（job 契约）
+
+命令作为 **job** 在持久会话里执行：`cd` / `export` / `source venv` 会带到下一次调用。
+`wait`（默认 30，服务端上限 120）只限制**本次请求**最多等多久；`timeout` 是命令的总时限——
+**无默认、无上限**，不传就跑到命令自己结束。全量输出写到容器内的 `log_path`（可在沙盒里
+`tail` / `grep`），响应里的 `output` 按 25 KB + 25 KB 的 head/tail 口径截断。
+
+```bash
+# 提交；最多等 60s，带着目前为止的状态返回
+curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/execute \
+  -H "Content-Type: application/json" \
+  -d '{"command": "pip install openai-whisper", "wait": 60}'
+# → {"job_id": "j_01K…", "status": "running", "exit_code": null, "output": "…到目前为止…",
+#    "cursor": 4096, "log_path": "/tmp/cr-jobs/j_01K….log", "kill_reason": null, "success": true}
+
+# 长轮询：从 cursor 起取增量输出；job 已结束立即返回
+curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/wait \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "j_01K…", "cursor": 4096, "wait": 60}'
+# → {"job_id": "j_01K…", "status": "exited", "exit_code": 0, "output": "…", "cursor": 9120, …}
+
+# 终止（调用方在用户点「停止」时调用）
+curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/kill \
+  -H "Content-Type: application/json" \
+  -d '{"job_id": "j_01K…", "signal": "INT"}'     # INT | TERM | KILL
+# → {"status": "killed", "exit_code": 130, "kill_reason": "kill:INT", …}
+```
+
+`status` 取值 `running | exited | killed`；`kill_reason` 为 `timeout`、`kill:<SIG>` 或 `restart`。
+同一时刻只跑一个 job——上一条没结束就再提交返回 **409**，body 带正在跑的 `job_id`。
+`POST /api/terminal/restart` 会 kill 当前 job 并复位 cwd / 环境变量。
+
+**旧形态**（过渡期保留）：请求体**不带 `wait`** 即阻塞至命令结束，`timeout` 默认 30s（上限
+300s），响应仍含 `success` / `output` / `error` / `system`（外加 job 字段）：
 
 ```bash
 curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/execute \
   -H "Content-Type: application/json" \
   -d '{"command": "ls /workspace", "timeout": 30}'
-# → {"success": true, "output": "...", "error": null}
+# → {"success": true, "output": "...", "error": "", "status": "exited", "exit_code": 0, …}
 ```
 
 ### 流式终端输出（SSE）
@@ -224,7 +258,7 @@ Ubuntu 容器对外暴露 40+ REST 接口和 30+ MCP 工具，主要分类：
 
 | 分类 | 接口 | 说明 |
 |------|------|------|
-| 终端 | `/api/terminal/execute`、`/execute/stream` | bash 命令、PTY 会话、SSE 流式输出 |
+| 终端 | `/api/terminal/execute`、`/wait`、`/kill`、`/restart`、`/execute/stream` | 持久会话里 job 化执行 bash、长轮询、终止、SSE 流式输出 |
 | 屏幕 | `/api/screen/screenshot`、`/screenshot/region` | 全屏或区域截图 |
 | 鼠标 | `/api/mouse/click`、`/move`、`/drag`、`/scroll` | 像素级鼠标控制 |
 | 键盘 | `/api/keyboard/key`、`/type` | 按键、文本输入 |
@@ -266,7 +300,7 @@ Ubuntu 容器对外暴露 40+ REST 接口和 30+ MCP 工具，主要分类：
 | `sandbox.idle_ttl` | `7200` | 已分配沙盒闲置回收阈值（秒），0=关闭 |
 | `reconcile.interval` | `60` | 周期对账间隔（秒） |
 | `reconcile.orphan_grace_seconds` | `300` | 孤儿容器创建宽限（秒） |
-| `proxy.read_timeout` / `proxy.connect_timeout` | `330` / `10` | 代理转发超时（秒）；读超时须大于终端命令预算 300s |
+| `proxy.read_timeout` / `proxy.connect_timeout` | `330` / `10` | 代理转发超时（秒）；读超时须大于终端单次请求最长时长（旧契约 `timeout` 上限 300s；job 契约 `wait` 上限 120s） |
 | `workspace.mount_enabled` | `true` | 工作区挂载总开关 |
 | `workspace.rclone_vfs_cache_mode` | `full` | rclone VFS 缓存模式；`full` 避免写回窗口内 rename-over 报 EIO（issue #9） |
 | `workspace.rclone_vfs_cache_max_size` | `2G` | VFS 本地缓存体积上限 |
