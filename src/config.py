@@ -45,6 +45,10 @@ SYSTEM_KNOBS: tuple[SystemKnob, ...] = (
     SystemKnob("warm_pool.maintain_interval", "POOL_MAINTAIN_INTERVAL", "预热池补齐检查间隔（秒）"),
     SystemKnob("sandbox.api_port", "SANDBOX_API_PORT", "容器内沙盒 FastAPI 端口"),
     SystemKnob("sandbox.idle_ttl", "SANDBOX_IDLE_TTL", "已分配沙盒闲置回收阈值（秒，0=关闭）"),
+    SystemKnob("sandbox.mem_limit", "SANDBOX_MEM_LIMIT", "单个沙盒容器内存上限（docker 写法如 1g；空=不限）"),
+    SystemKnob("sandbox.cpus", "SANDBOX_CPUS", "单个沙盒容器 CPU 上限（核数，0=不限）"),
+    SystemKnob("sandbox.pids_limit", "SANDBOX_PIDS_LIMIT", "单个沙盒容器进程数上限（0=不限）"),
+    SystemKnob("sandbox.max_total", "SANDBOX_MAX_TOTAL", "本机同时存在的沙盒容器总数上限（含预热池，0=不限）"),
     SystemKnob("reconcile.interval", "RECONCILE_INTERVAL", "周期对账间隔（秒）"),
     SystemKnob("reconcile.orphan_grace_seconds", "ORPHAN_GRACE_SECONDS", "孤儿容器创建宽限（秒）"),
     SystemKnob("proxy.read_timeout", "PROXY_READ_TIMEOUT", "代理读超时（秒）"),
@@ -198,6 +202,10 @@ class Settings(BaseSettings):
     POOL_MAINTAIN_INTERVAL: int = 30
     SANDBOX_API_PORT: int = 8000
     SANDBOX_IDLE_TTL: int = 7200
+    SANDBOX_MEM_LIMIT: str = ""
+    SANDBOX_CPUS: float = 0
+    SANDBOX_PIDS_LIMIT: int = 0
+    SANDBOX_MAX_TOTAL: int = 0
     RECONCILE_INTERVAL: int = 60
     ORPHAN_GRACE_SECONDS: int = 300
     PROXY_READ_TIMEOUT: float = 330.0

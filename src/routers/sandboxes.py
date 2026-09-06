@@ -119,6 +119,21 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
         )
         await _reconciler.destroy_sandbox(existing)
 
+    # 1.5 总量闸：本机沙盒容器数（含预热池）到上限即拒绝，避免把与推理服务共享的内存挤爆
+    if settings.SANDBOX_MAX_TOTAL > 0:
+        try:
+            total = int(await asyncio.to_thread(_container_manager.count_managed))
+        except Exception as e:  # 计数失败不阻断分配
+            logger.warning(f"沙盒计数失败，跳过总量闸 | err={e}"); total = 0
+        if total >= settings.SANDBOX_MAX_TOTAL:
+            logger.warning(f"沙盒总数到上限 | total={total} | max={settings.SANDBOX_MAX_TOTAL} | user={req.user_id}")
+            raise HTTPException(
+                status_code=503,
+                detail=_unavailable_detail(
+                    f"sandbox capacity reached ({total}/{settings.SANDBOX_MAX_TOTAL})", "capacity_reached"
+                ),
+            )
+
     # 2. 决定是否挂载工作区。请求带 workspace 但本服务无挂载能力（开关关/缺 MinIO 凭据）
     #    时记 warning 并回退为不挂载，避免因配置缺失而让终端整体不可用。
     workspace = None

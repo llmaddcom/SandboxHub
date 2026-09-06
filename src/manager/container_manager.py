@@ -169,6 +169,16 @@ class ContainerManager:
             security_opt.append("apparmor:unconfined")
         if security_opt:
             run_kwargs["security_opt"] = security_opt
+        # 资源上限（config/system.yaml sandbox.*）：与推理服务同机时防止沙盒挤占统一内存
+        if settings.SANDBOX_MEM_LIMIT:
+            run_kwargs["mem_limit"] = settings.SANDBOX_MEM_LIMIT
+            run_kwargs["memswap_limit"] = settings.SANDBOX_MEM_LIMIT  # 不许用 swap 顶
+        if settings.SANDBOX_CPUS > 0:
+            run_kwargs["nano_cpus"] = int(settings.SANDBOX_CPUS * 1_000_000_000)
+        if settings.SANDBOX_PIDS_LIMIT > 0:
+            run_kwargs["pids_limit"] = settings.SANDBOX_PIDS_LIMIT
+        # 沙盒容器先于宿主上其他服务被 OOM killer 选中（推理服务通常设为负值）
+        run_kwargs["oom_score_adj"] = 500
         # 自定义 DNS（可选）。use-vc 强制 TCP DNS，应对宿主 UDP 53 被拦截
         dns = settings.dns_servers()
         if dns:
@@ -196,6 +206,14 @@ class ContainerManager:
             raise RuntimeError(f"容器无法获取 IP | name={name}")
 
         return container.id, ip
+
+    def count_managed(self) -> int:
+        """本机由 SandboxHub 管理的沙盒容器数（含预热池与已分配；同步，供 to_thread）。"""
+        return len(
+            self._docker.containers.list(
+                all=True, filters={"label": f"{settings.CONTAINER_LABEL}=true"}
+            )
+        )
 
     def _stop_and_remove_sync(self, container_id: str) -> None:
         """停止并删除容器。同步方法，在 asyncio.to_thread 中调用。"""

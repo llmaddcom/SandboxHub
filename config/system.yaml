@@ -29,7 +29,13 @@ sandbox:
   api_port: 8000
   # 已分配沙盒的闲置回收阈值（秒）：超时未用（acquire/proxy）即回收——挂载容器销毁、
   # warm 容器复位回池；调用方按 (user, role) 幂等 acquire，回收后下次调用自动重建。0 = 关闭。
-  idle_ttl: 7200
+  idle_ttl: 1800
+  # 资源上限：与 vLLM 同机时必须设，否则一个跑 chromium 的沙盒就能把模型挤进 swap / 触发 OOM
+  mem_limit: "1g"
+  cpus: 2
+  pids_limit: 512
+  # 本机沙盒容器总数上限（含预热池）；到上限 acquire 返回 503 让调用方稍后重试
+  max_total: 4
 
 reconcile:
   # 周期对账间隔（秒）：清理已停止 / 孤儿容器、驱逐失联沙盒、闲置回收
