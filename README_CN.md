@@ -31,7 +31,7 @@ SandboxHub :8088  ─── 预热池 ──→  Ubuntu 容器
 
 Ubuntu 沙盒镜像直接参考了 Anthropic 的 [computer-use-demo](https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo)。延续的核心设计模式：
 
-- **`BashSession` PTY 模式** — 持久化 bash 子进程，通过哨兵字符串检测命令完成（`images/ubuntu/app/tools/bash.py`）
+- **终端 = tmux job** — 每条命令是一个 tmux 窗口，经 `script(1)` 在真实 PTY 里跑：交互式程序可用，人也能 `tmux attach` 旁观（`images/ubuntu/app/tools/bash.py`）
 - **`ToolResult` / `CLIResult` 抽象** — 结构化工具输出，便于 LLM 消费
 - **虚拟桌面栈** — TigerVNC + openbox + noVNC，支持 VLM 截图点击工作流
 - **lifespan 工具注入** — 启动时将 `BashTool`、`ComputerTool`、`EditTool` 单例注入各 FastAPI 路由
@@ -205,7 +205,7 @@ curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/kil
 ```
 
 `status` 取值 `running | exited | killed`；`kill_reason` 为 `timeout`、`kill:<SIG>` 或 `restart`。
-同一时刻只跑一个 job——上一条没结束就再提交返回 **409**，body 带正在跑的 `job_id`。
+多个 job 可并行。请求体 `session` 字段指定对话会话 → 容器内同名 tmux session（缺省 `default`），同会话的 job 共享 cwd / 导出环境并可用 `tmux send-keys / capture-pane / kill-window -t <job_id>` 互相交互，不同会话互不可见。活跃窗口最多 64 个，超出按最近活动淘汰最旧的、最近 8 个不动（`kill_reason=evicted`）。
 `POST /api/terminal/restart` 会 kill 当前 job 并复位 cwd / 环境变量。
 
 **旧形态**（过渡期保留）：请求体**不带 `wait`** 即阻塞至命令结束，`timeout` 默认 30s（上限
@@ -421,6 +421,6 @@ docker run -d --name sandbox --shm-size=2g \
 
 **优雅退出** 会在进程退出前清理所有容器（预热池 + 已分配），确保不留孤儿容器。
 
-**BashSession** 使用持久化 PTY 和 UUID 哨兵字符串检测命令完成。流式变体 `run_stream` 通过 `asyncio.readline()` 逐行 yield stdout，支持长时间运行命令的实时输出。
+**终端 job** 以 tmux 窗口运行（`script -q -f -e` 提供 PTY 并把输出记到 job 日志）；轮询 `pane_dead` 判定结束，退出码取包装脚本 EXIT trap 落盘值（`pane_dead_status` 只作兜底——tmux 3.2a 偶发永久为空）。流式变体 `execute_stream` 按行 tail job 日志。
 
 **VLM vs LLM 接口选择**：沙盒同时支持两种模态。LLM 应优先使用终端和 CDP 接口（token 消耗极低）；VLM 可使用截图 + 鼠标/键盘进行像素级交互。

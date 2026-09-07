@@ -1,12 +1,16 @@
 """
-终端操作路由模块 - 提供终端命令执行的 API 接口（job 契约，issue #30）。
+终端操作路由模块 - 提供终端命令执行的 API 接口（job 契约，issue #30；tmux 化）。
 
 接口列表：
-- POST /api/terminal/execute:        提交命令到持久会话，最多等 wait 秒后返回 job 状态
+- POST /api/terminal/execute:        在会话的 tmux session 里开窗口跑命令，最多等 wait 秒后返回 job 状态
 - POST /api/terminal/wait:           从 cursor 起取 job 增量输出，最多等 wait 秒
 - POST /api/terminal/kill:           向 job 进程组发 INT / KILL
 - POST /api/terminal/execute/stream: SSE 流式执行（旧契约，保留）
-- POST /api/terminal/restart:        重启终端会话（kill 当前 job，cwd / env 复位）
+- POST /api/terminal/restart:        重启终端会话（kill 该会话在跑的 job，cwd / env 复位）
+
+会话隔离：请求体 ``session`` 字段指定对话会话，对应容器内一个同名 tmux session（缺省
+``default``）；同一 session 的 job 之间 cwd / 导出环境跨调用保留，模型可用 ``tmux
+send-keys / capture-pane / kill-window -t <job_id>`` 与仍在跑的 job 交互。多 job 可并行。
 
 兼容：请求体不带 ``wait`` 字段 = 旧契约（阻塞至结束，timeout 默认 30s / 上限 300s，
 响应含 success/output/error/system）。带 ``wait`` = job 契约（timeout 无默认、无上限）。
@@ -19,7 +23,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..tools import BashTool, ToolError
-from ..tools.bash import DEFAULT_WAIT, MAX_WAIT, Job, SessionBusy
+from ..tools.bash import DEFAULT_WAIT, MAX_WAIT, Job
 
 # 创建终端操作路由，设置前缀和标签
 router = APIRouter(prefix="/api/terminal", tags=["终端操作"])
@@ -62,18 +66,27 @@ class ExecuteRequest(BaseModel):
             "不传 = 跑到命令自己结束；旧契约下默认 30s、上限 300s。"
         ),
     )
+    session: str | None = Field(
+        default=None,
+        description=(
+            "对话会话标识 → 容器内同名 tmux session（缺省 default）。同 session 的 job 共享 "
+            "cwd / 导出环境，并可用 tmux 互相看见；不同 session 互不可见。"
+        ),
+    )
 
 
 class JobResponse(BaseModel):
     """job 状态响应（execute / wait / kill 共用）。"""
-    job_id: str = Field(description="job 标识")
+    job_id: str = Field(description="job 标识；也是其 tmux 窗口名（tmux ... -t <job_id>）")
+    tmux_session: str = Field(default="", description="job 所在的 tmux session 名")
     status: str = Field(description="running | exited | killed")
     exit_code: int | None = Field(default=None, description="命令退出码；未结束为 null")
     output: str = Field(default="", description="本次返回的输出片段（head/tail 截断）")
     cursor: int = Field(description="下次 /wait 的起始字节偏移（日志文件当前大小）")
     log_path: str = Field(description="全量输出日志路径，可在容器内 tail / grep")
     kill_reason: str | None = Field(
-        default=None, description="被终止原因：timeout | kill:INT | kill:KILL | restart"
+        default=None,
+        description="被终止原因：timeout | kill:INT | kill:KILL | restart | evicted | window_closed",
     )
 
 
@@ -100,6 +113,11 @@ class KillRequest(BaseModel):
     signal: str = Field(default="INT", description="INT | TERM | KILL")
 
 
+class RestartRequest(BaseModel):
+    """重启终端会话请求模型（请求体可省略 = default 会话）。"""
+    session: str | None = Field(default=None, description="要重启的对话会话标识（缺省 default）")
+
+
 class RestartResponse(BaseModel):
     """重启终端响应模型。"""
     success: bool = Field(description="是否重启成功")
@@ -110,6 +128,7 @@ def _job_payload(job: Job, start: int = 0) -> dict:
     output, cursor = job.read(start)
     return {
         "job_id": job.id,
+        "tmux_session": job.session,
         "status": job.status,
         "exit_code": job.exit_code,
         "output": output,
@@ -123,35 +142,28 @@ def _job_payload(job: Job, start: int = 0) -> dict:
 
 @router.post("/execute", response_model=ExecuteResponse, summary="执行 bash 命令")
 async def execute_command(request: ExecuteRequest):
-    """把命令送入持久会话执行。
+    """在 ``session`` 对应的 tmux session 里开一个窗口跑命令。
 
     - job 契约（带 ``wait``）：最多等 ``wait`` 秒；没结束返回 ``status=running`` 与目前
-      输出，随后用 ``/wait`` 分段长轮询。``timeout`` 无默认无上限。
-      会话正忙（上一条命令未结束）返回 409，body 带正在跑的 job_id。
+      输出，随后用 ``/wait`` 分段长轮询。``timeout`` 无默认无上限。多个 job 可并行。
     - 旧契约（不带 ``wait``）：阻塞至结束，``timeout`` 默认 30s / 上限 300s。
-    - cwd / 导出环境跨调用保留（``cd`` / ``export`` / ``source venv``）。
+    - 同 session 的 cwd / 导出环境跨调用保留（``cd`` / ``export`` / ``source venv``）。
     """
     tool = get_bash_tool()
     try:
         if request.wait is None:
             # 旧契约：阻塞至结束
-            job, result = await tool.execute_job(request.command, timeout=request.timeout)
+            job, result = await tool.execute_job(
+                request.command, timeout=request.timeout, session=request.session
+            )
             payload = _job_payload(job)
             payload["output"] = result.output or ""
             return ExecuteResponse(**payload, success=True, error=result.error, system=result.system)
 
-        job = await tool.submit(request.command, wait=request.wait, timeout=request.timeout)
-        return ExecuteResponse(**_job_payload(job), success=True, system=tool.pop_notes())
-    except SessionBusy as e:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": e.message,
-                "job_id": e.job.id,
-                "status": e.job.status,
-                "log_path": str(e.job.log_path),
-            },
+        job = await tool.submit(
+            request.command, wait=request.wait, timeout=request.timeout, session=request.session
         )
+        return ExecuteResponse(**_job_payload(job), success=True, system=tool.pop_notes(request.session))
     except ToolError as e:
         raise HTTPException(status_code=400, detail=f"终端错误: {e.message}")
     except Exception as e:
@@ -194,7 +206,9 @@ async def execute_command_stream(request: ExecuteRequest):
     """
     async def event_gen():
         try:
-            async for event in get_bash_tool().execute_stream(request.command, request.timeout):
+            async for event in get_bash_tool().execute_stream(
+                request.command, request.timeout, session=request.session
+            ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:
             err_event = {"type": "error", "chunk": str(e)}
@@ -204,15 +218,16 @@ async def execute_command_stream(request: ExecuteRequest):
 
 
 @router.post("/restart", response_model=RestartResponse, summary="重启终端会话")
-async def restart_terminal():
-    """重启终端会话：kill 正在跑的 job（SIGKILL），cwd / 环境变量恢复初始值。
+async def restart_terminal(request: RestartRequest | None = None):
+    """重启终端会话：kill 该会话正在跑的 job（SIGKILL）并销毁其 tmux session，
+    cwd / 环境变量恢复初始值。
 
     返回:
         RestartResponse: 包含重启结果信息
     """
     try:
         tool = get_bash_tool()
-        result = await tool.restart()
+        result = await tool.restart(request.session if request else None)
         return RestartResponse(
             success=True,
             message=result.system or "终端已重启",

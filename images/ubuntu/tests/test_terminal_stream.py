@@ -74,14 +74,29 @@ def test_state_persists_across_execute_calls(client, tmp_path):
     assert body["output"] == f"{tmp_path.resolve()}\n1\n"
 
 
-def test_execute_while_busy_returns_409_with_running_job(client):
+def test_execute_while_running_runs_in_parallel(client):
+    """tmux 化：同容器多 job 并行，不再 409。"""
     running = client.post("/api/terminal/execute", json={"command": "sleep 30", "wait": 0}).json()
-    resp = client.post("/api/terminal/execute", json={"command": "echo x", "wait": 0})
-    assert resp.status_code == 409
-    detail = resp.json()["detail"]
-    assert detail["job_id"] == running["job_id"]
-    assert detail["status"] == "running"
+    resp = client.post("/api/terminal/execute", json={"command": "echo x", "wait": 5})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "exited" and resp.json()["output"] == "x\n"
     client.post("/api/terminal/kill", json={"job_id": running["job_id"], "signal": "KILL"})
+
+
+def test_execute_session_field_names_tmux_session_and_isolates_state(client, tmp_path):
+    client.post("/api/terminal/execute", json={"command": f"cd {tmp_path}", "wait": 5, "session": "conv.1"})
+    a = client.post("/api/terminal/execute", json={"command": "pwd", "wait": 5, "session": "conv.1"}).json()
+    b = client.post("/api/terminal/execute", json={"command": "pwd", "wait": 5, "session": "conv.2"}).json()
+    assert a["tmux_session"] == "conv_1" and b["tmux_session"] == "conv_2"
+    assert a["output"].strip() == str(tmp_path.resolve())
+    assert b["output"].strip() != str(tmp_path.resolve())
+
+
+def test_restart_accepts_session_field(client, tmp_path):
+    client.post("/api/terminal/execute", json={"command": f"cd {tmp_path}", "wait": 5, "session": "r1"})
+    assert client.post("/api/terminal/restart", json={"session": "r1"}).status_code == 200
+    body = client.post("/api/terminal/execute", json={"command": "pwd", "wait": 5, "session": "r1"}).json()
+    assert body["output"].strip() != str(tmp_path.resolve())
 
 
 def test_kill_then_wait_returns_killed_and_session_continues(client):
