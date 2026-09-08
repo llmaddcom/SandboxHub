@@ -46,15 +46,18 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
 # - fonts-noto-cjk/fonts-wqy-*：matplotlib/reportlab 生成图表/PDF 时的中文字体
 #   （多套并装：Noto 覆盖全、WenQuanYi 黑体/微米黑兜底，见下方 matplotlib 默认字体配置）
 # - locales/tzdata：zh_CN.UTF-8 locale 与 Asia/Shanghai 时区（国内业务时间/日期正确）
+# - tmux/bsdutils(script)：终端 job 在 tmux 窗口里经 script 跑（PTY、可交互、可 attach），见 app/tools/bash.py
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget gnupg \
         git openssh-client \
         dumb-init \
         build-essential pkg-config xz-utils \
         ripgrep jq less tree vim nano zip unzip procps \
+        tmux bsdutils \
         rclone fuse3 \
         locales tzdata \
         fonts-noto-cjk fonts-wqy-zenhei fonts-wqy-microhei && \
+    printf 'set -g remain-on-exit on\nset -g history-limit 50000\nset -g exit-empty off\nset -g status off\n' > /etc/tmux.conf && \
     sed -i 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen && \
     locale-gen && \
     ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \

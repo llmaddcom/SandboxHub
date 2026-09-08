@@ -40,8 +40,11 @@ RUN apt-get update && apt-get -y upgrade && \
     xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev \
     # --- 网络工具 ---
     net-tools netcat \
+    # --- 终端 job：tmux 窗口 + script(bsdutils) PTY 记录（app/tools/bash.py）---
+    tmux bsdutils \
     # --- 工作区 MinIO 挂载（容器内 rclone mount 需 fusermount3 与 /dev/fuse）---
     rclone fuse3 && \
+    printf 'set -g remain-on-exit on\nset -g history-limit 50000\nset -g exit-empty off\nset -g status off\n' > /etc/tmux.conf && \
     # 生成并设置中文 locale
     locale-gen zh_CN.UTF-8 && \
     update-locale LANG=zh_CN.UTF-8 && \

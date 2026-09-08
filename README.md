@@ -31,7 +31,7 @@ SandboxHub :8088  ─── warm pool ──→  Ubuntu Container
 
 The Ubuntu sandbox image is directly inspired by Anthropic's [computer-use-demo](https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo). Core design patterns carried over:
 
-- **`BashSession` PTY pattern** — persistent bash subprocess with sentinel-based command completion detection (`images/ubuntu/app/tools/bash.py`)
+- **Terminal as tmux jobs** — every command runs as a tmux window under `script(1)` (a real PTY), so interactive programs work and humans can `tmux attach` (`images/ubuntu/app/tools/bash.py`)
 - **`ToolResult` / `CLIResult` abstractions** — structured tool output for LLM consumption
 - **Virtual desktop stack** — TigerVNC + openbox + noVNC for VLM screenshot-and-click workflows
 - **Tool injection via lifespan** — `BashTool`, `ComputerTool`, `EditTool` singletons injected into FastAPI routers at startup
@@ -41,7 +41,7 @@ SandboxHub adds on top:
 - **Registry** — tracks allocated containers per `(user_id, role_id)` pair, enables reuse
 - **HTTP proxy layer** — single ingress point; routes all tool calls to the right container
 - **Reconciler** — self-healing lifecycle: health-check on acquire (dead sandboxes evicted and transparently re-created), startup recovery after host/service restarts (stopped containers removed, leftover warm containers reset then re-adopted), periodic sweep that destroys untracked orphan containers and auto-reclaims idle sandboxes
-- **Job-based terminal** — `execute(wait)` / `wait(cursor)` / `kill`: commands run as jobs in a persistent session (cwd / exported env survive across calls), callers long-poll in chunks, no default timeout and no upper bound (issue #30); full output lands in `/tmp/cr-jobs/<job_id>.log`
+- **Job-based terminal** — `execute(wait)` / `wait(cursor)` / `kill`: commands run as jobs (tmux windows) in a per-conversation tmux session (cwd / exported env survive across calls), several jobs may run in parallel, callers long-poll in chunks, no default timeout and no upper bound (issue #30); full output lands in `/tmp/cr-jobs/<job_id>.log`
 - **SSE streaming** — `POST /api/terminal/execute/stream` streams stdout in real-time (extends the original polling model)
 - **Multi-arch Dockerfile** — builds on both amd64 (Google Chrome) and arm64 (Chromium)
 
@@ -201,19 +201,26 @@ Key/value pairs in `env` are injected as container environment variables at crea
 
 ### Execute a terminal command (job contract)
 
-Commands run as **jobs** inside a persistent session: `cd` / `export` / `source venv` carry over
-to the next call. `wait` (default 30, server cap 120) bounds how long *this request* blocks;
-`timeout` is the command's total time limit — **no default, no upper bound**, omit it and the
-command runs until it finishes. Full output is written to `log_path` inside the container
-(`tail` / `grep` it from the sandbox); the `output` field is head/tail-truncated at 25 KB + 25 KB.
+Commands run as **jobs** — each one is a tmux window (named by `job_id`) inside a tmux session
+named after the caller's conversation (`session` field, default `default`). Within a session
+`cd` / `export` / `source venv` carry over to the next call; different sessions cannot see each
+other. Several jobs may run at once. The command runs under `script(1)` in a real PTY, so
+interactive programs work: from another job in the same session the model can
+`tmux send-keys -t <job_id> 'text' Enter`, `tmux capture-pane -p -t <job_id>`, or
+`tmux kill-window -t <job_id>`. `wait` (default 30, server cap 120) bounds how long *this
+request* blocks; `timeout` is the command's total time limit — **no default, no upper bound**,
+omit it and the command runs until it finishes. Full output is written to `log_path` inside the
+container (`tail` / `grep` it from the sandbox); the `output` field is head/tail-truncated at
+25 KB + 25 KB, with CRLF / escape sequences normalised.
 
 ```bash
 # submit; returns after ≤60s with the job state so far
 curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/execute \
   -H "Content-Type: application/json" \
-  -d '{"command": "pip install openai-whisper", "wait": 60}'
-# → {"job_id": "j_01K…", "status": "running", "exit_code": null, "output": "…so far…",
-#    "cursor": 4096, "log_path": "/tmp/cr-jobs/j_01K….log", "kill_reason": null, "success": true}
+  -d '{"command": "pip install openai-whisper", "wait": 60, "session": "conv-42"}'
+# → {"job_id": "j_01K…", "tmux_session": "conv-42", "status": "running", "exit_code": null,
+#    "output": "…so far…", "cursor": 4096, "log_path": "/tmp/cr-jobs/j_01K….log",
+#    "kill_reason": null, "success": true}
 
 # long-poll: incremental output from `cursor`; returns immediately once the job has ended
 curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/wait \
@@ -228,9 +235,11 @@ curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/kil
 # → {"status": "killed", "exit_code": 130, "kill_reason": "kill:INT", …}
 ```
 
-`status` is `running | exited | killed`; `kill_reason` is `timeout`, `kill:<SIG>`, or `restart`.
-One job runs at a time — submitting while another job is still running returns **409** with the
-running `job_id`. `POST /api/terminal/restart` kills the running job and resets cwd / env.
+`status` is `running | exited | killed`; `kill_reason` is `timeout`, `kill:<SIG>`, `restart`,
+`evicted` (the server keeps at most 64 live windows and evicts the least recently active ones,
+never the 8 most recent — codex's unified-exec limits) or `window_closed` (someone ran
+`tmux kill-window`). `POST /api/terminal/restart` (`{"session": "…"}`) kills that session's
+running jobs, destroys its tmux session and resets cwd / env.
 
 **Legacy form** (kept for a transition period): a body **without `wait`** blocks until the command
 ends, with `timeout` defaulting to 30s (max 300s), and the response still carries
@@ -283,7 +292,7 @@ The Ubuntu container exposes 40+ REST endpoints and 30+ MCP tools. Key categorie
 
 | Category | Endpoints | Description |
 |----------|-----------|-------------|
-| Terminal | `/api/terminal/execute`, `/wait`, `/kill`, `/restart`, `/execute/stream` | Job-based bash execution in a persistent session, long-poll, kill, SSE streaming |
+| Terminal | `/api/terminal/execute`, `/wait`, `/kill`, `/restart`, `/execute/stream` | Job-based bash execution in per-conversation tmux sessions, long-poll, kill, SSE streaming |
 | Screen | `/api/screen/screenshot`, `/screenshot/region` | Full-screen or region capture |
 | Mouse | `/api/mouse/click`, `/move`, `/drag`, `/scroll` | Pixel-level mouse control |
 | Keyboard | `/api/keyboard/key`, `/type` | Key press, text input |
@@ -453,6 +462,6 @@ docker run -d --name sandbox --shm-size=2g \
 
 **Graceful shutdown** drains all containers (both warm pool and allocated) before exit, ensuring no orphaned Docker containers.
 
-**BashSession** uses a persistent PTY with UUID-based sentinels to detect command completion. The streaming variant (`run_stream`) yields stdout line-by-line via `asyncio.readline()`, enabling real-time output for long-running commands.
+**Terminal jobs** run as tmux windows (`script -q -f -e` gives each command a PTY and records it to the job log); completion is detected by polling `pane_dead`, the exit code comes from the wrapper's EXIT trap (`pane_dead_status` is only a fallback — tmux 3.2a occasionally never fills it). The streaming variant (`execute_stream`) tails the job log line-by-line.
 
 **VLM vs LLM routing**: The sandbox supports both modalities. LLMs should use terminal/CDP endpoints (low token cost). VLMs can use screenshot + mouse/keyboard for pixel-level interaction.

@@ -1,24 +1,33 @@
-"""job 会话（app.tools.bash）——真实 bash 子进程测试，覆盖 issue #30 验收项的缩短版。"""
+"""job 会话（app.tools.bash）——真实 tmux + bash 测试，覆盖 issue #30 验收项与 tmux 化新增项。"""
 
 import asyncio
 import os
+import subprocess
 import time
 
 import pytest
 
+from app.tools import bash as bash_mod
 from app.tools.bash import (
     HEAD_BYTES,
     TAIL_BYTES,
     BashTool,
     JobSession,
-    SessionBusy,
     ToolError,
+    _clean_tty,
     _head_tail_truncate,
     _new_job_id,
+    session_name,
 )
 
 
-# ── 截断 ─────────────────────────────────────────────────────────────────────
+def _tmux(*args: str) -> str:
+    return subprocess.run(
+        ["tmux", "-S", bash_mod.TMUX_SOCKET, *args], capture_output=True, text=True, check=False
+    ).stdout
+
+
+# ── 纯函数 ───────────────────────────────────────────────────────────────────
 
 def test_head_tail_short_text_unchanged():
     text = "hello world"
@@ -54,6 +63,21 @@ def test_job_id_is_sortable_and_unique():
     assert _new_job_id() != _new_job_id()
 
 
+def test_session_name_sanitized_for_tmux():
+    assert session_name(None) == "default"
+    assert session_name("") == "default"
+    assert session_name("sess.abc:def/ghi") == "sess_abc_def_ghi"
+    assert session_name("x" * 100) == "x" * 48
+    assert session_name("Ab-1_2") == "Ab-1_2"
+
+
+def test_clean_tty_normalizes_pty_output():
+    assert _clean_tty("a\r\nb\r\n") == "a\nb\n"
+    assert _clean_tty("\x1b[32mgreen\x1b[0m") == "green"
+    assert _clean_tty("10%\r50%\r100%\n") == "100%\n"
+    assert _clean_tty("\x1b]0;title\x07plain") == "plain"
+
+
 # ── job 契约：submit / wait / kill ────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -73,7 +97,17 @@ async def test_submit_returns_running_then_wait_until_exited():
     assert job.exit_code == 0
     output, cursor = job.read(0)
     assert output == "done\n"
-    assert cursor == len(b"done\n")
+    assert cursor == job.log_size()
+
+
+@pytest.mark.asyncio
+async def test_output_strips_script_markers_and_crlf():
+    tool = BashTool()
+    job = await tool.submit("printf 'a\\nb'", wait=5)
+    assert job.status == "exited"
+    assert job.read(0)[0] == "a\nb"
+    raw = job.log_path.read_bytes()
+    assert raw.startswith(b"Script started on") and b"Script done on" in raw
 
 
 @pytest.mark.asyncio
@@ -85,22 +119,87 @@ async def test_wait_returns_incremental_output_from_cursor():
     job = await tool.wait(job.id, wait=5)
     second, cursor2 = job.read(cursor)
     assert second == "second\n"
-    assert cursor2 == cursor + len(b"second\n")
+    assert cursor2 == job.log_size()
     # cursor 越界按日志末尾处理
     assert job.read(10_000) == ("", cursor2)
 
 
 @pytest.mark.asyncio
-async def test_submit_while_running_raises_session_busy():
+async def test_exit_code_comes_from_pane_dead_status():
     tool = BashTool()
-    running = await tool.submit("sleep 2", wait=0)
-    with pytest.raises(SessionBusy) as exc:
-        await tool.submit("echo x", wait=0)
-    assert exc.value.job is running
-    await tool.kill(running.id, "KILL")
-    await tool.wait(running.id, 5)
-    ok = await tool.submit("echo x", wait=5)
-    assert ok.read(0)[0] == "x\n"
+    job = await tool.submit("echo x; exit 7", wait=5)
+    assert job.status == "exited" and job.exit_code == 7
+    assert job.read(0)[0] == "x\n"
+
+
+@pytest.mark.asyncio
+async def test_multiple_jobs_run_in_parallel():
+    """tmux 化：同容器多 job 并行，不再 409。"""
+    tool = BashTool()
+    a = await tool.submit("sleep 0.5; echo A", wait=0)
+    b = await tool.submit("echo B", wait=5)
+    assert a.status == "running" and b.status == "exited"
+    assert b.read(0)[0] == "B\n"
+    a = await tool.wait(a.id, wait=5)
+    assert a.status == "exited" and a.read(0)[0] == "A\n"
+
+
+@pytest.mark.asyncio
+async def test_job_runs_in_tmux_window_named_by_job_id():
+    tool = BashTool()
+    job = await tool.submit("sleep 5", wait=0.2, session="conv-1")
+    assert job.session == "conv-1"
+    windows = _tmux("list-windows", "-t", "=conv-1", "-F", "#{window_name}").split()
+    assert job.id in windows
+    await tool.kill(job.id, "KILL")
+    await tool.wait(job.id, 5)
+    # 结束后窗口销毁，日志保留
+    windows = _tmux("list-windows", "-t", "=conv-1", "-F", "#{window_name}").split()
+    assert job.id not in windows
+    assert os.path.exists(job.log_path)
+
+
+@pytest.mark.asyncio
+async def test_interactive_input_via_tmux_send_keys():
+    """交互式：命令等 stdin 时用 tmux send-keys 喂输入。"""
+    tool = BashTool()
+    job = await tool.submit("read -r name; echo hello:$name", wait=0.3, session="conv-2")
+    assert job.status == "running"
+    _tmux("send-keys", "-t", f"=conv-2:{job.id}", "world", "Enter")
+    job = await tool.wait(job.id, wait=5)
+    assert job.status == "exited" and job.exit_code == 0
+    assert job.read(0)[0].endswith("hello:world\n")
+
+
+@pytest.mark.asyncio
+async def test_window_closed_externally_settles_as_killed():
+    tool = BashTool()
+    job = await tool.submit("sleep 30", wait=0.2, session="conv-3")
+    _tmux("kill-window", "-t", f"=conv-3:{job.id}")
+    job = await tool.wait(job.id, wait=5)
+    assert job.status == "killed"
+    assert job.kill_reason == "window_closed"
+
+
+@pytest.mark.asyncio
+async def test_sessions_are_isolated(tmp_path):
+    """按会话命名的 tmux session：cwd / env / 窗口互不可见。"""
+    tool = BashTool()
+    work = tmp_path / "w"
+    work.mkdir()
+    await tool.submit(f"cd {work} && export FOO=1", wait=5, session="s-a")
+    a = await tool.submit("pwd; echo FOO=${FOO-unset}", wait=5, session="s-a")
+    b = await tool.submit("pwd; echo FOO=${FOO-unset}", wait=5, session="s-b")
+    assert a.read(0)[0] == f"{work.resolve()}\nFOO=1\n"
+    assert b.read(0)[0].endswith("FOO=unset\n") and str(work) not in b.read(0)[0]
+    # 各自的窗口只在各自的 tmux session 里（会话随最后一个窗口结束而消失，故用在跑的 job 看）
+    ra = await tool.submit("sleep 30", wait=0.2, session="s-a")
+    rb = await tool.submit("sleep 30", wait=0.2, session="s-b")
+    assert _tmux("list-windows", "-t", "=s-a", "-F", "#{window_name}").split() == [ra.id]
+    assert _tmux("list-windows", "-t", "=s-b", "-F", "#{window_name}").split() == [rb.id]
+    for j in (ra, rb):
+        await tool.kill(j.id, "KILL")
+        await tool.wait(j.id, 5)
 
 
 @pytest.mark.asyncio
@@ -117,6 +216,14 @@ async def test_cwd_and_exported_env_persist_across_jobs(tmp_path):
     await tool.submit("unset FOO", wait=5)
     job = await tool.submit("echo FOO=${FOO-unset}", wait=5)
     assert job.read(0)[0] == "FOO=unset\n"
+
+
+@pytest.mark.asyncio
+async def test_env_values_with_newlines_survive():
+    tool = BashTool()
+    await tool.submit("export MULTI=$'l1\\nl2'", wait=5)
+    job = await tool.submit('printf "%s" "$MULTI" | wc -l', wait=5)
+    assert job.read(0)[0].strip() == "1"
 
 
 @pytest.mark.asyncio
@@ -145,7 +252,7 @@ async def test_deleted_cwd_falls_back_with_note(tmp_path):
 async def test_kill_int_marks_killed_and_session_continues():
     """验收 3：kill 后 wait 立即返回 killed；会话仍可继续执行。"""
     tool = BashTool()
-    job = await tool.submit("sleep 30", wait=0.1)
+    job = await tool.submit("sleep 30", wait=0.3)
     job = await tool.kill(job.id, "INT")
     job = await tool.wait(job.id, wait=5)
     assert job.status == "killed"
@@ -165,7 +272,7 @@ async def test_kill_int_marks_killed_and_session_continues():
 @pytest.mark.asyncio
 async def test_kill_KILL_on_int_ignoring_process():
     tool = BashTool()
-    job = await tool.submit("trap '' INT; sleep 30", wait=0.1)
+    job = await tool.submit("trap '' INT; sleep 30", wait=0.3)
     await tool.kill(job.id, "INT")
     job = await tool.wait(job.id, wait=0.3)
     assert job.status == "running"
@@ -229,37 +336,42 @@ async def test_timeout_kills_children_in_group():
     tool = BashTool()
     job = await tool.submit("sh -c 'sleep 30' & wait", wait=5, timeout=0.3)
     assert job.status == "killed"
+    pgid = job.pid
     # 后台子进程默认忽略 SIGINT，包装 bash 先退；宽限后整个进程组被 SIGKILL 扫尾
     await asyncio.sleep(0.9)
     with pytest.raises(ProcessLookupError):
-        os.killpg(job.process.pid, 0)
+        os.killpg(pgid, 0)
 
 
 @pytest.mark.asyncio
 async def test_kill_int_sweeps_surviving_children():
     tool = BashTool()
-    job = await tool.submit("sh -c 'sleep 30' & wait", wait=0.1)
+    job = await tool.submit("sh -c 'sleep 30' & wait", wait=0.3)
     await tool.kill(job.id, "INT")
     job = await tool.wait(job.id, wait=5)
     assert job.status == "killed"
+    pgid = job.pid
     await asyncio.sleep(0.9)
     with pytest.raises(ProcessLookupError):
-        os.killpg(job.process.pid, 0)
+        os.killpg(pgid, 0)
 
 
 @pytest.mark.asyncio
-async def test_normal_exit_leaves_background_children_alone():
+async def test_normal_exit_leaves_nohup_background_children_alone():
+    """正常退出不扫尾：nohup 的后台进程（如 dev server）活过 job 结束。
+    （没有 nohup 的后台进程会随终端关闭收到 SIGHUP——这是 PTY 的正常语义，模型侧
+    长驻进程应开 tmux 窗口或 nohup。）"""
     tool = BashTool()
-    job = await tool.submit("sh -c 'sleep 2' & echo started", wait=5)
+    job = await tool.submit("nohup sh -c 'sleep 2' >/dev/null 2>&1 & echo started", wait=5)
     assert job.status == "exited"
+    pgid = job.pid
     await asyncio.sleep(0.9)
-    os.killpg(job.process.pid, 0)  # 组仍存活：后台进程（如 dev server）不被扫尾
-    os.killpg(job.process.pid, 9)
+    os.killpg(pgid, 0)  # 组仍存活
+    os.killpg(pgid, 9)
 
 
 @pytest.mark.asyncio
 async def test_wait_is_clamped_to_max_wait(monkeypatch):
-    from app.tools import bash as bash_mod
     monkeypatch.setattr(bash_mod, "MAX_WAIT", 0.2)
     tool = BashTool()
     t0 = time.monotonic()
@@ -275,10 +387,10 @@ async def test_large_output_is_head_tail_truncated_but_log_is_full():
     n = HEAD_BYTES + TAIL_BYTES + 1000
     job = await tool.submit(f"head -c {n} /dev/zero | tr '\\0' x", wait=10)
     output, cursor = job.read(0)
-    assert cursor == n
+    assert cursor == job.log_size()
     assert "已省略" in output
     assert len(output.encode()) < n
-    assert os.path.getsize(job.log_path) == n
+    assert os.path.getsize(job.log_path) > n
 
 
 @pytest.mark.asyncio
@@ -290,11 +402,32 @@ async def test_background_process_does_not_block_job():
 
 
 @pytest.mark.asyncio
+async def test_reaper_evicts_oldest_live_windows_but_protects_recent(monkeypatch):
+    """活跃窗口达上限：淘汰最旧的，最近 PROTECT_RECENT 个不动（codex 64/8 的缩小版）。"""
+    monkeypatch.setattr(bash_mod, "MAX_LIVE_WINDOWS", 3)
+    monkeypatch.setattr(bash_mod, "PROTECT_RECENT", 1)
+    tool = BashTool()
+    old = await tool.submit("sleep 30", wait=0.2)
+    await asyncio.sleep(1.1)  # window_activity 秒级，拉开先后
+    mid = await tool.submit("sleep 30", wait=0.2)
+    await asyncio.sleep(1.1)
+    newest = await tool.submit("sleep 30", wait=0.2)
+    fourth = await tool.submit("echo four", wait=5)
+    assert fourth.status == "exited"
+    old = await tool.wait(old.id, wait=5)
+    assert old.status == "killed" and old.kill_reason == "evicted"
+    assert not mid.finished and not newest.finished
+    for j in (mid, newest):
+        await tool.kill(j.id, "KILL")
+        await tool.wait(j.id, 5)
+
+
+@pytest.mark.asyncio
 async def test_restart_kills_running_job_and_resets_state(tmp_path):
     tool = BashTool()
-    initial = tool.session.cwd
+    initial = tool.session.state().cwd
     await tool.submit(f"cd {tmp_path} && export FOO=1", wait=5)
-    running = await tool.submit("sleep 30", wait=0.1)
+    running = await tool.submit("sleep 30", wait=0.3)
     result = await tool.restart()
     assert "重启" in (result.system or "")
     assert running.status == "killed"
@@ -304,8 +437,17 @@ async def test_restart_kills_running_job_and_resets_state(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_restart_only_touches_its_own_session(tmp_path):
+    tool = BashTool()
+    other = await tool.submit("sleep 30", wait=0.3, session="keep")
+    await tool.restart(session="gone")
+    assert not other.finished
+    await tool.kill(other.id, "KILL")
+    await tool.wait(other.id, 5)
+
+
+@pytest.mark.asyncio
 async def test_job_records_pruned_but_logs_kept(monkeypatch):
-    from app.tools import bash as bash_mod
     monkeypatch.setattr(bash_mod, "MAX_JOB_RECORDS", 3)
     tool = BashTool()
     jobs = [await tool.submit(f"echo {i}", wait=5) for i in range(5)]
@@ -315,13 +457,14 @@ async def test_job_records_pruned_but_logs_kept(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_session_env_skips_shell_managed_vars(tmp_path):
+async def test_session_env_skips_shell_and_tmux_managed_vars(tmp_path):
     session = JobSession(cwd=str(tmp_path), env={"PATH": os.environ["PATH"]})
     job = await session.start_job("export FOO=bar")
     await session.wait(job, 5)
-    assert session.env["FOO"] == "bar"
-    assert session.env["PATH"] == os.environ["PATH"]
-    assert not {"PWD", "OLDPWD", "SHLVL", "_"} & set(session.env)
+    env = session.state().env
+    assert env["FOO"] == "bar"
+    assert env["PATH"] == os.environ["PATH"]
+    assert not {"PWD", "OLDPWD", "SHLVL", "_", "TMUX", "TMUX_PANE"} & set(env)
 
 
 # ── 旧契约：execute / execute_stream ──────────────────────────────────────────
@@ -329,10 +472,10 @@ async def test_session_env_skips_shell_managed_vars(tmp_path):
 @pytest.mark.asyncio
 async def test_legacy_execute_blocks_until_done_and_merges_stderr():
     tool = BashTool()
-    result = await tool.execute("echo out; echo err >&2; exit 3")
+    job, result = await tool.execute_job("echo out; echo err >&2; exit 3")
     assert result.output == "out\nerr\n"
     assert result.error == ""
-    assert tool.session.current.exit_code == 3
+    assert job.exit_code == 3
 
 
 @pytest.mark.asyncio
@@ -348,7 +491,6 @@ async def test_legacy_execute_timeout_returns_notice_not_exception():
 
 @pytest.mark.asyncio
 async def test_legacy_execute_caps_timeout_at_max(monkeypatch):
-    from app.tools import bash as bash_mod
     monkeypatch.setattr(bash_mod, "MAX_TIMEOUT", 0.3)
     tool = BashTool()
     result = await tool.execute("sleep 30", timeout=9999)
@@ -356,13 +498,14 @@ async def test_legacy_execute_caps_timeout_at_max(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_legacy_execute_queues_behind_running_job():
-    """旧调用方并发提交：排队等前一个 job 结束，而不是报错。"""
+async def test_legacy_execute_runs_alongside_running_job():
+    """旧调用方并发提交：与在跑的 job 并行，不排队也不报错。"""
     tool = BashTool()
-    running = await tool.submit("sleep 0.4; echo first", wait=0)
+    running = await tool.submit("sleep 0.6; echo first", wait=0)
     result = await tool.execute("echo second")
-    assert running.status == "exited"
+    assert running.status == "running"
     assert result.output == "second\n"
+    await tool.wait(running.id, 5)
 
 
 @pytest.mark.asyncio
