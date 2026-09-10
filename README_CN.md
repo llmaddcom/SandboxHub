@@ -343,6 +343,16 @@ SandboxHub **没有**运行时覆盖这些源的配置旋钮。客户内网有�
 是默认 `bridge` 网络的宿主网关写法，自建网络/异机 MinIO 须相应调整，且必须与
 createrole 侧指向同一 MinIO 实例。
 
+**5. 告诉数字人「没有网」。** SandboxHub 没有运行期网络策略：`code` 镜像直连网络，
+容器里也没有任何东西告诉模型能不能出网。断网后模型只看到裸的 DNS/超时报错，会换着
+写法反复重试 `pip install` / `curl`。把 createrole `config/system.yaml` 的
+`sandbox.network_enabled` 设为 `false`：system 提示会多一行「沙盒无外网」，终端结果
+带联网失败特征时附「必然失败、勿重试、用预装」指引，数字人可按需读预装清单。
+`code` 镜像自带这份清单 `/etc/sandbox/MANIFEST.md`（构建期实测生成：`pip list`、
+`npm ls -g`、哪些命令行工具有/没有、Python/Node 版本）——createrole 侧手写摘要
+`me/SANDBOX.md` 指向它，两者不一致时以 MANIFEST 为准。交付前另把各角色云盘里的
+`web-composite-search` 技能删掉（它在沙盒内直连公网搜索引擎）。
+
 ---
 
 ## 项目结构
