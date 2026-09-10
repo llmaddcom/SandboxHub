@@ -132,6 +132,33 @@ COPY ubuntu/app/ /app/computer_use_demo/
 COPY code/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && mkdir -p /workspace
 
+# ===== 8. 预装清单 /etc/sandbox/MANIFEST.md（构建期实测生成，供 agent 按需 read）=====
+# agent 对「预装了什么」只能靠文档转述（createrole 的 me/SANDBOX.md 是手写摘要），摘要与
+# 实物漂移时以本文件为准。内网断网交付（createrole `sandbox.network_enabled=false`）下 agent
+# 装不了包，先读它选替代方案。生成失败即构建失败，防「有文件但内容空」。
+RUN mkdir -p /etc/sandbox && { \
+      echo "# 沙盒预装清单（构建期自动生成，镜像 sandbox-code $(tr -d '[:space:]' < /app/computer_use_demo/VERSION)）"; \
+      echo; echo "本文件随镜像生成，运行时不会变；pip/npm 现装的包不在此列（\`pip list\` 看实时）。"; \
+      echo; echo "## 基础环境"; echo; \
+      echo "- 系统：$(. /etc/os-release && echo "$PRETTY_NAME")，root，时区 $TZ，locale $LANG"; \
+      echo "- Python：$(python --version 2>&1)，pip $(pip --version | awk '{print $2}')，源 $(pip config get global.index-url)"; \
+      echo "- Node：$(node --version)，npm $(npm --version)，yarn $(yarn --version)，pnpm $(pnpm --version)，源 $NPM_CONFIG_REGISTRY"; \
+      echo "- playwright 浏览器：$(ls /opt/ms-playwright | tr '\n' ' ')（headless chromium，\`playwright screenshot\` 可直接用）"; \
+      echo "- 中文字体：$(fc-list :lang=zh family | sort -u | tr '\n' ';' )"; \
+      echo; echo "## 命令行工具"; echo; \
+      for c in git curl wget rg jq tree less vim nano zip unzip xz tmux rclone gcc make pkg-config todo memory skills; do \
+        if command -v "$c" >/dev/null 2>&1; then echo "- $c：已装"; else echo "- $c：未装"; fi; done; \
+      echo; echo "常见但**没有预装**的工具（断网时不可用，联网时可 apt-get 安装）："; \
+      for c in ffmpeg libreoffice soffice pandoc pdftotext tesseract convert; do \
+        command -v "$c" >/dev/null 2>&1 && echo "- $c：已装" || echo "- $c：未装"; done; \
+      echo; echo "## Python 包（pip list）"; echo; echo '```'; pip list --format=freeze; echo '```'; \
+      echo; echo "## Node 全局包（npm ls -g）"; echo; echo '```'; npm ls -g --depth=0 2>/dev/null; echo '```'; \
+    } > /etc/sandbox/MANIFEST.md && \
+    test "$(wc -l < /etc/sandbox/MANIFEST.md)" -gt 40 && \
+    grep -q "^pandas==" /etc/sandbox/MANIFEST.md && \
+    grep -q "^- todo：已装" /etc/sandbox/MANIFEST.md && \
+    echo "MANIFEST.md: $(wc -l < /etc/sandbox/MANIFEST.md) 行"
+
 WORKDIR /app
 EXPOSE 8000
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/entrypoint.sh"]

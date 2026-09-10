@@ -384,6 +384,20 @@ shared intranet, set `SANDBOX_HUB_API_KEY` (the createrole client sends the matc
 for custom networks or a remote MinIO, and make sure it points at the **same MinIO
 instance** createrole uses.
 
+**5. Tell the agent it is offline.** SandboxHub has no runtime network policy — the
+`code` image talks to the network directly, and nothing in the container tells the model
+whether egress works. Offline, the model only sees raw DNS/timeout errors and keeps
+retrying `pip install` / `curl` in different spellings. Set `sandbox.network_enabled: false`
+in createrole's `config/system.yaml`: the system prompt then carries a one-line "sandbox
+has no internet" notice, terminal results whose output looks like a network failure get a
+"will always fail, do not retry, use what is preinstalled" hint, and the agent can read
+the preinstalled inventory on demand. The `code` image ships that inventory as
+`/etc/sandbox/MANIFEST.md`, generated at build time (`pip list`, `npm ls -g`, which CLI
+tools exist / are missing, Python/Node versions) — the hand-written summary in
+createrole's `me/SANDBOX.md` points to it; when the two disagree, the manifest is right.
+Also remove the `web-composite-search` skill from role workspaces before hand-over (it
+hits public search engines from inside the sandbox).
+
 ---
 
 ## Project Structure
