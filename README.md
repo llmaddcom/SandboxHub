@@ -80,7 +80,7 @@ docker build -f images/code/Dockerfile -t sandbox-code:latest images
 > - noVNC, websockify (GitHub)
 > - pyenv (GitHub)
 
-> **Code image toolchain:** Python 3.11 + Node 20 (yarn/pnpm), `git`/`ripgrep`/`jq`/`vim`, build-essential, and daily Python libs (pandas, openpyxl, python-docx/pptx, reportlab, pypdf, matplotlib, markitdown…). Agents can introspect it at runtime via `GET /api/system/env`.
+> **Code image toolchain:** Python 3.11 + Node 20 (yarn/pnpm), `git`/`ripgrep`/`jq`/`vim`, build-essential, daily Python libs (pandas, openpyxl, python-docx/pptx, reportlab, pypdf, pymupdf, matplotlib, markitdown with docx/xlsx/pdf extras…), legacy Office readers (olefile, xlrd, msoffcrypto-tool, `antiword`, `catdoc`), `file`/`xxd` and `poppler-utils`. Agents can introspect it at runtime via `GET /api/system/env` or read `/etc/sandbox/MANIFEST.md` (includes a file-format → tool table).
 
 #### Building with a proxy
 

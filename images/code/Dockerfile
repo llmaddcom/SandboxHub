@@ -47,6 +47,9 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
 #   （多套并装：Noto 覆盖全、WenQuanYi 黑体/微米黑兜底，见下方 matplotlib 默认字体配置）
 # - locales/tzdata：zh_CN.UTF-8 locale 与 Asia/Shanghai 时区（国内业务时间/日期正确）
 # - tmux/bsdutils(script)：终端 job 在 tmux 窗口里经 script 跑（PTY、可交互、可 attach），见 app/tools/bash.py
+# - file/xxd：探测附件真实类型（B 端失败日志：`file` 缺失是最高频的 127）
+# - antiword/catdoc(含 xls2csv/catppt)：.doc/.xls/.ppt 提文字，旧版 Office 与 WPS 的兜底
+# - poppler-utils：pdftotext/pdfinfo/pdfimages/pdftoppm，agent 反复 which 找它
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget gnupg \
         git openssh-client \
@@ -54,6 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential pkg-config xz-utils \
         ripgrep jq less tree vim nano zip unzip procps \
         tmux bsdutils \
+        file xxd antiword catdoc poppler-utils \
         rclone fuse3 \
         locales tzdata \
         fonts-noto-cjk fonts-wqy-zenhei fonts-wqy-microhei && \
@@ -114,6 +118,12 @@ RUN mkdir -p /root/.config/matplotlib && \
     python -c "from matplotlib import font_manager as fm; \
 print('CJK font:', fm.findfont(fm.FontProperties(family=['Noto Sans CJK SC', 'WenQuanYi Zen Hei']), fallback_to_default=False))"
 
+# ===== 5c. 办公文件工具链验证（B 端 call-tool 失败史：.doc/.xls/.wps 缺 olefile/xlrd/antiword，file 缺失）=====
+# 真实生成 docx/xlsx/pdf 各转换一遍（markitdown extra、pymupdf、pdftotext），并逐个确认系统命令在——
+# 装了但不可用的镜像直接构建失败，防「声称预装、实际缺依赖」的漂移。
+COPY code/verify-office.py /tmp/verify-office.py
+RUN python /tmp/verify-office.py && rm -f /tmp/verify-office.py
+
 # ===== 6. 预装单文件 CLI（issue #15/#16/#24：skills / todo / memory）=====
 # code/bin/ 下的脚本装进 /usr/local/bin（去 .py 扩展名，须自带 shebang）。
 # CLI 本体由上游仓维护（createrole 仓 server/infrastructure/sandbox_cli/），落地后
@@ -132,6 +142,11 @@ COPY ubuntu/app/ /app/computer_use_demo/
 COPY code/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && mkdir -p /workspace
 
+# ===== 7a. 断网现场 pip 快速失败 =====
+# B 端断网（createrole `sandbox.network_enabled=false`）时 pip install 卡到超时才报错（日志里一次 60s+），
+# agent 白等一轮。收紧超时/重试，十几秒内失败，agent 立刻改用预装库。构建期安装已全部完成，不受影响。
+RUN python -m pip config set global.timeout 15 && python -m pip config set global.retries 1
+
 # ===== 8. 预装清单 /etc/sandbox/MANIFEST.md（构建期实测生成，供 agent 按需 read）=====
 # agent 对「预装了什么」只能靠文档转述（createrole 的 me/SANDBOX.md 是手写摘要），摘要与
 # 实物漂移时以本文件为准。内网断网交付（createrole `sandbox.network_enabled=false`）下 agent
@@ -146,17 +161,34 @@ RUN mkdir -p /etc/sandbox && { \
       echo "- playwright 浏览器：$(ls /opt/ms-playwright | tr '\n' ' ')（headless chromium，\`playwright screenshot\` 可直接用）"; \
       echo "- 中文字体：$(fc-list :lang=zh family | sort -u | tr '\n' ';' )"; \
       echo; echo "## 命令行工具"; echo; \
-      for c in git curl wget rg jq tree less vim nano zip unzip xz tmux rclone gcc make pkg-config todo memory skills; do \
+      for c in git curl wget rg jq tree less vim nano zip unzip xz tmux rclone gcc make pkg-config todo memory skills \
+               file xxd antiword catdoc xls2csv catppt pdftotext pdfinfo pdftoppm pdfimages; do \
         if command -v "$c" >/dev/null 2>&1; then echo "- $c：已装"; else echo "- $c：未装"; fi; done; \
       echo; echo "常见但**没有预装**的工具（断网时不可用，联网时可 apt-get 安装）："; \
-      for c in ffmpeg libreoffice soffice pandoc pdftotext tesseract convert; do \
+      for c in ffmpeg ffprobe libreoffice soffice pandoc tesseract convert; do \
         command -v "$c" >/dev/null 2>&1 && echo "- $c：已装" || echo "- $c：未装"; done; \
+      echo; echo "## 文件格式 → 用什么读（断网时别 pip/apt，直接用下面的）"; echo; \
+      echo "| 格式 | 首选 | 备选 |"; echo "|---|---|---|"; \
+      echo "| 先看类型 | \`file <路径>\` | \`xxd <路径> \| head\`（\`D0 CF 11 E0\` 开头 = 旧版 Office/WPS 的 OLE 容器，\`PK\` 开头 = docx/xlsx/pptx/ofd 的 zip 容器）|"; \
+      echo "| .docx | python-docx | \`markitdown x.docx\`（转 Markdown） |"; \
+      echo "| .doc（旧版 Word / 多数 .wps） | \`antiword x.doc\` 或 \`catdoc x.doc\` | olefile 读 WordDocument 流 |"; \
+      echo "| .xlsx | openpyxl / pandas | \`markitdown x.xlsx\` |"; \
+      echo "| .xls（旧版 Excel / 多数 .et） | xlrd 或 \`pandas.read_excel(engine='xlrd')\` | \`xls2csv x.xls\` |"; \
+      echo "| .pptx / .ppt | python-pptx / \`catppt x.ppt\` | \`markitdown x.pptx\` |"; \
+      echo "| .pdf | pymupdf（\`import fitz\`）| pdfplumber、pypdf、\`pdftotext -layout x.pdf -\`；扫描件 \`pdftoppm\` 出图再看 |"; \
+      echo "| .ofd（政务公文） | zipfile 解开 + lxml 读 Doc_0/Pages/*/Content.xml | — |"; \
+      echo "| 带密码的 Office | msoffcrypto-tool 解密到临时文件再按上面读 | pypdf 直接 \`decrypt()\`（PDF）|"; \
+      echo "| .msg（Outlook） | \`markitdown x.msg\`（olefile） | — |"; \
+      echo "| 没在表里的 | 先 \`file\` 看真实类型，很多附件只是改了扩展名 | — |"; \
       echo; echo "## Python 包（pip list）"; echo; echo '```'; pip list --format=freeze; echo '```'; \
       echo; echo "## Node 全局包（npm ls -g）"; echo; echo '```'; npm ls -g --depth=0 2>/dev/null; echo '```'; \
     } > /etc/sandbox/MANIFEST.md && \
     test "$(wc -l < /etc/sandbox/MANIFEST.md)" -gt 40 && \
     grep -q "^pandas==" /etc/sandbox/MANIFEST.md && \
     grep -q "^- todo：已装" /etc/sandbox/MANIFEST.md && \
+    grep -q "^- antiword：已装" /etc/sandbox/MANIFEST.md && \
+    grep -q "^olefile==" /etc/sandbox/MANIFEST.md && \
+    grep -q "^| .doc" /etc/sandbox/MANIFEST.md && \
     echo "MANIFEST.md: $(wc -l < /etc/sandbox/MANIFEST.md) 行"
 
 WORKDIR /app
