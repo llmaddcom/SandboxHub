@@ -11,6 +11,8 @@ from typing import Literal, Optional
 
 SandboxType = Literal["ubuntu", "code"]
 SandboxStatus = Literal["ready", "released"]
+# 网络策略二值（createrole#449 / SandboxHub#42）：allow=联网态网络，deny=隔离网。
+NetworkMode = Literal["allow", "deny"]
 
 
 @dataclass
@@ -39,6 +41,9 @@ class ContainerInfo:
     # 注入的 env 无法从运行中容器清除，故该容器同样不入 warm pool、释放即销毁，
     # 防止凭据泄漏给下一个租户。
     env_injected: bool = False
+    # 容器当前所在 Docker 网络名（联网态 SANDBOX_NETWORK / 隔离网 SANDBOX_NETWORK_ISOLATED）。
+    # 空 = 未知（旧记录 / 测试构造），switch_network 会按实际状态处理。
+    network: str = ""
 
 
 @dataclass
@@ -70,3 +75,4 @@ class ManagedContainer:
     created_at: Optional[datetime]  # Docker Created 时间；解析失败为 None（视为刚创建）
     container_ip: str = ""  # 仅 running 且拿得到 IP 时非空
     env_injected: bool = False  # 注入过租户 env 的容器：启动恢复不收养回池，直接销毁
+    network: str = ""  # 容器实际所在 Docker 网络名（running 时），供 registry 网络对齐

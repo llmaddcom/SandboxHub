@@ -5,7 +5,8 @@
 # /api/system/health 上报，SandboxHub reconciler 据此对账部署漂移）。
 # 改动 images/ 下代码时请同步 bump 该文件，并在合并后执行本脚本重建镜像。
 #
-# 用法：scripts/build-images.sh [code|ubuntu|all]（默认 all）
+# 用法：scripts/build-images.sh [code|ubuntu|gateway|all]（默认 all）
+# gateway = cr-host 网关镜像（alpine + socat，网络策略平台通道，SandboxHub#42）
 #
 # 代理：ubuntu 镜像需从境外拉 Chrome/noVNC/pyenv 等（见 README「使用代理构建」）。
 # 设置 BUILD_PROXY 后自动以 --network host + 代理 build-arg 构建，例：
@@ -47,7 +48,13 @@ if [ "$TARGET" = "ubuntu" ] || [ "$TARGET" = "all" ]; then
         -t "sandbox-ubuntu:$VERSION" -t sandbox-ubuntu:latest "$ROOT/images/ubuntu"
 fi
 
+if [ "$TARGET" = "gateway" ] || [ "$TARGET" = "all" ]; then
+    docker build "${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"}" -f "$ROOT/images/gateway/Dockerfile" \
+        -t "sandbox-gateway:$VERSION" -t sandbox-gateway:latest "$ROOT/images/gateway"
+fi
+
 echo "==> 完成。在跑的旧镜像容器不会自动替换："
 echo "    - warm 容器：重启 SandboxHub 或等 reconciler 闲置回收后由 warm pool 以新镜像重建"
 echo "    - 挂载容器：release 后下一次 acquire 自动用新镜像"
 echo "    - reconciler 会对版本漂移的存量容器持续告警（日志关键字：镜像版本漂移）"
+echo "    - 网关容器 cr-host：SandboxHub 启动 / 每轮对账发现镜像或转发表变化会自动重建"

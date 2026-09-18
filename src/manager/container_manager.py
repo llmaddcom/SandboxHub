@@ -19,13 +19,17 @@ import httpx
 from loguru import logger
 
 from src.config import settings
-from src.models import ContainerInfo, ManagedContainer, SandboxType, WorkspaceMount
+from src.models import ContainerInfo, ManagedContainer, NetworkMode, SandboxType, WorkspaceMount
 
 # 挂载容器标签：用于启动恢复时识别并清理孤儿挂载容器（其 registry 映射在重启后已丢失）。
 _MOUNTED_LABEL = "sandboxhub.mounted"
 # env 注入容器标签：注入过调用方环境变量（可能含租户凭据）的容器，同挂载容器一样
 # 专属化——不入 warm pool、启动恢复不收养、release 即销毁（env 无法从运行中容器清除）。
 _ENV_LABEL = "sandboxhub.env-injected"
+# 网关容器标签：cr-host 不带 CONTAINER_LABEL（不是沙盒、不参与对账），单独标识。
+_GATEWAY_LABEL = "sandboxhub.gateway"
+# 容器内网络策略标记文件：环境变量不能热改，切网后写文件供镜像脚本 / MANIFEST 感知。
+_POLICY_MARKER = "/etc/sandbox/network-policy"
 
 
 def _parse_docker_time(raw: str) -> Optional[datetime]:
@@ -59,9 +63,9 @@ class ContainerManager:
 
     # ── 内部辅助 ─────────────────────────────────────────────────────────────
 
-    def _get_container_ip(self, container) -> str:
+    def _get_container_ip(self, container, prefer: Optional[str] = None) -> str:
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-        ip = networks.get(settings.SANDBOX_NETWORK, {}).get("IPAddress", "")
+        ip = networks.get(prefer or settings.SANDBOX_NETWORK, {}).get("IPAddress", "")
         if ip:
             return ip
         for net_info in networks.values():
@@ -69,6 +73,15 @@ class ContainerManager:
             if ip:
                 return ip
         raise RuntimeError(f"无法获取容器 IP | container={container.name}")
+
+    @staticmethod
+    def _container_network(container) -> str:
+        """容器实际所在网络名：优先两张受管网络，其次任一已接入网络；未接入返回空。"""
+        networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        for name in (settings.SANDBOX_NETWORK, settings.SANDBOX_NETWORK_ISOLATED):
+            if name in networks:
+                return name
+        return next(iter(networks), "")
 
     def _build_warm_name(self, sandbox_type: str, slot: int) -> str:
         return f"cr-sb-warm-{sandbox_type}-{slot}-{uuid.uuid4().hex[:6]}"
@@ -122,10 +135,14 @@ class ContainerManager:
         name: str,
         workspace: Optional[WorkspaceMount] = None,
         extra_env: Optional[dict[str, str]] = None,
+        network: Optional[str] = None,
     ) -> tuple[str, str]:
         """
         docker run，等待 IP，返回 (container_id, container_ip)。
         同步方法，在 asyncio.to_thread 中调用。
+
+        ``network`` 指定容器落在哪张 Docker 网络（默认联网态 SANDBOX_NETWORK；策略 deny 的
+        冷启动直接落隔离网，省一次切换）。
 
         ``workspace`` 非空时，容器额外获得 FUSE 能力（``SYS_ADMIN`` + ``/dev/fuse``）以便
         容器内 rclone 挂载 MinIO，并打上挂载标签供启动恢复识别。
@@ -147,11 +164,12 @@ class ContainerManager:
         if extra_env:
             labels[_ENV_LABEL] = "true"
 
+        network = network or settings.SANDBOX_NETWORK
         run_kwargs = dict(
             image=image,
             detach=True,
             name=name,
-            network=settings.SANDBOX_NETWORK,
+            network=network,
             shm_size="2g",
             # 让容器用 host.docker.internal 指向宿主，代理 URL 不必写死网段
             extra_hosts={"host.docker.internal": "host-gateway"},
@@ -186,7 +204,7 @@ class ContainerManager:
                 container.remove(force=True)
                 raise RuntimeError(f"容器意外退出 | name={name} | status={container.status}")
             try:
-                ip = self._get_container_ip(container)
+                ip = self._get_container_ip(container, prefer=network)
                 break
             except RuntimeError:
                 time.sleep(0.5)
@@ -236,6 +254,7 @@ class ContainerManager:
                         created_at=_parse_docker_time(c.attrs.get("Created", "")),
                         container_ip=ip,
                         env_injected=c.labels.get(_ENV_LABEL) == "true",
+                        network=self._container_network(c),
                     )
                 )
             except Exception as e:
@@ -250,10 +269,14 @@ class ContainerManager:
         slot: int = 0,
         workspace: Optional[WorkspaceMount] = None,
         extra_env: Optional[dict[str, str]] = None,
+        network: Optional[str] = None,
     ) -> ContainerInfo:
         """
         启动新容器，等待健康检查，返回 ContainerInfo。
         冷启动路径，在 asyncio.to_thread 中执行 Docker 操作。
+
+        ``network`` 非空时容器直接落该网络（策略 deny 的冷启动落隔离网）；落隔离网的容器
+        健康后写入网络策略标记文件。
 
         ``workspace`` 非空时：容器带 FUSE 能力启动，健康后在容器内用 rclone 把
         MinIO ``bucket/prefix`` 挂到 ``mount_path``；挂载失败即销毁容器并抛错。
@@ -267,13 +290,16 @@ class ContainerManager:
             name = self._build_env_name(sandbox_type)
         else:
             name = self._build_warm_name(sandbox_type, slot)
+        network = network or settings.SANDBOX_NETWORK
         container_id, ip = await asyncio.to_thread(
-            self._run_container_sync, sandbox_type, name, workspace, extra_env
+            self._run_container_sync, sandbox_type, name, workspace, extra_env, network
         )
         # 等待 API 就绪
         if not await self.wait_healthy(ip):
             await asyncio.to_thread(self._stop_and_remove_sync, container_id)
             raise RuntimeError(f"容器健康检查超时 | name={name}")
+        if network == settings.SANDBOX_NETWORK_ISOLATED:
+            await asyncio.to_thread(self._write_policy_marker_sync, container_id, "deny")
 
         if mounted:
             try:
@@ -295,7 +321,136 @@ class ContainerManager:
             mounted=mounted,
             mount_path=workspace.mount_path if mounted else "/workspace",
             env_injected=bool(extra_env),
+            network=network,
         )
+
+    # ── 网络策略：受管网络 / 网关容器 / 运行中容器热切网（SandboxHub#42）──────
+
+    def _ensure_network_sync(self, name: str, internal: bool) -> None:
+        try:
+            self._docker.networks.get(name)
+        except docker.errors.NotFound:
+            self._docker.networks.create(
+                name, driver="bridge", internal=internal, labels={_GATEWAY_LABEL: "network"}
+            )
+            logger.info(f"已创建 Docker 网络 | name={name} | internal={internal}")
+
+    async def ensure_networks(self) -> None:
+        """幂等创建联网态网络与隔离网。SANDBOX_NETWORK 是 Docker 内置网络时网络策略不可用，只告警。"""
+        if not settings.network_policy_supported:
+            logger.warning(
+                f"SANDBOX_NETWORK={settings.SANDBOX_NETWORK!r} 是 Docker 内置网络，无内嵌 DNS，"
+                "网络策略不可用：acquire 请求 deny 将被拒绝。改配用户自定义网络（默认 cr-sb-net）即可启用"
+            )
+            return
+        await asyncio.to_thread(self._ensure_network_sync, settings.SANDBOX_NETWORK, False)
+        await asyncio.to_thread(self._ensure_network_sync, settings.SANDBOX_NETWORK_ISOLATED, True)
+
+    def _ensure_gateway_sync(self) -> None:
+        """确保网关容器 cr-host 运行且同时接在两张网上；配置（转发表 / 镜像）变了就重建。"""
+        name = settings.SANDBOX_GATEWAY_NAME
+        image = settings.DOCKER_IMAGE_GATEWAY
+        forwards = ",".join(f"{port}={upstream}" for port, upstream in settings.gateway_forwards())
+        container = None
+        try:
+            container = self._docker.containers.get(name)
+            container.reload()
+            env = container.attrs.get("Config", {}).get("Env") or []
+            current_forwards = next((e.split("=", 1)[1] for e in env if e.startswith("FORWARDS=")), None)
+            stale = (
+                container.status != "running"
+                or current_forwards != forwards
+                or container.labels.get(_GATEWAY_LABEL) != "true"
+                or image not in (container.attrs.get("Config", {}).get("Image"), *container.image.tags)
+            )
+            if stale:
+                logger.info(f"网关容器配置已变或未运行，重建 | name={name} | status={container.status}")
+                container.remove(force=True)
+                container = None
+        except docker.errors.NotFound:
+            container = None
+        if container is None:
+            container = self._docker.containers.run(
+                image=image,
+                detach=True,
+                name=name,
+                network=settings.SANDBOX_NETWORK,
+                environment={"FORWARDS": forwards},
+                extra_hosts={"host.docker.internal": "host-gateway"},
+                restart_policy={"Name": "unless-stopped"},
+                labels={_GATEWAY_LABEL: "true"},
+            )
+            logger.info(f"网关容器已启动 | name={name} | forwards={forwards or '(空)'}")
+        container.reload()
+        attached = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        if settings.SANDBOX_NETWORK_ISOLATED not in attached:
+            self._docker.networks.get(settings.SANDBOX_NETWORK_ISOLATED).connect(container)
+
+    async def ensure_gateway(self) -> None:
+        """幂等确保网关容器就绪（启动时与每轮对账调用）。网络策略不可用时不建网关。"""
+        if not settings.network_policy_supported:
+            return
+        await asyncio.to_thread(self._ensure_gateway_sync)
+
+    def _remove_gateway_sync(self) -> None:
+        try:
+            self._docker.containers.get(settings.SANDBOX_GATEWAY_NAME).remove(force=True)
+        except docker.errors.NotFound:
+            pass
+        except Exception as e:
+            logger.warning(f"删除网关容器失败 | err={e}")
+
+    async def remove_gateway(self) -> None:
+        await asyncio.to_thread(self._remove_gateway_sync)
+
+    def _switch_network_sync(self, container_id: str, target: str) -> str:
+        """把运行中容器从当前网络挪到 ``target``，返回新 IP。同步方法，在 to_thread 中调用。
+
+        先断开除 target 外的全部网络再接入 target（容器任一时刻只在一张受管网络上），
+        进程与 tmux 会话不受影响，仅在途 TCP 连接断开。
+        """
+        container = self._docker.containers.get(container_id)
+        container.reload()
+        attached = list(container.attrs.get("NetworkSettings", {}).get("Networks", {}))
+        for name in attached:
+            if name != target:
+                self._docker.networks.get(name).disconnect(container, force=True)
+        if target not in attached:
+            self._docker.networks.get(target).connect(container)
+        container.reload()
+        return self._get_container_ip(container, prefer=target)
+
+    def _write_policy_marker_sync(self, container_id: str, mode: NetworkMode) -> None:
+        """写容器内 /etc/sandbox/network-policy（best-effort，失败只记 warning）。"""
+        try:
+            container = self._docker.containers.get(container_id)
+            container.exec_run(
+                cmd=["/bin/sh", "-c", f"mkdir -p /etc/sandbox && printf '%s\\n' {mode} > {_POLICY_MARKER}"],
+            )
+        except Exception as e:
+            logger.warning(f"写网络策略标记失败 | id={container_id} | err={e}")
+
+    async def switch_network(self, info: ContainerInfo, mode: NetworkMode) -> ContainerInfo:
+        """按策略把容器热切到对应网络，原地更新 ``info`` 的 ip/network 并返回。
+
+        目标网络与在册网络一致时不动 Docker（对账器负责把在册状态与实际对齐）。
+        切网后等待容器 API 在新 IP 上可达；不可达抛 RuntimeError，由调用方销毁重建。
+        """
+        target = settings.network_for_mode(mode)
+        if info.network == target:
+            return info
+        old_ip = info.container_ip
+        new_ip = await asyncio.to_thread(self._switch_network_sync, info.container_id, target)
+        if not await self.wait_healthy(new_ip, timeout=10):
+            raise RuntimeError(f"切网后容器不可达 | name={info.container_name} | ip={new_ip}")
+        await asyncio.to_thread(self._write_policy_marker_sync, info.container_id, mode)
+        info.container_ip = new_ip
+        info.network = target
+        logger.info(
+            f"容器已切网 | name={info.container_name} | mode={mode} | network={target} "
+            f"| ip={old_ip}->{new_ip}"
+        )
+        return info
 
     # ── 工作区挂载（容器内 rclone over MinIO/S3）─────────────────────────────
 

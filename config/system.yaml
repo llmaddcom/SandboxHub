@@ -16,6 +16,8 @@ image:
   ubuntu: "sandbox-ubuntu:latest"
   # code profile：轻量无 GUI，仅终端 / 文件
   code: "sandbox-code:latest"
+  # cr-host 网关：alpine + socat 端口转发，网络策略的平台通道（images/gateway）
+  gateway: "sandbox-gateway:latest"
 
 warm_pool:
   # 预热容器数（0 = 不预热，acquire 时冷启动）。每个 ubuntu 容器 shm 2G + 桌面栈内存占用可观。

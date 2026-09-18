@@ -156,6 +156,40 @@ curl -X POST http://localhost:8088/v1/sandboxes/acquire \
 
 从预热池返回，耗时 <100ms。若相同 `(user_id, role_id)` 已有容器分配，则直接复用。
 
+#### 携带网络策略（SandboxHub#42 / createrole#449）
+
+```bash
+curl -X POST http://localhost:8088/v1/sandboxes/acquire \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "u1", "role_id": "r1", "sandbox_type": "code",
+       "policy": {"network": {"default": "deny"}}}'
+# → {"sandbox_id": "sb_abc123", "status": "ready",
+#    "effective_policy": {"schema_version": 1, "network": {"default": "deny", "allow": [], "deny": []},
+#                         "protected_paths": [], "writable_roots": [], "reasons": []}}
+```
+
+`policy` 是调用方业务侧解析好的沙盒策略（形状对齐 OpenSandbox / E2B），本版只实现
+`network.default`（`allow` | `deny`）：
+
+- **每次 acquire 都落实**：复用 / 出池的容器不在策略对应网络上就**热切网**（运行中容器
+  `docker network disconnect/connect`，亚秒，进程与 tmux 会话不重启，仅在途 TCP 断开）；
+  冷启动直接落目标网络。调用方随每次工具调用带最新值即可，键一改下一次调用就生效。
+- **`effective_policy` 是生效值**：调用方的感知层（离线钩子 / 结果尾注）只吃它，
+  `reasons` 列出未执行项（如本版不执行 `protected_paths` / `writable_roots`，仅回显）。
+- **不支持的项拒绝而非降级**：`network.allow` / `network.deny` 列表非空 → 400
+  `network_policy_lists_unsupported`（留给 egress 代理版）；`deny` 但 `SANDBOX_NETWORK`
+  是 Docker 内置网络 → 400 `network_policy_unsupported`。
+- 缺省（无 `policy`）= `allow`，行为与旧版一致。
+
+批量热应用（调用方业务键变更时调用，让在册运行中沙盒**立即**切网、不等下一次 acquire）：
+
+```bash
+curl -X POST http://localhost:8088/v1/sandboxes/policy/apply \
+  -H "Content-Type: application/json" \
+  -d '{"policy": {"network": {"default": "deny"}}}'          # 可加 "user_id" / "role_id" 过滤
+# → {"effective_policy": {...}, "switched": [{"sandbox_id": "...", "container_ip": "..."}], "failed": []}
+```
+
 #### 携带环境变量注入（issue #15/#16）
 
 ```bash
@@ -280,11 +314,14 @@ Ubuntu 容器对外暴露 40+ REST 接口和 30+ MCP 工具，主要分类：
 | `SANDBOX_HUB_HOST` | `0.0.0.0` | 监听地址；私有化部署建议收紧为 `127.0.0.1` 或内网 IP |
 | `SANDBOX_HUB_PORT` | `8088` | SandboxHub 服务端口 |
 | `CONTAINER_LABEL` | `sandboxhub.managed` | 受管容器标签（同机多实例隔离用） |
-| `SANDBOX_NETWORK` | `bridge` | 容器所在 Docker 网络 |
+| `SANDBOX_NETWORK` | `cr-sb-net` | 联网态容器所在 Docker 网络。须是用户自定义 bridge 网络（Hub 启动时幂等创建）；配成内置 `bridge/host/none` 则网络策略不可用（acquire 请求 deny 被 400 拒绝，联网态行为同旧版） |
+| `SANDBOX_NETWORK_ISOLATED` | `cr-sb-isolated` | 断网态网络（`--internal`，Hub 幂等创建）：策略 `deny` 的沙盒热切到这里，只能到达 `cr-host` |
+| `SANDBOX_GATEWAY_NAME` | `cr-host` | 网关容器名 = 容器内访问 MinIO / createrole API 的固定主机名，两张网都能按名解析 |
+| `SANDBOX_GATEWAY_FORWARDS` | （空）| 网关额外端口转发，逗号分隔 `listen=宿主可达地址:port`（`host.docker.internal` 即宿主）；MinIO 转发按 `MINIO_ENDPOINT` 自动加入。createrole 的 `SANDBOX_MARKET_CLI_API_BASE=http://cr-host:8012` 时这里须转发 `8012` |
 | `SANDBOX_HTTP_PROXY` | （空）| 注入 ubuntu 容器的出网代理；宿主代理须写容器可达地址（`host.docker.internal`） |
 | `SANDBOX_DNS` | （空）| 容器自定义 DNS（逗号分隔，经 `docker --dns` 注入）；非空时同时注入 `SANDBOX_KEEP_DNS=1`，使 ubuntu 镜像 entrypoint 不覆写 `resolv.conf` |
 | `SANDBOX_KEEP_DNS` | `false` | `true`=始终注入 `SANDBOX_KEEP_DNS=1`，容器保留 Docker 注入的 `resolv.conf`（宿主 `daemon.json`/`--dns`）。需重建镜像后生效 |
-| `MINIO_ENDPOINT` | （空）| MinIO `host:port`（不含 scheme），写**容器内可达**地址（默认 bridge 网桥宿主为 `172.17.0.1`）；空=不具备挂载能力 |
+| `MINIO_ENDPOINT` | （空）| MinIO `host:port`（不含 scheme），写**宿主可达**地址（`host.docker.internal:9000` 或宿主网卡 IP）：容器内实际经网关 `cr-host:<port>` 访问；仅 `SANDBOX_NETWORK` 为内置 bridge 时才直连此地址（须容器内可达，如 `172.17.0.1:9000`）；空=不具备挂载能力 |
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | （空）| MinIO 凭据（经环境变量内联传给容器内 rclone，不落盘）；须与 createrole 侧指向同一实例 |
 | `MINIO_SECURE` | `false` | `true`=https 访问 MinIO |
 | `SANDBOX_HUB_API_KEY` | （空）| 可选鉴权：非空时所有请求须带匹配的 `X-API-Key` 头，否则 401；`/v1/health` 豁免。空=不鉴权 |
@@ -339,18 +376,48 @@ SandboxHub **没有**运行时覆盖这些源的配置旋钮。客户内网有�
 `SANDBOX_HUB_API_KEY`（createrole 客户端用同名 env 自动带 `X-API-Key` 头），
 与 createrole 同机部署时可把 `SANDBOX_HUB_HOST` 收紧为 `127.0.0.1`。
 
-**4. MinIO 地址。** `MINIO_ENDPOINT` 必须是「容器内可达」的地址：`172.17.0.1:9000`
-是默认 `bridge` 网络的宿主网关写法，自建网络/异机 MinIO 须相应调整，且必须与
-createrole 侧指向同一 MinIO 实例。
+**4. MinIO 地址。** `MINIO_ENDPOINT` 写「宿主可达」地址（`host.docker.internal:9000`
+或宿主网卡 IP），容器内经网关 `cr-host:9000` 访问；只有把 `SANDBOX_NETWORK` 配回内置
+`bridge` 时才需写容器内可达地址（`172.17.0.1:9000`）。必须与 createrole 侧指向同一 MinIO 实例。
 
-**5. 告诉数字人「没有网」。** SandboxHub 没有运行期网络策略：`code` 镜像直连网络，
-容器里也没有任何东西告诉模型能不能出网。断网后模型只看到裸的 DNS/超时报错，会换着
-写法反复重试 `pip install` / `curl`。把 createrole `config/system.yaml` 的
-`sandbox.network_enabled` 设为 `false`：system 提示会多一行「沙盒无外网」，终端结果
+**5. 绝对无网络的沙盒：网络策略（SandboxHub#42）。** 宿主断外网只切掉了 NAT 出口，
+容器仍能访问整个局域网与宿主上绑 `0.0.0.0` 的服务（Postgres/Redis 等）。要让沙盒
+「绝对无网」，用 createrole 的业务键 `sandbox.network_enabled`（管理员配置面热改，
+不重启）：它随每次 acquire 以 `policy.network.default=deny` 下发，SandboxHub 把容器热切到
+`--internal` 的隔离网 `cr-sb-isolated`——无默认路由、无 NAT，公网与局域网天然不可达，
+Docker ≥ 28 连宿主自身也不可达（本仓在 Docker 29.2.1 实测：容器到宿主网关端口、局域网、
+公网、DNS 全部失败；宿主到容器、容器到同网容器正常）。此时容器只能到达同样接在两张网上的
+网关容器 `cr-host`（`images/gateway`，alpine + socat），它只转发两类平台通道到宿主：MinIO
+（去 FUSE 后删除）与 createrole API（memory/todo CLI 回连）。
+
+部署要点：
+- `SANDBOX_NETWORK` 须是用户自定义网络（默认 `cr-sb-net`，Hub 自动创建）；旧 `.env` 里的
+  `SANDBOX_NETWORK=bridge` 要删掉或改掉，否则策略 deny 被 400 拒绝。
+- `MINIO_ENDPOINT` 改写宿主可达地址（`host.docker.internal:9000`），容器内统一经 `cr-host:9000`。
+- createrole 的 `SANDBOX_MARKET_CLI_API_BASE` 改 `http://cr-host:<API 端口>`，并在
+  `SANDBOX_GATEWAY_FORWARDS` 转发该端口。
+- 网关镜像随其它镜像一起构建 / `docker save` 导入：`scripts/build-images.sh gateway`。
+- 兜底（可选，Docker < 28 或不信任 Docker 版本时）：宿主防火墙对隔离网段的新入站连接一律
+  DROP（平台通道已全走 `cr-host`，不需要端口例外；Hub → 容器由宿主主动发起，conntrack 放行回包）：
+  `nft add rule inet filter input ip saddr <cr-sb-isolated 网段> ct state new drop`
+  （网段：`docker network inspect cr-sb-isolated --format '{{(index .IPAM.Config 0).Subnet}}'`）。
+
+验收（策略 deny 的容器内）：`curl` 局域网任一地址、`curl http://1.1.1.1`、`nc <宿主 LAN IP> 5432`、
+`getent hosts baidu.com` 全部失败；`curl http://cr-host:9000/minio/health/live` 成功；
+`pip install x` 失败且 createrole 侧结果尾注出现「勿重试」。热切换：容器内起一个 `sleep 600`
+的 tmux job，`policy/apply` 切 deny 再切回 allow，job 仍在、proxy 立即可达（实测单次切换约 0.3–0.4s）。
+
+已知限制（与旧版相同，非本期）：同一网络内的沙盒容器互相可达；`ubuntu` 镜像注入的
+`SANDBOX_HTTP_PROXY` 环境变量不能热删，隔离网上它本就不可达，无副作用。
+
+**6. 告诉数字人「没有网」。** 容器里没有任何东西告诉模型能不能出网，断网后模型只看到裸的
+DNS/超时报错，会换着写法反复重试 `pip install` / `curl`。同一把业务键
+`sandbox.network_enabled=false` 让 createrole 在 system 提示多一行「沙盒无外网」，终端结果
 带联网失败特征时附「必然失败、勿重试、用预装」指引，数字人可按需读预装清单。
 `code` 镜像自带这份清单 `/etc/sandbox/MANIFEST.md`（构建期实测生成：`pip list`、
 `npm ls -g`、哪些命令行工具有/没有、Python/Node 版本）——createrole 侧手写摘要
-`me/SANDBOX.md` 指向它，两者不一致时以 MANIFEST 为准。交付前另把各角色云盘里的
+`me/SANDBOX.md` 指向它，两者不一致时以 MANIFEST 为准。切网时 SandboxHub 还会写
+`/etc/sandbox/network-policy`（`allow` | `deny`）供镜像脚本感知。交付前另把各角色云盘里的
 `web-composite-search` 技能删掉（它在沙盒内直连公网搜索引擎）。
 
 ---

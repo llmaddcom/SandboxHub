@@ -36,6 +36,10 @@ async def lifespan(app: FastAPI):
     warm_pool = WarmPool(container_manager)
     reconciler = SandboxReconciler(registry, warm_pool, container_manager)
 
+    # 网络策略地基：两张受管网络 + cr-host 网关容器（幂等；SANDBOX_NETWORK 为内置网络时跳过）
+    await container_manager.ensure_networks()
+    await container_manager.ensure_gateway()
+
     # 启动恢复：处置 Docker 遗留的受管容器（已停止/挂载孤儿销毁，健康 warm 收养回池）
     await reconciler.startup()
 
@@ -73,6 +77,7 @@ async def lifespan(app: FastAPI):
         return_exceptions=True,
     )
 
+    await container_manager.remove_gateway()
     await close_all_clients()
     logger.info("SandboxHub 已关闭，所有容器已清理")
 
@@ -109,7 +114,13 @@ async def health():
     """健康检查，返回服务状态、warm pool 状态和已分配沙盒数。"""
     pool_status = sandboxes_router._warm_pool.status() if sandboxes_router._warm_pool else {}
     ready = len(sandboxes_router._registry.list_ready()) if sandboxes_router._registry else 0
-    return {"ok": True, "warm_pool": pool_status, "sandboxes_ready": ready}
+    return {
+        "ok": True,
+        "warm_pool": pool_status,
+        "sandboxes_ready": ready,
+        # 网络策略能力：binary = 支持 policy.network.default 二值热切换；none = 不可用
+        "network_policy": "binary" if settings.network_policy_supported else "none",
+    }
 
 
 if __name__ == "__main__":

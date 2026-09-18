@@ -40,6 +40,7 @@ class SystemKnob:
 SYSTEM_KNOBS: tuple[SystemKnob, ...] = (
     SystemKnob("image.ubuntu", "DOCKER_IMAGE_UBUNTU", "desktop profile 镜像名"),
     SystemKnob("image.code", "DOCKER_IMAGE_CODE", "code profile 镜像名"),
+    SystemKnob("image.gateway", "DOCKER_IMAGE_GATEWAY", "cr-host 网关容器镜像名（网络策略平台通道）"),
     SystemKnob("warm_pool.ubuntu", "WARM_POOL_UBUNTU", "ubuntu 预热容器数"),
     SystemKnob("warm_pool.code", "WARM_POOL_CODE", "code 预热容器数"),
     SystemKnob("warm_pool.maintain_interval", "POOL_MAINTAIN_INTERVAL", "预热池补齐检查间隔（秒）"),
@@ -62,6 +63,16 @@ SYSTEM_FIELDS: frozenset[str] = frozenset(k.field for k in SYSTEM_KNOBS)
 RETIRED_ENV_KEYS: frozenset[str] = SYSTEM_FIELDS
 
 _MISSING = object()
+# Docker 内置网络：没有内嵌 DNS 按名解析，网络策略在这些网络上不可用。
+_DOCKER_BUILTIN_NETWORKS = frozenset({"bridge", "host", "none"})
+
+
+def _endpoint_port(endpoint: str, default: int = 9000) -> int:
+    """从 ``host:port`` 取端口；无端口用默认（MinIO 9000）。"""
+    host, sep, port = endpoint.rpartition(":")
+    if sep and port.isdigit() and host:
+        return int(port)
+    return default
 # load_settings() 借此把 yaml 路径传进 settings_customise_sources（pydantic 无逐实例参数口）。
 _system_yaml_ctx: ContextVar[Path] = ContextVar("sandboxhub_system_yaml", default=SYSTEM_YAML_PATH)
 
@@ -165,7 +176,22 @@ class Settings(BaseSettings):
     CONTAINER_LABEL: str = "sandboxhub.managed"
 
     # ── 部署接入（.env）：网络 ───────────────────────────────────────────────
-    SANDBOX_NETWORK: str = "bridge"
+    # 容器所在 Docker 网络（联网态）。须是用户自定义 bridge 网络（Hub 启动时幂等创建）：
+    # 网络策略靠 Docker 内嵌 DNS 按容器名解析网关容器 cr-host，Docker 默认 `bridge`
+    # 没有这能力。配成 bridge/host/none 时网络策略整体不可用：acquire 请求 deny 一律
+    # 400 拒绝（fail-closed），联网态行为与旧版一致。
+    SANDBOX_NETWORK: str = "cr-sb-net"
+    # 断网态网络：`--internal`，无默认路由、无 NAT、Docker ≥28 连宿主也不可达；容器只能
+    # 到同网容器（即 cr-host 网关）。acquire 携带 policy.network.default=deny 的沙盒
+    # 热切到这张网（运行中容器 disconnect/connect，亚秒，进程不重启）。
+    SANDBOX_NETWORK_ISOLATED: str = "cr-sb-isolated"
+    # 网关容器名 = 容器内访问平台通道（MinIO / createrole API）的固定主机名，两张网
+    # 都能按名解析；切网后无需改 /etc/hosts。也是后续 egress 代理（域名白名单）的落位。
+    SANDBOX_GATEWAY_NAME: str = "cr-host"
+    # 网关额外端口转发：逗号分隔 `listen=upstream_host:port`，upstream 写宿主可达地址
+    # （网关容器带 host.docker.internal → 宿主）。MinIO 转发按 MINIO_ENDPOINT 自动加入。
+    # 例：SANDBOX_GATEWAY_FORWARDS=8012=host.docker.internal:8012（createrole API 给容器内 CLI）
+    SANDBOX_GATEWAY_FORWARDS: str = ""
     # 容器代理：空=不注入代理。容器内 127.0.0.1 不是宿主，需用 host.docker.internal
     # 或宿主在 docker 网桥上可达的地址，例：http://host.docker.internal:8118
     SANDBOX_HTTP_PROXY: str = ""
@@ -193,6 +219,7 @@ class Settings(BaseSettings):
     # 各键含义见 SYSTEM_KNOBS 与 config/system.yaml 内注释。
     DOCKER_IMAGE_UBUNTU: str = "sandbox-ubuntu:latest"
     DOCKER_IMAGE_CODE: str = "sandbox-code:latest"
+    DOCKER_IMAGE_GATEWAY: str = "sandbox-gateway:latest"
     WARM_POOL_UBUNTU: int = 3
     WARM_POOL_CODE: int = 0
     POOL_MAINTAIN_INTERVAL: int = 30
@@ -243,6 +270,47 @@ class Settings(BaseSettings):
     def dns_servers(self) -> list[str]:
         return [s.strip() for s in self.SANDBOX_DNS.split(",") if s.strip()]
 
+    # ── 网络策略（createrole#449 / SandboxHub#42）────────────────────────────
+
+    @property
+    def network_policy_supported(self) -> bool:
+        """网络策略可用条件：联网态网络是用户自定义网络（Docker 内嵌 DNS 才能按名解析网关）。"""
+        return self.SANDBOX_NETWORK not in _DOCKER_BUILTIN_NETWORKS
+
+    def network_for_mode(self, mode: str) -> str:
+        """策略 → 容器应在的 Docker 网络：deny=隔离网，其余=联网态网络。"""
+        return self.SANDBOX_NETWORK_ISOLATED if mode == "deny" else self.SANDBOX_NETWORK
+
+    def gateway_forwards(self) -> list[tuple[int, str]]:
+        """网关容器的端口转发表 ``[(listen_port, "upstream_host:port")]``。
+
+        MinIO 转发按 ``MINIO_ENDPOINT`` 自动加入（监听端口 = MinIO 端口，上游 = MINIO_ENDPOINT
+        原值，宿主可达地址）；其余来自 ``SANDBOX_GATEWAY_FORWARDS``。坏条目告警并跳过。
+        """
+        forwards: dict[int, str] = {}
+        if self.MINIO_ENDPOINT:
+            forwards[_endpoint_port(self.MINIO_ENDPOINT)] = self.MINIO_ENDPOINT
+        for raw in self.SANDBOX_GATEWAY_FORWARDS.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            listen, sep, upstream = raw.partition("=")
+            try:
+                port = int(listen)
+                if not sep or ":" not in upstream or not (0 < port < 65536):
+                    raise ValueError
+            except ValueError:
+                logger.warning("SANDBOX_GATEWAY_FORWARDS 条目非法，跳过：{!r}（期望 listen=host:port）", raw)
+                continue
+            forwards[port] = upstream.strip()
+        return sorted(forwards.items())
+
+    def minio_endpoint_for_container(self) -> str:
+        """容器内访问 MinIO 的地址：网络策略可用时经网关主机名（两张网都通），否则原值。"""
+        if self.MINIO_ENDPOINT and self.network_policy_supported:
+            return f"{self.SANDBOX_GATEWAY_NAME}:{_endpoint_port(self.MINIO_ENDPOINT)}"
+        return self.MINIO_ENDPOINT
+
     @property
     def expected_app_version(self) -> str:
         """仓库声明的沙盒 app 版本（images/ubuntu/app/VERSION）。
@@ -277,7 +345,7 @@ class Settings(BaseSettings):
             "RCLONE_CONFIG_MINIO_ENV_AUTH": "false",
             "RCLONE_CONFIG_MINIO_ACCESS_KEY_ID": self.MINIO_ACCESS_KEY,
             "RCLONE_CONFIG_MINIO_SECRET_ACCESS_KEY": self.MINIO_SECRET_KEY,
-            "RCLONE_CONFIG_MINIO_ENDPOINT": f"{scheme}://{self.MINIO_ENDPOINT}",
+            "RCLONE_CONFIG_MINIO_ENDPOINT": f"{scheme}://{self.minio_endpoint_for_container()}",
             # MinIO 用 path-style 寻址，且固定 region 占位避免签名差异。
             "RCLONE_CONFIG_MINIO_FORCE_PATH_STYLE": "true",
             "RCLONE_CONFIG_MINIO_REGION": "us-east-1",
