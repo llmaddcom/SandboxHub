@@ -93,6 +93,7 @@ class SandboxReconciler:
                 container_name=c.container_name,
                 container_ip=c.container_ip,
                 sandbox_type=c.sandbox_type,  # type: ignore[arg-type]
+                network=c.network,
             )
         )
         return True
@@ -111,6 +112,10 @@ class SandboxReconciler:
                 await self.check_version_drift()
             except Exception as e:
                 logger.warning(f"镜像版本对账失败，下一轮重试 | err={e}")
+            try:
+                await self._manager.ensure_gateway()
+            except Exception as e:
+                logger.warning(f"网关容器保活失败，下一轮重试 | err={e}")
 
     async def reconcile_once(self) -> None:
         managed = await self._manager.list_managed()
@@ -157,6 +162,29 @@ class SandboxReconciler:
                 logger.warning(
                     f"warm 容器已消失，摘除池记录 | name={removed.container_name}"
                 )
+
+        # 3c) 网络 / IP 对齐：在册记录以 Docker 实际为准（Hub 重启、手工 docker network
+        #     connect 等会让在册网络与实际漂移）。Hub 不持有策略，只对齐事实；策略由
+        #     下一次 acquire / policy.apply 再落实。
+        running_by_id = {c.container_id: c for c in managed if c.status == "running"}
+        for record in self._registry.list_ready():
+            info = record.container_info
+            actual = running_by_id.get(info.container_id)
+            if actual is None or not actual.container_ip:
+                continue
+            if actual.container_ip != info.container_ip or (actual.network and actual.network != info.network):
+                logger.info(
+                    f"沙盒网络对齐 | id={record.sandbox_id} | network={info.network or '?'}->{actual.network} "
+                    f"| ip={info.container_ip}->{actual.container_ip}"
+                )
+                old_ip = info.container_ip
+                info.container_ip = actual.container_ip
+                info.network = actual.network
+                if old_ip != actual.container_ip:
+                    try:
+                        await close_client(old_ip)
+                    except Exception:
+                        pass
 
         # 4) 闲置超时的已分配沙盒：自动回收（挂载容器销毁、warm 容器复位回池）。
         #    调用方（createrole）按 (user, role) 幂等 acquire，回收对其透明。

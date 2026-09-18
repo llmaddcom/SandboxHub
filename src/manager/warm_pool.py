@@ -61,6 +61,18 @@ class WarmPool:
             await self._manager.remove_container(container_info.container_id)
             logger.info(f"env 注入容器已销毁（不入池）| ip={container_info.container_ip}")
             return
+        # 被策略切到隔离网的容器先切回联网态再入池（池内容器统一在 SANDBOX_NETWORK，
+        # 下一次 acquire 按策略再切）；切不回去就销毁。
+        if container_info.network and container_info.network != settings.SANDBOX_NETWORK:
+            old_ip = container_info.container_ip
+            try:
+                await self._manager.switch_network(container_info, "allow")
+                from src.proxy.forwarder import close_client
+                await close_client(old_ip)
+            except Exception as e:
+                logger.warning(f"归还前切回联网态失败，销毁 | ip={old_ip} | err={e}")
+                await self._manager.remove_container(container_info.container_id)
+                return
         try:
             await self._manager.clean_and_reset(container_info.container_ip)
             # 关闭上一租户的连接池，防止跨租户连接复用

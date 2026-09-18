@@ -80,7 +80,7 @@ docker build -f images/code/Dockerfile -t sandbox-code:latest images
 > - noVNC, websockify (GitHub)
 > - pyenv (GitHub)
 
-> **Code image toolchain:** Python 3.11 + Node 20 (yarn/pnpm), `git`/`ripgrep`/`jq`/`vim`, build-essential, and daily Python libs (pandas, openpyxl, python-docx/pptx, reportlab, pypdf, matplotlib, markitdown…). Agents can introspect it at runtime via `GET /api/system/env`.
+> **Code image toolchain:** Python 3.11 + Node 20 (yarn/pnpm), `git`/`ripgrep`/`jq`/`vim`, build-essential, daily Python libs (pandas, openpyxl, python-docx/pptx, reportlab, pypdf, pymupdf, matplotlib, markitdown with docx/xlsx/pdf extras…), legacy Office readers (olefile, xlrd, msoffcrypto-tool, `antiword`, `catdoc`), `file`/`xxd` and `poppler-utils`. Agents can introspect it at runtime via `GET /api/system/env` or read `/etc/sandbox/MANIFEST.md` (includes a file-format → tool table).
 
 #### Building with a proxy
 
@@ -314,11 +314,14 @@ Full API docs available at `http://localhost:8000/docs` inside a running contain
 | `SANDBOX_HUB_HOST` | `0.0.0.0` | Listen address; tighten to `127.0.0.1` or an intranet IP for private deployments |
 | `SANDBOX_HUB_PORT` | `8088` | SandboxHub service port |
 | `CONTAINER_LABEL` | `sandboxhub.managed` | Label on managed containers (isolates multiple instances on one host) |
-| `SANDBOX_NETWORK` | `bridge` | Docker network the containers join |
+| `SANDBOX_NETWORK` | `cr-sb-net` | Docker network for *online* containers. Must be a user-defined bridge network (SandboxHub creates it idempotently); with the built-in `bridge/host/none` the network policy is unavailable (an acquire asking for `deny` gets 400; `allow` behaves as before) |
+| `SANDBOX_NETWORK_ISOLATED` | `cr-sb-isolated` | *Offline* network (`--internal`, created by SandboxHub): sandboxes with policy `deny` are hot-switched here and can only reach `cr-host` |
+| `SANDBOX_GATEWAY_NAME` | `cr-host` | Gateway container name = the fixed hostname containers use for MinIO / the createrole API; resolvable on both networks |
+| `SANDBOX_GATEWAY_FORWARDS` | _(empty)_ | Extra gateway port forwards, comma-separated `listen=host-reachable-address:port` (`host.docker.internal` = the host); the MinIO forward is added automatically from `MINIO_ENDPOINT`. Forward `8012` here when createrole uses `SANDBOX_MARKET_CLI_API_BASE=http://cr-host:8012` |
 | `SANDBOX_HTTP_PROXY` | _(empty)_ | Egress proxy injected into ubuntu containers; a host proxy must use a container-reachable address (`host.docker.internal`) |
 | `SANDBOX_DNS` | _(empty)_ | Custom container DNS (comma-separated, injected via `docker --dns`); when set, `SANDBOX_KEEP_DNS=1` is also injected so the ubuntu entrypoint does not overwrite `resolv.conf` |
 | `SANDBOX_KEEP_DNS` | `false` | `true` = always inject `SANDBOX_KEEP_DNS=1` so containers keep the Docker-injected `resolv.conf` (host `daemon.json` / `--dns`). Needs a rebuilt image |
-| `MINIO_ENDPOINT` | _(empty)_ | MinIO `host:port` (no scheme), **reachable from inside containers** (default bridge gateway is `172.17.0.1`); empty disables mounting |
+| `MINIO_ENDPOINT` | _(empty)_ | MinIO `host:port` (no scheme), **reachable from the host side** (`host.docker.internal:9000` or a host NIC IP): containers actually go through the gateway `cr-host:<port>`; only with the built-in `bridge` network must it be container-reachable (`172.17.0.1:9000`). Empty disables mounting |
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | _(empty)_ | MinIO credentials passed inline to the container's rclone; must point at the same instance createrole uses |
 | `MINIO_SECURE` | `false` | `true` = use https for MinIO |
 | `SANDBOX_HUB_API_KEY` | _(empty)_ | Optional auth: when set, every request must carry a matching `X-API-Key` header (401 otherwise); `/v1/health` is exempt |
@@ -379,16 +382,36 @@ shared intranet, set `SANDBOX_HUB_API_KEY` (the createrole client sends the matc
 `X-API-Key` header using the same-named env var) and/or bind `SANDBOX_HUB_HOST` to
 `127.0.0.1` when co-located with createrole.
 
-**4. MinIO endpoint.** `MINIO_ENDPOINT` must be reachable *from inside containers*.
+**4. MinIO endpoint.** `MINIO_ENDPOINT` is a *host-reachable* address (`host.docker.internal:9000`); containers reach MinIO through the gateway `cr-host:9000`. Only with the built-in `bridge` network must it be reachable *from inside containers*.
 `172.17.0.1:9000` is the host-gateway address of the default `bridge` network; adjust it
 for custom networks or a remote MinIO, and make sure it points at the **same MinIO
 instance** createrole uses.
 
-**5. Tell the agent it is offline.** SandboxHub has no runtime network policy — the
-`code` image talks to the network directly, and nothing in the container tells the model
+**5. A sandbox with no network at all: the network policy (SandboxHub#42).** Cutting the host's
+uplink only removes NAT egress; containers can still reach the whole LAN and every host service
+bound to `0.0.0.0` (Postgres, Redis, ...). For a truly offline sandbox use createrole's business
+setting `sandbox.network_enabled` (hot-reloaded from the admin console, no restart): it is sent with
+every acquire as `policy.network.default=deny`, and SandboxHub hot-switches the container onto the
+`--internal` network `cr-sb-isolated` — no default route, no NAT, and on Docker ≥ 28 not even the host
+is reachable (verified on Docker 29.2.1: container → host gateway port / LAN / internet / DNS all fail;
+host → container and container → container on the same network work). The container can then only
+reach the gateway container `cr-host` (`images/gateway`, alpine + socat), attached to both networks,
+which forwards exactly two platform channels to the host: MinIO (dropped once FUSE goes away) and the
+createrole API (memory/todo CLI). Deployment: `SANDBOX_NETWORK` must be a user-defined network
+(default `cr-sb-net`; delete any old `SANDBOX_NETWORK=bridge` from `.env`), `MINIO_ENDPOINT` becomes a
+host-reachable address, createrole's `SANDBOX_MARKET_CLI_API_BASE` becomes `http://cr-host:<port>` with
+that port listed in `SANDBOX_GATEWAY_FORWARDS`, and the gateway image is built / imported with the
+others (`scripts/build-images.sh gateway`). Optional belt-and-braces for Docker < 28: a host firewall rule
+dropping new inbound connections from the isolated subnet. Acceptance inside a `deny` container: LAN /
+internet / DNS all fail, `curl http://cr-host:9000/minio/health/live` succeeds; a `sleep 600` tmux job
+survives a `policy/apply` deny → allow round trip (one switch takes ~0.3–0.4 s). Known limitation (unchanged):
+sandboxes on the same network can reach each other. Policy shape and the `policy/apply` endpoint are
+documented under *Acquire a sandbox* in the Chinese README.
+
+**6. Tell the agent it is offline.** Nothing in the container tells the model
 whether egress works. Offline, the model only sees raw DNS/timeout errors and keeps
-retrying `pip install` / `curl` in different spellings. Set `sandbox.network_enabled: false`
-in createrole's `config/system.yaml`: the system prompt then carries a one-line "sandbox
+retrying `pip install` / `curl` in different spellings. The same setting
+`sandbox.network_enabled=false` makes createrole add a one-line "sandbox
 has no internet" notice, terminal results whose output looks like a network failure get a
 "will always fail, do not retry, use what is preinstalled" hint, and the agent can read
 the preinstalled inventory on demand. The `code` image ships that inventory as

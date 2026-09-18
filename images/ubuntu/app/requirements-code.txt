@@ -20,7 +20,16 @@ python-pptx>=0.6.23
 reportlab>=4.0.0
 pypdf>=4.0.0
 pdfplumber>=0.11.0
-markitdown[pptx]>=0.1.0
+PyMuPDF>=1.24.0                  # import fitz：agent 读 PDF 的第一选择（提文字 / 渲染页面图）
+# 原来只装 [pptx]，MarkItDown().convert('x.docx') 当场报缺 mammoth（B 端失败日志）
+markitdown[docx,xlsx,xls,pdf,pptx,outlook]>=0.1.0
+
+# ── 旧版 Office / WPS 二进制格式（.doc .xls .wps .msg）─────────
+# B 端客户断网，现场 pip 装不了；失败日志里 olefile 缺失 10 次、xlrd 4 次，
+# agent 只能手写 OLE 解析，一份 .doc 耗掉十几个回合。配套系统命令见 Dockerfile（antiword/catdoc/file）。
+olefile>=0.47                    # OLE2 复合文档容器，.doc/.xls/.wps/.msg 解析基础
+xlrd>=2.0.1                      # 读 .xls（pandas.read_excel 的 xls 引擎）
+msoffcrypto-tool>=5.4.0          # 解带密码的 Office 文件
 
 # ── 图像 / 图表 ──────────────────────────────────────────────
 Pillow>=10.0.0
