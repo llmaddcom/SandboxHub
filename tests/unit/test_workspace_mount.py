@@ -35,7 +35,9 @@ def test_mount_ready_true_with_creds():
 
 
 def test_minio_rclone_env_shape():
-    s = Settings(MINIO_ENDPOINT="minio:9000", MINIO_ACCESS_KEY="ak", MINIO_SECRET_KEY="sk", MINIO_SECURE=False)
+    # SANDBOX_NETWORK=bridge：网络策略不可用，端点原样透传（受管网络下改写为 cr-host，
+    # 见 test_network_policy.py）
+    s = Settings(SANDBOX_NETWORK="bridge", MINIO_ENDPOINT="minio:9000", MINIO_ACCESS_KEY="ak", MINIO_SECRET_KEY="sk", MINIO_SECURE=False)
     env = s.minio_rclone_env()
     assert env["RCLONE_CONFIG_MINIO_TYPE"] == "s3"
     assert env["RCLONE_CONFIG_MINIO_PROVIDER"] == "Minio"
@@ -45,7 +47,7 @@ def test_minio_rclone_env_shape():
 
 
 def test_minio_rclone_env_https_when_secure():
-    s = Settings(MINIO_ENDPOINT="minio:9000", MINIO_ACCESS_KEY="ak", MINIO_SECRET_KEY="sk", MINIO_SECURE=True)
+    s = Settings(SANDBOX_NETWORK="bridge", MINIO_ENDPOINT="minio:9000", MINIO_ACCESS_KEY="ak", MINIO_SECRET_KEY="sk", MINIO_SECURE=True)
     assert s.minio_rclone_env()["RCLONE_CONFIG_MINIO_ENDPOINT"] == "https://minio:9000"
 
 
