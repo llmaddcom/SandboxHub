@@ -236,10 +236,31 @@ curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/kil
 ```
 
 `status` is `running | exited | killed`; `kill_reason` is `timeout`, `kill:<SIG>`, `restart`,
-`evicted` (the server keeps at most 64 live windows and evicts the least recently active ones,
-never the 8 most recent — codex's unified-exec limits) or `window_closed` (someone ran
+`evicted` (legacy records only) or `window_closed` (someone ran
 `tmux kill-window`). `POST /api/terminal/restart` (`{"session": "…"}`) kills that session's
 running jobs, destroys its tmux session and resets cwd / env.
+
+The server retains a capacity of 64 live windows and rejects new commands when full;
+existing jobs keep running. `GET /api/terminal/activity` reports `running_jobs`,
+`live_panes`, and `marked_processes`. Each job passes an internal, non-secret ID to
+its child processes, so `/proc` activity also protects `nohup`, background `&`, and
+`setsid` descendants after their shell exits or the job record is pruned. The marker
+is excluded from saved session environment; zombies do not count. Idle reclaim
+requires all three counters to be zero. Unreadable process activity, missing fields,
+and unavailable or old container APIs are preserved rather than assumed idle.
+
+`POST /api/file/view` accepts `max_chars` (default 16000) and `column` (default 0),
+and returns `path`, `next_offset`, `next_column`, `truncated`, and `total_lines`
+(known only at EOF). Continue using both returned offsets, including when a long line
+spans multiple pages. Reads use bounded fragments instead of loading the whole file.
+The response text includes the continuation parameters for older callers.
+
+`POST /api/file/upload` has no business size cap by default. The Hub streams request
+bodies; the container copies multipart temporary storage in 1MiB chunks and replaces
+the destination atomically. Failures preserve an existing destination and remove the
+temporary copy. Storage exhaustion during multipart parsing or destination writes
+returns 507 with the affected path. Incomplete multipart files are also closed on
+errors or cancelled uploads; the multipart fields and OpenAPI schema are unchanged.
 
 **Legacy form** (kept for a transition period): a body **without `wait`** blocks until the command
 ends, with `timeout` defaulting to 30s (max 300s), and the response still carries
@@ -334,13 +355,14 @@ Full API docs available at `http://localhost:8000/docs` inside a running contain
 | `warm_pool.ubuntu` / `warm_pool.code` | `3` / `0` (this repo's live box: ubuntu=1) | Pre-warmed containers, 0 = cold start on acquire |
 | `warm_pool.maintain_interval` | `30` | Seconds between pool replenishment checks |
 | `sandbox.api_port` | `8000` | FastAPI port inside the container; matches the image entrypoint |
-| `sandbox.idle_ttl` | `7200` | Idle reclaim threshold for allocated sandboxes (seconds), 0 = off |
+| `sandbox.idle_ttl` | `7200` | Reclaim only after request inactivity and confirmed absence of running jobs (seconds), 0 = off |
+| `sandbox.file_upload_max_bytes` | `0` | Container file upload size cap in bytes, 0 = unlimited; applies to newly created containers |
 | `reconcile.interval` | `60` | Reconciler period (seconds) |
 | `reconcile.orphan_grace_seconds` | `300` | Grace period before an unregistered running container is destroyed |
 | `proxy.read_timeout` / `proxy.connect_timeout` | `330` / `10` | Proxy timeouts (seconds); read timeout must exceed the longest single terminal request (legacy `timeout` cap 300s; job-contract `wait` cap 120s) |
 | `workspace.mount_enabled` | `true` | Master switch for the MinIO workspace mount |
 | `workspace.rclone_vfs_cache_mode` | `full` | rclone VFS cache mode; `full` avoids EIO on rename-over inside the write-back window (issue #9) |
-| `workspace.rclone_vfs_cache_max_size` | `2G` | Local VFS cache size cap |
+| `workspace.rclone_vfs_cache_max_size` | `2G` | Local VFS cache eviction target, not a file/workspace quota; open or pending files can exceed it |
 | `workspace.rclone_vfs_write_back` | `1s` | Delay before a closed file is uploaded to MinIO |
 | `workspace.rclone_dir_cache_time` | `2s` | Directory listing cache (MinIO→container visibility lag) |
 | `workspace.mount_ready_retries` / `mount_ready_interval` | `20` / `0.5` | Mountpoint readiness probe attempts and interval (seconds) |

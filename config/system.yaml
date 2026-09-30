@@ -29,9 +29,13 @@ warm_pool:
 sandbox:
   # 容器内沙盒 FastAPI 端口，与镜像 entrypoint 一致，一般不要改
   api_port: 8000
-  # 已分配沙盒的闲置回收阈值（秒）：超时未用（acquire/proxy）即回收——挂载容器销毁、
-  # warm 容器复位回池；调用方按 (user, role) 幂等 acquire，回收后下次调用自动重建。0 = 关闭。
+  # 无 acquire/proxy 且无运行 job、活跃 tmux pane、继承 job 标记的用户进程才回收。
+  # nohup / & / setsid 后代同样保活；进程活性未知、探测失败或旧镜像缺字段时保守保留。
+  # 挂载容器销毁、warm 容器复位回池。后台任务不受此时长限制。0 = 关闭。
   idle_ttl: 7200
+  # 容器 /api/file/upload 单文件业务上限（字节），0 = 不限；仍受物理磁盘空间约束。
+  # 创建容器时由 Hub 注入，调整后新容器生效；不限制 /api/file/view 分页读取。
+  file_upload_max_bytes: 0
 
 reconcile:
   # 周期对账间隔（秒）：清理已停止 / 孤儿容器、驱逐失联沙盒、闲置回收
@@ -53,7 +57,8 @@ workspace:
   # rclone VFS 缓存模式：full 对 rename / 并发读写支持最完整；writes 模式下写回窗口内的
   # rename-over（sed -i / mv 覆盖）会报 EIO（issue #9），勿改回 writes
   rclone_vfs_cache_mode: "full"
-  # full 模式本地读缓存体积上限（防大文件读放大占满容器磁盘）
+  # full 模式本地缓存清理目标，不是单文件或云盘容量上限；打开/待回写文件可暂时超过。
+  # 保留有界读缓存，不能用无限缓存解决磁盘不足；实际容量取决于 Docker 数据盘/MinIO。
   rclone_vfs_cache_max_size: "2G"
   # 文件关闭后回写 MinIO 的延迟（越小越接近实时）
   rclone_vfs_write_back: "1s"

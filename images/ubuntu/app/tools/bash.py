@@ -11,9 +11,8 @@
 - 「持久会话」= 跨 job 传递的 cwd + 导出环境（按 tmux session 各自维护）：job 结束时
   （EXIT trap）把 ``pwd`` 与 ``env -0`` 落盘，同 session 的下一个 job 以此为起点。
   ``cd``/``export``/``source venv`` 因而跨调用保留；shell 函数/别名/未导出变量不跨越。
-- 多 job 并行：同一容器同时可跑多个 job（不再 409）。活跃窗口总数超过
-  ``MAX_LIVE_WINDOWS`` 时按最近活动时间淘汰最旧的，最近 ``PROTECT_RECENT`` 个不动
-  （对标 codex unified exec 的 64 / 8）。
+- 多 job 并行：同一容器同时可跑多个 job。活跃窗口到 ``MAX_LIVE_WINDOWS`` 时
+  拒绝新提交，已有任务继续运行；只回收已完成窗口。
 - 完成判定：``remain-on-exit`` 下轮询 ``pane_dead`` / ``pane_dead_status``（= 命令退出码，
   信号致死为 128+N）；结束后窗口即销毁，日志保留。
 - ``timeout``：无默认、无上限。到期先 SIGINT，宽限后 SIGKILL 整个进程组。
@@ -46,7 +45,6 @@ MAX_JOB_RECORDS = 200     # 内存保留的 job 记录数（日志文件不删�
 TMUX_SOCKET = os.getenv("CR_TMUX_SOCKET") or None   # None = 默认 socket（容器内 tmux ls 直接可见）
 DEFAULT_SESSION = "default"
 MAX_LIVE_WINDOWS = 64     # 整个 tmux server 的活跃窗口上限（对标 codex MAX_UNIFIED_EXEC_PROCESSES）
-PROTECT_RECENT = 8        # 淘汰时保护最近活动的窗口数
 POLL_INTERVAL = 0.1       # 轮询 pane 状态的间隔
 DEAD_STATUS_TICKS = 10    # pane 已死但退出码未到时最多再等的轮询次数
 PANE_COLUMNS, PANE_LINES = 200, 50
@@ -66,8 +64,57 @@ STATUS_KILLED = "killed"
 _SIGNALS = {"INT": signal.SIGINT, "KILL": signal.SIGKILL, "TERM": signal.SIGTERM}
 
 # 不跨 job 传递的环境变量：shell 自行维护的、tmux/script 按窗口注入的
-_ENV_SKIP = {"_", "PWD", "OLDPWD", "SHLVL", "TMUX", "TMUX_PANE", "LINES", "COLUMNS"}
+JOB_ACTIVITY_ENV = "CR_SANDBOX_JOB_ID"
+PROC_ROOT = Path("/proc")
+_JOB_ACTIVITY_RE = re.compile(rb"(?:^|\x00)CR_SANDBOX_JOB_ID=j_[0-9A-HJKMNP-TV-Z]{26}(?:\x00|$)")
+_ENV_SKIP = {"_", "PWD", "OLDPWD", "SHLVL", "TMUX", "TMUX_PANE", "LINES", "COLUMNS", JOB_ACTIVITY_ENV}
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def count_marked_processes() -> int:
+    """Count live job descendants, including nohup/setsid children after their job exits.
+
+    The inherited marker is a non-secret job ID, independent of in-memory job
+    retention and process groups. Read only; never log process environments.
+    An unreadable process makes an otherwise empty result unknown, not idle.
+    """
+    count = 0
+    uncertain = False
+    try:
+        processes = list(PROC_ROOT.iterdir())
+    except OSError as exc:
+        raise ToolError("无法读取进程活性，保留现有任务。") from exc
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        marked = False
+        try:
+            # comm can contain spaces and ')'; fields after the final ')' start
+            # at state (field 3), and starttime is field 22. Recheck identity so
+            # PID reuse cannot turn an unknown/new process into a false idle.
+            before = (process / "stat").read_text().rsplit(")", 1)[1].split()
+            if before[0] in ("Z", "X", "x"):
+                continue
+            marked = bool(_JOB_ACTIVITY_RE.search((process / "environ").read_bytes()))
+            after = (process / "stat").read_text().rsplit(")", 1)[1].split()
+            if before[19] != after[19]:
+                uncertain = True
+            elif marked and after[0] not in ("Z", "X", "x"):
+                count += 1
+        except OSError:
+            if marked:
+                # A marked parent may have just forked and exited after /proc
+                # was enumerated. Preserve this lease until a later probe.
+                count += 1
+            else:
+                # Even an exited PID may have spawned a child after this scan
+                # began. A later complete scan can safely establish idleness.
+                uncertain = True
+        except (IndexError, ValueError):
+            uncertain = True
+    if uncertain and not count:
+        raise ToolError("部分进程活性无法确认，保留现有任务。")
+    return count
 
 # job 包装脚本（经 script 在 PTY 里由 bash 执行）：$1 = 状态文件基名。
 # 先落 pid（kill 用），载入上一 job 的导出环境，EXIT trap 保证 exit / 报错 / SIGINT 后
@@ -300,7 +347,7 @@ class Tmux:
         subprocess.run(self._argv(*args), stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
-    async def list_panes(self) -> list[dict]:
+    async def list_panes(self, *, strict: bool = False) -> list[dict]:
         """server 上全部 pane：pane_id / dead / dead_status / activity / session / window。"""
         try:
             out = await self.run(
@@ -308,12 +355,20 @@ class Tmux:
                 "#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{window_activity}\t"
                 "#{session_name}\t#{window_name}",
             )
-        except ToolError:
-            return []   # server 未起 / 已退出 = 没有 pane
+        except ToolError as exc:
+            detail = exc.message.lower()
+            absent = "no server running" in detail or detail.endswith("no current target") or (
+                "error connecting to" in detail and "no such file or directory" in detail
+            )
+            if strict and not absent:
+                raise
+            return []
         panes = []
         for line in out.splitlines():
             parts = line.split("\t")
             if len(parts) < 6:
+                if strict:
+                    raise ToolError("tmux 活跃任务查询返回无效数据，保留现有任务。")
                 continue
             pane_id, dead, dead_status, activity, sess, win = parts[:6]
             panes.append({
@@ -341,6 +396,7 @@ class JobSession:
         self.states: dict[str, _SessionState] = {}
         self.jobs: dict[str, Job] = {}
         self._supervisor: asyncio.Task | None = None
+        self._submit_lock = asyncio.Lock()
         JOB_DIR.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ 会话状态
@@ -360,12 +416,19 @@ class JobSession:
     # ------------------------------------------------------------------ 提交
     async def start_job(self, command: str, timeout: float | None = None,
                         session: str | None = None) -> Job:
+        # 容量检查与创建窗口原子化，避免并发提交越过窗口上限。
+        async with self._submit_lock:
+            return await self._start_job(command, timeout, session)
+
+    async def _start_job(self, command: str, timeout: float | None,
+                         session: str | None) -> Job:
         """在该 session 的 tmux 会话里开一个窗口跑命令；返回 running 的 job。"""
         if not command:
             raise ToolError("未提供命令。")
         if timeout is not None and timeout <= 0:
             raise ToolError("timeout 必须大于 0。")
         st = self.state(session)
+        await self._reap_windows()
 
         job_id = _new_job_id()
         base = JOB_DIR / job_id
@@ -388,8 +451,8 @@ class JobSession:
             st.notes.append(f"⚠️ 上次工作目录 {cwd} 已不存在，已回退到 {self._initial_cwd}")
             cwd = st.cwd = self._initial_cwd
 
-        await self._reap_windows()
         inner = (
+            f"env {JOB_ACTIVITY_ENV}={job_id} "
             f"/bin/bash --noprofile --norc {shlex.quote(str(base.with_suffix('.run.sh')))} "
             f"{shlex.quote(str(base))}"
         )
@@ -419,19 +482,19 @@ class JobSession:
         return out.strip()
 
     async def _reap_windows(self) -> None:
-        """活跃窗口达上限时淘汰最旧的（按最近活动），最近 PROTECT_RECENT 个不动。"""
-        panes = await self.tmux.list_panes()
-        live = sorted((p for p in panes if not p["dead"]), key=lambda p: p["activity"])
-        excess = len(live) - MAX_LIVE_WINDOWS + 1
-        if excess <= 0:
-            return
-        candidates = live[: max(0, len(live) - PROTECT_RECENT)]
-        for pane in candidates[:excess]:
+        """容量满时拒绝新任务，不强杀旧任务。"""
+        panes = await self.tmux.list_panes(strict=True)
+        live = [pane for pane in panes if not pane["dead"]]
+        if len(live) >= MAX_LIVE_WINDOWS:
+            raise ToolError(
+                f"活跃终端已达容量 {MAX_LIVE_WINDOWS}，新命令未执行，已有任务继续运行。"
+                "请等待任务结束，或通过 /api/terminal/kill 显式终止不再需要的 job 后再提交。"
+            )
+        # 仅清已结算的退出窗口；日志与 job 记录保留供 wait/read 查询。
+        for pane in panes:
             job = self._job_by_pane(pane["pane_id"])
-            if job is not None and not job.finished:
-                job.kill_reason = job.kill_reason or "evicted"
-                self._signal_group(job, signal.SIGKILL)
-            await self.tmux.ok("kill-pane", "-t", pane["pane_id"])
+            if pane["dead"] and job is not None and job.finished:
+                await self.tmux.ok("kill-pane", "-t", pane["pane_id"])
 
     def _job_by_pane(self, pane_id: str) -> Job | None:
         for job in self.jobs.values():
@@ -448,7 +511,12 @@ class JobSession:
         """单循环轮询全部 running job：pane 死亡即结算；timeout 到期即终止。"""
         while self.running:
             await asyncio.sleep(POLL_INTERVAL)
-            panes = {p["pane_id"]: p for p in await self.tmux.list_panes()}
+            try:
+                panes = {p["pane_id"]: p for p in await self.tmux.list_panes(strict=True)}
+            except ToolError:
+                # 临时查询失败不是“窗口消失”；保留 job 状态，避免提前报告任务失败。
+                await asyncio.sleep(1.0)
+                continue
             now = time.time()
             for job in self.running:
                 pane = panes.get(job.pane_id)

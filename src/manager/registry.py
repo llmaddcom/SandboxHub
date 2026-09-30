@@ -72,7 +72,9 @@ class SandboxRegistry:
             self._by_user_role.pop((record.user_id, record.role_id), None)
             return record.container_info
 
-    async def evict(self, sandbox_id: str) -> Optional[SandboxRecord]:
+    async def evict(
+        self, sandbox_id: str, *, if_last_active_at: datetime | None = None
+    ) -> Optional[SandboxRecord]:
         """
         彻底移除记录（容器已死/失联/闲置回收时用）。
 
@@ -80,6 +82,11 @@ class SandboxRegistry:
         宽限，且要让同 user+role 的下一次 acquire 立即走全新分配。
         """
         async with self._lock:
+            current = self._by_id.get(sandbox_id)
+            if if_last_active_at is not None and (
+                current is None or current.last_active_at != if_last_active_at
+            ):
+                return None  # 活性探测期间 acquire/proxy 已续活，不能按旧快照回收。
             record = self._by_id.pop(sandbox_id, None)
             if not record:
                 return None

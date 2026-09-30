@@ -54,6 +54,7 @@ def parts(mock_manager):
     registry = SandboxRegistry()
     pool = WarmPool(mock_manager)
     reconciler = SandboxReconciler(registry, pool, mock_manager)
+    reconciler._probe_terminal_idle = AsyncMock(return_value=True)
     return registry, pool, reconciler, mock_manager
 
 
@@ -197,6 +198,70 @@ async def test_reconcile_idle_ttl_disabled_by_zero(parts, monkeypatch):
     with patch("src.manager.reconciler.close_client", new_callable=AsyncMock):
         await reconciler.reconcile_once()
     assert await registry.get(record.sandbox_id) is record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idle", [False, None])
+async def test_idle_sandbox_with_running_or_unknown_jobs_is_kept(parts, monkeypatch, idle):
+    registry, pool, reconciler, manager = parts
+    monkeypatch.setattr(settings, "SANDBOX_IDLE_TTL", 1)
+    record = await registry.register(make_info("long_job"), user_id="u", role_id="r")
+    record.last_active_at -= timedelta(days=2)
+    manager.list_managed.return_value = [make_managed("long_job")]
+    reconciler._probe_terminal_idle.return_value = idle
+    await reconciler.reconcile_once()
+    assert await registry.get(record.sandbox_id) is record
+    manager.clean_and_reset.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_new_request_during_idle_probe_prevents_reclaim(parts, monkeypatch):
+    registry, _, reconciler, manager = parts
+    monkeypatch.setattr(settings, "SANDBOX_IDLE_TTL", 1)
+    record = await registry.register(make_info("race"), user_id="u", role_id="r")
+    record.last_active_at -= timedelta(days=2)
+    manager.list_managed.return_value = [make_managed("race")]
+
+    async def probe(_):
+        registry.touch(record.sandbox_id)
+        return True
+
+    reconciler._probe_terminal_idle.side_effect = probe
+    await reconciler.reconcile_once()
+    assert await registry.get(record.sandbox_id) is record
+    manager.clean_and_reset.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload, expected", [
+    ({"running_jobs": 0, "live_panes": 0, "marked_processes": 0}, True),
+    ({"running_jobs": 1, "live_panes": 0, "marked_processes": 0}, False),
+    ({"running_jobs": 0, "live_panes": 1, "marked_processes": 0}, False),
+    ({"running_jobs": 0, "live_panes": 0, "marked_processes": 1}, False),
+    ({"running_jobs": 0, "live_panes": 0}, None),
+    ({"running_jobs": False, "live_panes": 0, "marked_processes": 0}, None),
+    ({"running_jobs": 0, "live_panes": 0, "marked_processes": -1}, None),
+    ({}, None),
+])
+async def test_activity_probe_requires_valid_zero_counters(payload, expected):
+    import httpx
+    response = httpx.Response(200, json=payload, request=httpx.Request("GET", "http://sandbox"))
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.get.return_value = response
+    reconciler = SandboxReconciler(MagicMock(), MagicMock(), MagicMock())
+    with patch("src.manager.reconciler.httpx.AsyncClient", return_value=client):
+        assert await reconciler._probe_terminal_idle("127.0.0.1") is expected
+
+
+@pytest.mark.asyncio
+async def test_activity_probe_network_failure_is_unknown():
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.get.side_effect = OSError("offline")
+    reconciler = SandboxReconciler(MagicMock(), MagicMock(), MagicMock())
+    with patch("src.manager.reconciler.httpx.AsyncClient", return_value=client):
+        assert await reconciler._probe_terminal_idle("127.0.0.1") is None
 
 
 @pytest.mark.asyncio

@@ -17,13 +17,14 @@ send-keys / capture-pane / kill-window -t <job_id>`` 与仍在跑的 job 交互�
 两种形态的响应字段是同一超集，调用方按需取用。
 """
 
+import asyncio
 import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..tools import BashTool, ToolError
-from ..tools.bash import DEFAULT_WAIT, MAX_WAIT, Job
+from ..tools.bash import DEFAULT_WAIT, MAX_WAIT, Job, count_marked_processes
 
 # 创建终端操作路由，设置前缀和标签
 router = APIRouter(prefix="/api/terminal", tags=["终端操作"])
@@ -135,6 +136,21 @@ def _job_payload(job: Job, start: int = 0) -> dict:
         "cursor": cursor,
         "log_path": str(job.log_path),
         "kill_reason": job.kill_reason,
+    }
+
+
+@router.get("/activity", summary="查询终端任务活性（闲置回收前使用）")
+async def terminal_activity():
+    session = get_bash_tool().session
+    try:
+        panes = await session.tmux.list_panes(strict=True)
+        marked_processes = await asyncio.to_thread(count_marked_processes)
+    except ToolError as exc:
+        raise HTTPException(status_code=503, detail=f"任务活性未知: {exc.message}") from exc
+    return {
+        "running_jobs": len(session.running),
+        "live_panes": sum(not pane["dead"] for pane in panes),
+        "marked_processes": marked_processes,
     }
 
 
