@@ -192,16 +192,44 @@ class SandboxReconciler:
             for record in self._registry.list_ready():
                 idle = (now - record.last_active_at).total_seconds()
                 if idle > settings.SANDBOX_IDLE_TTL:
+                    observed_at = record.last_active_at
+                    # HTTP 闲置不等于计算闲置；老镜像/探测失败均保守保留。
+                    terminal_idle = await self._probe_terminal_idle(record.container_info.container_ip)
+                    if terminal_idle is False:
+                        # 任务活动也续活：结束后留出正常闲置期，避免立即回收。
+                        self._registry.touch(record.sandbox_id)
+                        continue
+                    if terminal_idle is not True:
+                        continue
                     logger.info(
                         f"闲置沙盒自动回收 | id={record.sandbox_id} "
                         f"| user={record.user_id} | idle={int(idle)}s"
                     )
-                    evicted = await self._registry.evict(record.sandbox_id)
+                    evicted = await self._registry.evict(
+                        record.sandbox_id, if_last_active_at=observed_at
+                    )
                     if evicted is not None:
                         await self._pool.release(evicted.container_info)
 
         # 5) released 记录修剪（内存有界）。
         await self._registry.prune_released(_RELEASED_RECORD_TTL)
+
+    async def _probe_terminal_idle(self, container_ip: str) -> bool | None:
+        """仅明确确认无 job、活跃 pane 和脱离终端的用户进程才允许闲置回收。"""
+        try:
+            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+                response = await client.get(
+                    f"http://{container_ip}:{settings.SANDBOX_API_PORT}/api/terminal/activity"
+                )
+                response.raise_for_status()
+                data = response.json()
+            counts = [data.get("running_jobs"), data.get("live_panes"), data.get("marked_processes")]
+            if any(type(value) is not int or value < 0 for value in counts):
+                raise ValueError("invalid activity counters")
+            return all(value == 0 for value in counts)
+        except Exception as exc:
+            logger.warning("沙盒任务活性未知，跳过闲置回收 | ip={} | err={}", container_ip, exc)
+            return None
 
     # ── 镜像版本对账（issue #6：防「代码已合、镜像未重建」的静默漂移）────────
 

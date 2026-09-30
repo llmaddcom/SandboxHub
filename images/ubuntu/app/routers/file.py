@@ -9,16 +9,26 @@
 """
 
 import os
+import errno
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 
-from fastapi import APIRouter, Form, HTTPException, Query, UploadFile
+import anyio
+from fastapi import APIRouter, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse as FastAPIFileResponse
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..tools import EditTool, MatchError, ToolError
+from ..tools.base import filesystem_error_detail
 
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
+# Hub 从 system.yaml 注入；直接运行容器同样默认不限业务文件大小。
+MAX_UPLOAD_SIZE = max(0, int(os.environ.get("SANDBOX_FILE_UPLOAD_MAX_BYTES", "0")))
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 # 创建文件操作路由，设置前缀和标签
 router = APIRouter(prefix="/api/file", tags=["文件操作"])
@@ -52,6 +62,8 @@ class ViewRequest(BaseModel):
         description="查看的行范围 [起始行, 结束行]，仅对文件有效",
         examples=[[1, 50]],
     )
+    max_chars: int = Field(default=16000, ge=256, le=1000000, description="本页正文预算，不限制文件大小")
+    column: int = Field(default=0, ge=0, description="起始行内的字符偏移，用于续读超长单行")
 
 
 class CreateRequest(BaseModel):
@@ -93,9 +105,17 @@ class FileResponse(BaseModel):
     error: str | None = Field(default=None, description="错误信息")
 
 
+class FileViewResponse(FileResponse):
+    path: str
+    next_offset: int | None = None
+    next_column: int = 0
+    truncated: bool = False
+    total_lines: int | None = None
+
+
 # ==================== API 接口 ====================
 
-@router.post("/view", response_model=FileResponse, summary="查看文件/目录内容")
+@router.post("/view", response_model=FileViewResponse, summary="查看文件/目录内容")
 async def view_file(request: ViewRequest):
     """查看文件或目录的内容。
 
@@ -110,11 +130,18 @@ async def view_file(request: ViewRequest):
     """
     try:
         tool = get_edit_tool()
-        result = await tool.view(request.path, request.view_range)
-        return FileResponse(
+        result = await tool.view(
+            request.path, request.view_range, max_chars=request.max_chars, column=request.column
+        )
+        return FileViewResponse(
             success=True,
             output=result.output,
             error=result.error,
+            path=request.path,
+            next_offset=getattr(result, "next_offset", None),
+            next_column=getattr(result, "next_column", 0),
+            truncated=getattr(result, "truncated", False),
+            total_lines=getattr(result, "total_lines", None),
         )
     except ToolError as e:
         raise HTTPException(status_code=400, detail=f"查看文件失败: {e.message}")
@@ -278,7 +305,51 @@ def _validate_path(path: str) -> Path:
     return resolved
 
 
-@router.post("/upload", summary="上传文件到沙盒")
+class _StorageAwareUploadRoute(APIRoute):
+    """Parse before FastAPI masks multipart I/O errors as a generic HTTP 400.
+
+    Keep the endpoint's UploadFile/Form declaration for validation and OpenAPI.
+    Starlette caches FormData on Request; its parser tracks every temporary file,
+    including unfinished parts absent from FormData when a write fails.
+    """
+
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handler(request: Request):
+            content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+            if content_type != "multipart/form-data":
+                return await original(request)
+            parser = MultiPartParser(request.headers, request.stream())
+            try:
+                try:
+                    request._form = await parser.parse()
+                except OSError as exc:
+                    code = 507 if exc.errno in (errno.ENOSPC, errno.EDQUOT) else 500
+                    # Do not probe/create another tempfile while handling a
+                    # disk-full error; gettempdir() can itself fail uncached.
+                    temp_root = tempfile.tempdir or os.getenv("TMPDIR") or "/tmp"
+                    path = str(Path(os.fsdecode(temp_root)) / "multipart-upload")
+                    raise HTTPException(status_code=code, detail=filesystem_error_detail(path, exc)) from exc
+                except MultiPartException as exc:
+                    raise HTTPException(status_code=400, detail=exc.message) from exc
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail="上传表单解析失败，请检查 multipart/form-data 格式") from exc
+                return await original(request)
+            finally:
+                # parse() itself only cleans up MultiPartException. Also close
+                # incomplete files on OSError, validation failure or cancellation.
+                def close_files():
+                    for uploaded in parser._files_to_close_on_error:
+                        with suppress(OSError):
+                            uploaded.close()
+
+                with anyio.CancelScope(shield=True):
+                    await run_in_threadpool(close_files)
+
+        return handler
+
+
 async def upload_file(
     file: UploadFile,
     dest_path: str = Form(..., description="沙盒内目标绝对路径（目录或完整文件路径）"),
@@ -302,27 +373,53 @@ async def upload_file(
 
         if target.is_dir() or dest_path.endswith("/"):
             target.mkdir(parents=True, exist_ok=True)
-            filename = file.filename or "uploaded_file"
+            filename = Path((file.filename or "uploaded_file").replace("\\", "/")).name
+            if filename in ("", ".", ".."):
+                raise HTTPException(status_code=400, detail="文件名无效")
             target = target / filename
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
 
-        content = await file.read()
-        if len(content) > MAX_UPLOAD_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail=f"文件大小超过限制（最大 {MAX_UPLOAD_SIZE // 1024 // 1024} MB）",
-            )
-
-        target.write_bytes(content)
+        # multipart 已落 SpooledTemporaryFile；有界拷贝到同目录临时文件后原子替换。
+        # 不把大文件重新载入内存，超额/磁盘错误保留目标旧内容并清理半成品。
+        size = await run_in_threadpool(_save_upload, file.file, target)
         return FileResponse(
             success=True,
-            output=f"文件已保存到 {target}（{len(content)} 字节）",
+            output=f"文件已保存到 {target}（{size} 字节）",
         )
     except HTTPException:
         raise
+    except OSError as exc:
+        code = 507 if exc.errno in (errno.ENOSPC, errno.EDQUOT) else 500
+        raise HTTPException(status_code=code, detail=filesystem_error_detail(dest_path, exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"上传文件失败: {str(e)}")
+
+
+router.add_api_route(
+    "/upload", upload_file, methods=["POST"], summary="上传文件到沙盒",
+    route_class_override=_StorageAwareUploadRoute,
+)
+
+
+def _save_upload(source, target: Path) -> int:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".upload-", delete=False) as output:
+            temporary = Path(output.name)
+            size = 0
+            while chunk := source.read(_UPLOAD_CHUNK_BYTES):
+                size += len(chunk)
+                if MAX_UPLOAD_SIZE > 0 and size > MAX_UPLOAD_SIZE:
+                    raise HTTPException(status_code=413, detail=f"文件大小超过限制（最大 {MAX_UPLOAD_SIZE} 字节）")
+                output.write(chunk)
+        mode = target.stat().st_mode & 0o777 if target.exists() else 0o644
+        temporary.chmod(mode)
+        os.replace(temporary, target)
+        return size
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 @router.get("/download", summary="从沙盒下载文件")

@@ -371,6 +371,16 @@ async def test_normal_exit_leaves_nohup_background_children_alone():
 
 
 @pytest.mark.asyncio
+async def test_activity_marker_is_fresh_and_not_saved_as_session_environment():
+    tool = BashTool()
+    first = await tool.submit('printf "%s" "$CR_SANDBOX_JOB_ID"', wait=5)
+    assert first.read(0)[0] == first.id
+    assert bash_mod.JOB_ACTIVITY_ENV not in tool.session.state(None).env
+    second = await tool.submit('printf "%s" "$CR_SANDBOX_JOB_ID"', wait=5)
+    assert second.read(0)[0] == second.id != first.id
+
+
+@pytest.mark.asyncio
 async def test_wait_is_clamped_to_max_wait(monkeypatch):
     monkeypatch.setattr(bash_mod, "MAX_WAIT", 0.2)
     tool = BashTool()
@@ -402,24 +412,42 @@ async def test_background_process_does_not_block_job():
 
 
 @pytest.mark.asyncio
-async def test_reaper_evicts_oldest_live_windows_but_protects_recent(monkeypatch):
-    """活跃窗口达上限：淘汰最旧的，最近 PROTECT_RECENT 个不动（codex 64/8 的缩小版）。"""
+async def test_capacity_rejects_new_command_without_killing_active_jobs(monkeypatch):
     monkeypatch.setattr(bash_mod, "MAX_LIVE_WINDOWS", 3)
-    monkeypatch.setattr(bash_mod, "PROTECT_RECENT", 1)
     tool = BashTool()
     old = await tool.submit("sleep 30", wait=0.2)
-    await asyncio.sleep(1.1)  # window_activity 秒级，拉开先后
     mid = await tool.submit("sleep 30", wait=0.2)
-    await asyncio.sleep(1.1)
     newest = await tool.submit("sleep 30", wait=0.2)
-    fourth = await tool.submit("echo four", wait=5)
-    assert fourth.status == "exited"
-    old = await tool.wait(old.id, wait=5)
-    assert old.status == "killed" and old.kill_reason == "evicted"
-    assert not mid.finished and not newest.finished
-    for j in (mid, newest):
+    with pytest.raises(ToolError, match="新命令未执行"):
+        await tool.submit("echo four", wait=5)
+    assert all(not job.finished for job in (old, mid, newest))
+    for j in (old, mid, newest):
         await tool.kill(j.id, "KILL")
         await tool.wait(j.id, 5)
+    fourth = await tool.submit("echo four", wait=5)
+    assert fourth.status == "exited" and fourth.read(0)[0] == "four\n"
+
+
+@pytest.mark.asyncio
+async def test_transient_tmux_probe_error_does_not_settle_running_job(monkeypatch):
+    tool = BashTool()
+    job = await tool.submit("sleep 0.5; echo survived", wait=0)
+    real = tool.session.tmux.list_panes
+    failed = False
+
+    async def probe(**kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise ToolError("temporary tmux query failure")
+        return await real(**kwargs)
+
+    monkeypatch.setattr(tool.session.tmux, "list_panes", probe)
+    await asyncio.sleep(0.2)
+    assert not job.finished
+    final = await tool.wait(job.id, wait=5)
+    assert failed and final.status == "exited" and final.kill_reason is None
+    assert "survived" in final.read(0)[0]
 
 
 @pytest.mark.asyncio

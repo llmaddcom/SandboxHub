@@ -239,7 +239,11 @@ curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/kil
 ```
 
 `status` 取值 `running | exited | killed`；`kill_reason` 为 `timeout`、`kill:<SIG>` 或 `restart`。
-多个 job 可并行。请求体 `session` 字段指定对话会话 → 容器内同名 tmux session（缺省 `default`），同会话的 job 共享 cwd / 导出环境并可用 `tmux send-keys / capture-pane / kill-window -t <job_id>` 互相交互，不同会话互不可见。活跃窗口最多 64 个，超出按最近活动淘汰最旧的、最近 8 个不动（`kill_reason=evicted`）。
+多个 job 可并行。请求体 `session` 字段指定对话会话 → 容器内同名 tmux session（缺省 `default`），同会话的 job 共享 cwd / 导出环境并可用 `tmux send-keys / capture-pane / kill-window -t <job_id>` 互相交互，不同会话互不可见。活跃窗口最多 64 个，容量满时拒绝新命令，已有任务继续运行；只清理已完成窗口。`GET /api/terminal/activity` 返回 `running_jobs`、`live_panes` 与 `marked_processes`。job 向后代继承不含敏感信息的内部标记，扫描 `/proc` 时可识别 `nohup`、后台 `&`、`setsid` 后仍存活的用户进程，不依赖父 shell 或已剪枝的 job 记录；标记不进入跨 job 的环境状态，zombie 不计数。仅三个计数均明确为零才允许闲置回收；进程不可读、字段缺失、探测失败或旧镜像不支持时保守保留。
+
+`POST /api/file/view` 支持 `max_chars`（默认 16000）与 `column`（默认 0）。返回 `path`、`next_offset`、`next_column`、`truncated` 与 `total_lines`；后者仅读到文件末尾时可知，否则为 null。按返回位置继续，超长单行可能仍在同一 `next_offset`，须同时传回 `next_column`。读取在后台线程中逐片进行，不将整文件载入内存；页正文不再叠加固定截断，调用方也应保留该分页结果。旧客户端仍可从正文末尾取得准确续读参数。
+
+`POST /api/file/upload` 默认无业务大小上限；Hub 流式转发请求，容器从 multipart 暂存文件以 1MiB 片段复制，在同目录临时文件写完后原子替换。失败会清理临时副本，保留旧目标。multipart 解析暂存及目标写入阶段的磁盘/文件系统配额不足均返回 507 并指出路径；失败或取消上传也会关闭未完成的暂存文件，原 multipart 字段及 OpenAPI schema 不变。实际可用容量取决于 Docker 数据盘和 MinIO。multipart 暂存、原子写入及 rclone 待回写缓存仍需实际可用空间。
 `POST /api/terminal/restart` 会 kill 当前 job 并复位 cwd / 环境变量。
 
 **旧形态**（过渡期保留）：请求体**不带 `wait`** 即阻塞至命令结束，`timeout` 默认 30s（上限
@@ -334,19 +338,24 @@ Ubuntu 容器对外暴露 40+ REST 接口和 30+ MCP 工具，主要分类：
 | `warm_pool.ubuntu` / `warm_pool.code` | `3` / `0`（本仓线上 ubuntu=1） | 预热容器数，0=不预热 |
 | `warm_pool.maintain_interval` | `30` | 预热池补齐检查间隔（秒） |
 | `sandbox.api_port` | `8000` | 容器内 FastAPI 端口，与镜像 entrypoint 一致 |
-| `sandbox.idle_ttl` | `7200` | 已分配沙盒闲置回收阈值（秒），0=关闭 |
+| `sandbox.idle_ttl` | `7200` | 无请求且确认无运行任务时的闲置回收阈值（秒），0=关闭 |
+| `sandbox.file_upload_max_bytes` | `0` | 容器上传单文件业务上限（字节），0=不限；新建容器生效 |
 | `reconcile.interval` | `60` | 周期对账间隔（秒） |
 | `reconcile.orphan_grace_seconds` | `300` | 孤儿容器创建宽限（秒） |
 | `proxy.read_timeout` / `proxy.connect_timeout` | `330` / `10` | 代理转发超时（秒）；读超时须大于终端单次请求最长时长（旧契约 `timeout` 上限 300s；job 契约 `wait` 上限 120s） |
 | `workspace.mount_enabled` | `true` | 工作区挂载总开关 |
 | `workspace.rclone_vfs_cache_mode` | `full` | rclone VFS 缓存模式；`full` 避免写回窗口内 rename-over 报 EIO（issue #9） |
-| `workspace.rclone_vfs_cache_max_size` | `2G` | VFS 本地缓存体积上限 |
+| `workspace.rclone_vfs_cache_max_size` | `2G` | VFS 本地缓存清理目标，不是单文件/云盘上限；打开或待回写文件可超过 |
 | `workspace.rclone_vfs_write_back` | `1s` | 文件关闭后回写 MinIO 的延迟 |
 | `workspace.rclone_dir_cache_time` | `2s` | 目录列表缓存时长（MinIO→容器可见延迟） |
 | `workspace.mount_ready_retries` / `mount_ready_interval` | `20` / `0.5` | 挂载就绪探测轮询次数与间隔（秒） |
 
 系统键声明在 `src/config.py` 的 `SYSTEM_KNOBS`，`tests/unit/test_system_config.py` 对账 yaml 不缺不多。
 机器差异（GPU 机 vs 开发机的镜像名 / 预热数）走分支或 PR，不走现场 env。
+
+容量口径：Hub 创建容器时没有设置 `mem_limit`、CPU、PID 或 `storage_opt` 硬配额；`shm_size=2g` 仅指定 `/dev/shm`，不限制工作盘大小。`rclone_vfs_cache_max_size=2G` 保留为缓存清理目标，打开及待回写文件不可安全驱逐，实际占用可暂时超出该值，详见 [rclone VFS 文档](https://rclone.org/commands/rclone_mount/#vfs-file-caching)。角色云盘的业务配额由上游管理，物理容量由 Docker 数据盘、multipart 暂存盘与 MinIO 决定。看到 ENOSPC/EDQUOT 时应定位对应存储或扩容，而不是把缓存设成无限。
+
+升级须同时更新 Hub 与容器镜像（app 版本 `2026.09.30-1`），新建容器才能获得分页、上传及活性接口；仅更新 Hub 时，旧镜像因活性未知会跳过闲置回收。既有后台任务不会通过本次代码修改迁移到新容器，升级时应让任务自然结束后再更换；本仓测试不执行生产容器回收。
 
 ---
 

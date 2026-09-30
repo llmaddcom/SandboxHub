@@ -61,7 +61,6 @@ async def forward(container_ip: str, path: str, request: Request) -> Response:
     - 过滤 hop-by-hop 请求头（host, content-length）
     - 原样返回容器响应（status / body / content-type）
     """
-    body = await request.body()
     req_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in _SKIP_REQ_HEADERS
@@ -72,7 +71,7 @@ async def forward(container_ip: str, path: str, request: Request) -> Response:
         resp = await client.request(
             method=request.method,
             url=f"/{path}",
-            content=body,
+            content=request.stream(),
             headers=req_headers,
             params=dict(request.query_params),
         )

@@ -10,9 +10,10 @@
 
 import asyncio
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
-from .base import CLIResult, ToolError, ToolResult
+from .base import CLIResult, ToolError, ToolResult, filesystem_error_detail
 from .matcher import STRATEGY_LABELS, MatchError, apply_spans, find_replacement_spans
 from .run import maybe_truncate, run
 
@@ -20,6 +21,15 @@ __all__ = ["EditTool", "MatchError"]
 
 # 编辑片段显示的上下文行数
 SNIPPET_LINES: int = 4
+
+
+@dataclass(kw_only=True, frozen=True)
+class FileViewResult(CLIResult):
+    path: str
+    next_offset: int | None = None
+    next_column: int = 0
+    truncated: bool = False
+    total_lines: int | None = None
 
 
 class EditTool:
@@ -38,7 +48,10 @@ class EditTool:
         """初始化文件编辑工具，创建空的历史记录。"""
         self._file_history = defaultdict(list)
 
-    async def view(self, path: str, view_range: list[int] | None = None) -> ToolResult:
+    async def view(
+        self, path: str, view_range: list[int] | None = None, *,
+        max_chars: int = 16000, column: int = 0,
+    ) -> ToolResult:
         """查看文件或目录内容。
 
         参数:
@@ -53,7 +66,7 @@ class EditTool:
         """
         _path = Path(path)
         self._validate_path("view", _path)
-        return await self._view(_path, view_range)
+        return await self._view(_path, view_range, max_chars=max_chars, column=column)
 
     async def write(self, path: str, file_text: str) -> ToolResult:
         """创建或覆盖文件（upsert 语义）。
@@ -187,7 +200,10 @@ class EditTool:
                     f"路径 {path} 是目录，只能使用 view 命令查看目录"
                 )
 
-    async def _view(self, path: Path, view_range: list[int] | None = None):
+    async def _view(
+        self, path: Path, view_range: list[int] | None = None, *,
+        max_chars: int = 16000, column: int = 0,
+    ):
         """查看文件或目录内容的内部实现。"""
         if await asyncio.to_thread(path.is_dir):
             if view_range:
@@ -200,34 +216,92 @@ class EditTool:
                 stdout = f"以下是 {path} 中深度不超过 2 层的文件和目录（不含隐藏项）:\n{stdout}\n"
             return CLIResult(output=stdout, error=stderr)
 
-        file_content = self._read_file(path)
-        init_line = 1
-        if view_range:
-            if len(view_range) != 2 or not all(isinstance(i, int) for i in view_range):
+        start, end = 1, -1
+        if view_range is not None:
+            if len(view_range) != 2 or not all(type(i) is int for i in view_range):
                 raise ToolError("view_range 无效，必须是包含两个整数的列表。")
-            file_lines = file_content.split("\n")
-            n_lines_file = len(file_lines)
-            init_line, final_line = view_range
-            if init_line < 1 or init_line > n_lines_file:
-                raise ToolError(
-                    f"view_range 无效: {view_range}。起始行 {init_line} 应在文件行数范围 [1, {n_lines_file}] 内"
-                )
-            if final_line > n_lines_file:
-                raise ToolError(
-                    f"view_range 无效: {view_range}。结束行 {final_line} 应不超过文件总行数 {n_lines_file}"
-                )
-            if final_line != -1 and final_line < init_line:
-                raise ToolError(
-                    f"view_range 无效: {view_range}。结束行 {final_line} 应大于等于起始行 {init_line}"
-                )
+            start, end = view_range
+        if start < 1 or (end != -1 and end < start) or column < 0 or max_chars < 1:
+            raise ToolError("读取范围无效：起始行至少为 1，列偏移非负，结束行为 -1 或不小于起始行。")
+        return await asyncio.to_thread(self._read_page, path, start, end, column, max_chars)
 
-            if final_line == -1:
-                file_content = "\n".join(file_lines[init_line - 1:])
-            else:
-                file_content = "\n".join(file_lines[init_line - 1: final_line])
+    def _read_page(self, path: Path, start: int, end: int, column: int, budget: int) -> FileViewResult:
+        # 保持原有 UTF-8 → GB18030 → 替换回退；读取和跳行都以有界片段进行，
+        # 不为文件总行数扫描剩余内容。total_lines 仅到 EOF 后可知。
+        for encoding, errors in (("utf-8", "strict"), ("gb18030", "strict"), ("utf-8", "replace")):
+            try:
+                with path.open("r", encoding=encoding, errors=errors) as stream:
+                    return self._read_page_stream(stream, path, start, end, column, budget)
+            except UnicodeDecodeError:
+                continue
+            except OSError as exc:
+                raise ToolError(f"读取 {path} 时遇到错误: {exc}") from exc
+        raise AssertionError("replacement decoder cannot fail")
 
-        return CLIResult(
-            output=self._make_output(file_content, str(path), init_line=init_line)
+    @staticmethod
+    def _read_page_stream(stream, path: Path, start: int, end: int, column: int, budget: int) -> FileViewResult:
+        line, col = 1, 0
+        fragments: list[str] = []
+        rendered_line: int | None = None
+        next_offset: int | None = None
+        next_column = 0
+        total_lines: int | None = None
+        remaining = budget
+        while True:
+            # readline(size) 同时限制超长单行与普通文本；不缓存跳过的行。
+            chunk = stream.readline(min(8192, max(1, remaining + 1)))
+            if not chunk:
+                total_lines = line if col else line - 1
+                if not fragments and (start > max(1, total_lines) or column > col):
+                    raise ToolError(f"读取起点超出文件末尾（共 {total_lines} 行）。")
+                break
+            ends_line = chunk.endswith("\n")
+            chunk_col = col
+            col += len(chunk)
+            if line < start or (line == start and col <= column):
+                if ends_line:
+                    if line == start and column >= col:
+                        raise ToolError("column 超出该行长度，请使用下一行 offset 并将 column 置 0。")
+                    line, col = line + 1, 0
+                continue
+            if end != -1 and line > end:
+                next_offset, next_column = line, chunk_col
+                break
+            if line == start and column > chunk_col:
+                chunk = chunk[column - chunk_col:]
+                chunk_col = column
+            # 行号/列说明也计入预算；预留一个字符保证每页都有进展。
+            prefix = "" if rendered_line == line else f"{line:6}\t"
+            if rendered_line != line and chunk_col:
+                prefix += f"[column={chunk_col}] "
+            if remaining <= len(prefix) and fragments:
+                next_offset, next_column = line, chunk_col
+                break
+            available = max(1, remaining - len(prefix))
+            shown = chunk[:available]
+            fragments.append(prefix + shown)
+            rendered_line = line
+            remaining -= len(prefix) + len(shown)
+            if len(shown) < len(chunk):
+                next_offset, next_column = line, chunk_col + len(shown)
+                break
+            if ends_line:
+                line, col = line + 1, 0
+            if remaining <= 0:
+                if stream.read(1):
+                    next_offset, next_column = line, col
+                else:
+                    total_lines = line if col else line - 1
+                break
+        content = "".join(fragments)
+        output = f"以下是 {path} 的内容（带行号）:\n{content}"
+        if next_offset is not None:
+            output += f"\n[部分内容；继续读取 {path}：offset={next_offset}, column={next_column}]"
+        else:
+            output += f"\n[已到文件末尾，共 {total_lines} 行]"
+        return FileViewResult(
+            output=output, path=str(path), next_offset=next_offset, next_column=next_column,
+            truncated=next_offset is not None, total_lines=total_lines,
         )
 
     def _str_replace(
@@ -354,6 +428,8 @@ class EditTool:
         """
         try:
             path.write_text(file)
+        except OSError as exc:
+            raise ToolError(filesystem_error_detail(path, exc)) from exc
         except Exception as e:
             raise ToolError(f"写入 {path} 时遇到错误: {e}") from None
 

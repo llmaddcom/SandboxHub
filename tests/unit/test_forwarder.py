@@ -98,3 +98,31 @@ async def test_unknown_error_returns_structured_502():
     body = json.loads(resp.body)
     assert body["reason"] == "proxy_error"
     assert '"quoted"' in body["error"]
+
+
+@pytest.mark.asyncio
+async def test_request_body_is_forwarded_as_stream_without_buffering():
+    from src.proxy.forwarder import forward
+
+    chunks = [b"first", b"second"]
+    req = _fake_request()
+    req.body.side_effect = AssertionError("must not buffer request.body")
+
+    async def stream():
+        for chunk in chunks:
+            yield chunk
+
+    req.stream = stream
+    sent = []
+
+    async def request(**kwargs):
+        async for chunk in kwargs["content"]:
+            sent.append(chunk)
+        return httpx.Response(200, json={"success": True})
+
+    client = AsyncMock()
+    client.request.side_effect = request
+    forwarder_module._client_pool["172.17.0.9"] = client
+    response = await forward("172.17.0.9", "api/file/upload", req)
+    assert response.status_code == 200 and sent == chunks
+    req.body.assert_not_called()

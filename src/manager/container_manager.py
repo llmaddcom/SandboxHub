@@ -125,6 +125,8 @@ class ContainerManager:
         # 最后合并、允许覆盖默认值；值可能含凭据，任何日志只记 key 不记 value。
         if extra_env:
             env.update(extra_env)
+        # 系统业务上限只能由 system.yaml 控制；0 明确表示不限制文件大小。
+        env["SANDBOX_FILE_UPLOAD_MAX_BYTES"] = str(max(0, settings.FILE_UPLOAD_MAX_BYTES))
         return env
 
     # ── Docker 操作（同步，供 to_thread 调用） ────────────────────────────────

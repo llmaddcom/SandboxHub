@@ -1,6 +1,11 @@
 """终端路由（/api/terminal/*）——job 契约 + 旧契约 + SSE，走真实 bash。"""
 
 import json
+import os
+import shlex
+import signal
+import time
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -8,11 +13,17 @@ from fastapi.testclient import TestClient
 
 from app.routers import terminal
 from app.tools.bash import BashTool
+from app.tools import bash as bash_mod
 
 
 @pytest.fixture
-def client(monkeypatch):
+def client(monkeypatch, tmp_path):
     monkeypatch.setattr(terminal, "bash_tool", BashTool())
+    # Tests run outside the root-owned container: expose only this test's
+    # processes, not unrelated host services whose /proc may be unreadable.
+    process_root = tmp_path / "proc"
+    process_root.mkdir()
+    monkeypatch.setattr(bash_mod, "PROC_ROOT", process_root)
     app = FastAPI()
     app.include_router(terminal.router)
     with TestClient(app) as c:
@@ -81,6 +92,69 @@ def test_execute_while_running_runs_in_parallel(client):
     assert resp.status_code == 200
     assert resp.json()["status"] == "exited" and resp.json()["output"] == "x\n"
     client.post("/api/terminal/kill", json={"job_id": running["job_id"], "signal": "KILL"})
+
+
+def test_activity_reports_background_jobs_and_then_empty(client):
+    empty = client.get("/api/terminal/activity")
+    assert empty.status_code == 200
+    assert empty.json() == {"running_jobs": 0, "live_panes": 0, "marked_processes": 0}
+    job = client.post("/api/terminal/execute", json={"command": "sleep 30", "wait": 0}).json()
+    busy = client.get("/api/terminal/activity").json()
+    assert busy["running_jobs"] == 1 and busy["live_panes"] == 1
+    client.post("/api/terminal/kill", json={"job_id": job["job_id"], "signal": "KILL"})
+    client.post("/api/terminal/wait", json={"job_id": job["job_id"], "wait": 5})
+    assert client.get("/api/terminal/activity").json() == {"running_jobs": 0, "live_panes": 0, "marked_processes": 0}
+
+
+@pytest.mark.parametrize("launcher", ["nohup", "setsid"])
+def test_detached_descendants_keep_activity_after_parent_exit_and_job_pruning(client, tmp_path, launcher):
+    pid_file = tmp_path / "child.pid"
+    # The sh leader exits; only its background child survives. Looking up a
+    # job PID/process-group leader or the pruned job registry cannot find it.
+    inner = f"sleep 30 & echo $! > {shlex.quote(str(pid_file))}"
+    command = f"{launcher} sh -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &"
+    child_pid = None
+    try:
+        result = client.post("/api/terminal/execute", json={"command": command, "wait": 5}).json()
+        assert result["status"] == "exited"
+        for _ in range(100):
+            if pid_file.exists() and pid_file.read_text().strip():
+                child_pid = int(pid_file.read_text())
+                break
+            time.sleep(0.02)
+        assert child_pid is not None
+        os.kill(child_pid, 0)
+        (bash_mod.PROC_ROOT / str(child_pid)).symlink_to(Path("/proc") / str(child_pid))
+        terminal.bash_tool.session.jobs.clear()
+        activity = client.get("/api/terminal/activity")
+        assert activity.status_code == 200
+        assert activity.json() == {"running_jobs": 0, "live_panes": 0, "marked_processes": 1}
+        os.kill(child_pid, signal.SIGKILL)
+        for _ in range(100):
+            if not (Path("/proc") / str(child_pid)).exists():
+                # A real /proc listing would no longer contain this PID.
+                (bash_mod.PROC_ROOT / str(child_pid)).unlink(missing_ok=True)
+            response = client.get("/api/terminal/activity")
+            if response.json().get("marked_processes") == 0:
+                break
+            time.sleep(0.02)
+        assert response.status_code == 200 and response.json()["marked_processes"] == 0
+    finally:
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_activity_does_not_treat_tmux_probe_errors_as_idle(client, monkeypatch):
+    from unittest.mock import AsyncMock
+    from app.tools.base import ToolError
+
+    monkeypatch.setattr(terminal.bash_tool.session.tmux, "run", AsyncMock(side_effect=ToolError("permission denied")))
+    response = client.get("/api/terminal/activity")
+    assert response.status_code == 503
+    assert "任务活性未知" in response.json()["detail"]
 
 
 def test_execute_session_field_names_tmux_session_and_isolates_state(client, tmp_path):
