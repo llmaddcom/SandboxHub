@@ -9,6 +9,25 @@
 """
 
 from dataclasses import dataclass, fields, replace
+import errno
+import os
+
+
+def filesystem_error_detail(path, exc: OSError) -> str:
+    """区分物理磁盘/配额耗尽与应用层文件大小限制。"""
+    if exc.errno not in (errno.ENOSPC, errno.EDQUOT):
+        return f"{path}: {exc}"
+    parent = os.path.dirname(str(path)) or "/"
+    try:
+        stat = os.statvfs(parent)
+        space = f"，挂载点可用 {stat.f_bavail * stat.f_frsize} 字节"
+    except OSError:
+        space = ""
+    return (
+        f"存储空间或文件系统配额不足：{path}{space}（errno={exc.errno}）。"
+        "请检查该路径所在磁盘、Docker 数据盘及 /tmp/rclone-mount.log；"
+        "这是底层存储限制，增大上传大小参数不会恢复空间。"
+    )
 
 
 @dataclass(kw_only=True, frozen=True)

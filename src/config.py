@@ -46,6 +46,7 @@ SYSTEM_KNOBS: tuple[SystemKnob, ...] = (
     SystemKnob("warm_pool.maintain_interval", "POOL_MAINTAIN_INTERVAL", "预热池补齐检查间隔（秒）"),
     SystemKnob("sandbox.api_port", "SANDBOX_API_PORT", "容器内沙盒 FastAPI 端口"),
     SystemKnob("sandbox.idle_ttl", "SANDBOX_IDLE_TTL", "已分配沙盒闲置回收阈值（秒，0=关闭）"),
+    SystemKnob("sandbox.file_upload_max_bytes", "FILE_UPLOAD_MAX_BYTES", "容器文件上传上限（字节，0=不限）"),
     SystemKnob("reconcile.interval", "RECONCILE_INTERVAL", "周期对账间隔（秒）"),
     SystemKnob("reconcile.orphan_grace_seconds", "ORPHAN_GRACE_SECONDS", "孤儿容器创建宽限（秒）"),
     SystemKnob("proxy.read_timeout", "PROXY_READ_TIMEOUT", "代理读超时（秒）"),
@@ -225,6 +226,7 @@ class Settings(BaseSettings):
     POOL_MAINTAIN_INTERVAL: int = 30
     SANDBOX_API_PORT: int = 8000
     SANDBOX_IDLE_TTL: int = 7200
+    FILE_UPLOAD_MAX_BYTES: int = 0
     RECONCILE_INTERVAL: int = 60
     ORPHAN_GRACE_SECONDS: int = 300
     PROXY_READ_TIMEOUT: float = 330.0
