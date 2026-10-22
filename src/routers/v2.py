@@ -6,8 +6,9 @@ v2 接口：按工作区分配执行实例（ADR 0025）
 - ``POST /v2/sandboxes/{id}/release``             释放实例（销毁容器，工作区保留）
 - ``PUT  /v2/sandboxes/{id}/inputs|context``      就地更新只读视图
 - ``GET  /v2/sandboxes/{id}/activity``            终端活性（不刷新活跃时间）
-- ``*    /v2/sandboxes/{id}/proxy/{path}``         透传到实例 API（注入每实例 token）
+- ``*    /v2/sandboxes/{id}/proxy/{path}``         透传到实例 API（注入每实例 token；终端任务注入来源）
 - ``GET  /v2/work-areas/{id}/usage|files|files/content``  经 cr-fs 读取，不依赖实例存活
+- ``GET  /v2/work-areas/{id}/jobs``               终端任务来源清单（session_id / turn_id / 起止时间）
 - ``POST /v2/work-areas/{id}/import``             tar 导入（迁移用）
 - ``DELETE /v2/work-areas/{id}``                  删除工作区
 - ``POST|GET|DELETE /v2/admin/drain``             切换窗口：排空 / 查询 / 解除 v1
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -29,6 +31,7 @@ from starlette.background import BackgroundTask
 from src.config import settings
 from src.manager.fs_sidecar import FsOpError
 from src.manager.wa_instances import CWD, LAYOUT_VERSION, AcquireSpec, WorkAreaError, WorkAreaService
+from src.manager.wa_jobs import TERMINAL_START_PATHS, iso_utc
 from src.models import InputFileSpec, RoleMountSpec
 from src.proxy.forwarder import forward
 from src.routers import sandboxes as v1
@@ -289,6 +292,16 @@ async def proxy(sandbox_id: str, path: str, request: Request) -> Response:
         return _error(exc)
     service.registry.touch(sandbox_id)
     info = instance.container_info
+    if request.method == "POST" and path.strip("/") in TERMINAL_START_PATHS:
+        # 终端任务（含随后转入后台的）按请求时实例当前的会话与回合打标
+        async with service.terminal_start(instance):
+            return await forward(
+                info.container_ip,
+                path,
+                request,
+                api_token=instance.api_token,
+                extra_headers=service.origin_header(instance),
+            )
     return await forward(info.container_ip, path, request, api_token=instance.api_token)
 
 
@@ -311,12 +324,25 @@ async def list_files(
     root: Literal["work", "deliverables"] = "deliverables",
     max_files: Optional[int] = Query(default=None, ge=1),
 ):
+    """``observed_at``：开始列举前取的 Hub 时钟，与 ``/jobs`` 的时间同源可比。"""
+    observed_at = iso_utc(time.time())
     try:
-        return await _svc().work_areas.list_files(work_area_id, root, max_files)
+        result = await _svc().work_areas.list_files(work_area_id, root, max_files)
     except ValueError as exc:
         raise HTTPException(400, detail={"reason": "invalid_request", "message": str(exc)})
     except FsOpError as exc:
         return _fs_error(exc)
+    return {**result, "observed_at": observed_at}
+
+
+@router.get("/work-areas/{work_area_id}/jobs", dependencies=_auth)
+async def list_jobs(work_area_id: str):
+    """工作区终端任务来源。``ended_at=null`` = 仍在运行或结束时间未知（按运行到 ``now``）；
+    Hub 无法保证清单完整时 ``known=false``。"""
+    try:
+        return await _svc().job_report(work_area_id)
+    except WorkAreaError as exc:
+        return _error(exc)
 
 
 @router.get("/work-areas/{work_area_id}/files/content", dependencies=_auth)

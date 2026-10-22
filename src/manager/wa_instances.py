@@ -17,6 +17,7 @@ Hub 重启后从容器标签与 env 恢复在册记录与挂载引用。
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import secrets
@@ -37,6 +38,7 @@ from src.manager.fs_sidecar import FsSidecar, RoleMounts
 from src.manager.inputs_cache import InputsCache, InputsError, validate_inputs
 from src.manager.netguard import NetGuard, SelfTest
 from src.manager.paths import valid_id, valid_mount_name, valid_prefix
+from src.manager.wa_jobs import JOB_ORIGIN_HEADER, JobLedger, iso_utc, parse_report
 from src.manager.wa_registry import LimitExceeded, WorkAreaRegistry
 from src.manager.work_areas import InstanceDirs, WorkAreas
 from src.models import (
@@ -58,6 +60,8 @@ from src.proxy.forwarder import SANDBOX_TOKEN_HEADER, close_client
 
 LAYOUT_VERSION = 1
 CWD = "/workspace/work"
+# 这些原因下实例 API 已不可达，销毁前不再做最后一次任务观测（徒增超时）
+_UNREACHABLE_REASONS = frozenset({"container_gone", "unhealthy", "create_failed"})
 
 
 class WorkAreaError(Exception):
@@ -138,6 +142,9 @@ class WorkAreaService:
         self.inputs = inputs or InputsCache(sidecar.root)
         self.netguard = NetGuard(sidecar, manager)
         self.selftest = SelfTest(sidecar, self.netguard, manager)
+        self.jobs = JobLedger(sidecar.host_path("job-ledger"))
+        # 正在销毁的实例（sandbox_id → work_area_id）：任务尚未结算，/jobs 期间按来源未知
+        self._discarding: dict[str, str] = {}
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._deleting: set[str] = set()
         self._last_selftest = 0.0
@@ -240,6 +247,9 @@ class WorkAreaService:
                 sandbox_id = c.labels.get(SANDBOX_ID_LABEL, "")
                 if valid_id(sandbox_id):
                     self.dirs.remove(sandbox_id)
+                    work_area_id = c.labels.get(WORK_AREA_LABEL, "")
+                    if valid_id(work_area_id):
+                        self.jobs.settle_sandbox(work_area_id, sandbox_id, time.time())
                 continue
             self.mounts.restore(instance.mounts)
             instance.mounts_held = True
@@ -707,9 +717,13 @@ class WorkAreaService:
         async with self._locks[instance.work_area_id]:
             current = self.get(sandbox_id, include_quiesced=True)
             if current.container_info is not None:
+                if current.status == "ready":
+                    await self.activity(current)  # 停止前最后一次任务观测
                 await self._manager.stop_wa_container(
                     current.container_info.container_id
                 )
+                # 进程已全部停止：仍未结束的任务最迟在此刻结束
+                self.jobs.settle_sandbox(current.work_area_id, sandbox_id, time.time())
                 # 归档失败后停止实例仍在登记；下一次申请必须重建，不能报告复用成功。
                 current.status = "quiesced"
 
@@ -747,19 +761,28 @@ class WorkAreaService:
         self.registry.touch(sandbox_id)
         return written
 
+    async def _probe_terminal(self, instance: WorkAreaInstance) -> dict:
+        info = instance.container_info
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            response = await client.get(
+                f"http://{info.container_ip}:{settings.SANDBOX_API_PORT}/api/terminal/activity",
+                headers={SANDBOX_TOKEN_HEADER: instance.api_token},
+            )
+            response.raise_for_status()
+            return response.json()
+
     async def activity(self, instance: WorkAreaInstance) -> dict:
-        """容器内终端活性；不刷新 last_active_at（否则兜底 TTL 永远不触发）。"""
+        """容器内终端活性；不刷新 last_active_at（否则兜底 TTL 永远不触发）。
+
+        同时是一次任务观测：容器回报的任务清单并入工作区任务台账，``jobs_known`` 表示
+        本次观测是否拿到了完整清单（旧镜像不回报清单时为 False）。
+        """
         info = instance.container_info
         if info is None:
-            return {"known": False, "idle": False, "error": "instance starting"}
+            return {"known": False, "idle": False, "jobs_known": False, "error": "instance starting"}
+        token = self.jobs.observation_token(instance.sandbox_id)
         try:
-            async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-                response = await client.get(
-                    f"http://{info.container_ip}:{settings.SANDBOX_API_PORT}/api/terminal/activity",
-                    headers={SANDBOX_TOKEN_HEADER: instance.api_token},
-                )
-                response.raise_for_status()
-                data = response.json()
+            data = await self._probe_terminal(instance)
             counts = [
                 data.get("running_jobs"),
                 data.get("live_panes"),
@@ -767,16 +790,64 @@ class WorkAreaService:
             ]
             if any(type(v) is not int or v < 0 for v in counts):
                 raise ValueError("invalid activity counters")
-            return {
-                "known": True,
-                "idle": all(v == 0 for v in counts),
-                "running_jobs": counts[0],
-                "live_panes": counts[1],
-                "marked_processes": counts[2],
-                "last_active_at": instance.last_active_at.isoformat(),
-            }
         except Exception as exc:
-            return {"known": False, "idle": False, "error": str(exc)}
+            return {"known": False, "idle": False, "jobs_known": False, "error": str(exc)}
+        try:
+            report = parse_report(data)
+        except ValueError as exc:
+            logger.warning(f"实例任务清单无效 | id={instance.sandbox_id} | err={exc}")
+            report = None
+        if report is not None:
+            self.jobs.merge(instance.work_area_id, instance.sandbox_id, report, time.time(), token)
+        return {
+            "known": True,
+            "idle": all(v == 0 for v in counts),
+            "running_jobs": counts[0],
+            "live_panes": counts[1],
+            "marked_processes": counts[2],
+            "last_active_at": instance.last_active_at.isoformat(),
+            "jobs_known": report is not None,
+        }
+
+    def origin_header(self, instance: WorkAreaInstance) -> dict[str, str]:
+        """经 proxy 启动终端任务时交给容器的来源（请求时实例当前的会话与回合）。"""
+        value = json.dumps(
+            {"session_id": instance.session_id, "turn_id": instance.turn_id},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        return {JOB_ORIGIN_HEADER: value}
+
+    @contextlib.asynccontextmanager
+    async def terminal_start(self, instance: WorkAreaInstance):
+        """包住一次经 proxy 的终端任务启动请求：请求开始前落盘「有未观测启动」。"""
+        self.jobs.start_begin(instance.work_area_id, instance.sandbox_id, time.time())
+        try:
+            yield
+        finally:
+            self.jobs.start_end(instance.sandbox_id)
+
+    async def job_report(self, work_area_id: str) -> dict:
+        """``GET /v2/work-areas/{id}/jobs``：工作区任务来源清单（契约见 createrole_com_api#38 C.2）。"""
+        if not valid_id(work_area_id):
+            raise WorkAreaError(400, "invalid_request", f"work_area_id 非法：{work_area_id!r}")
+        instance = self.registry.find_by_work_area(work_area_id)
+        if (
+            instance is None
+            and not self.work_areas.exists(work_area_id)
+            and not self.jobs.exists(work_area_id)
+        ):
+            raise WorkAreaError(404, "work_area_not_found", f"工作区 {work_area_id!r} 不存在")
+        live = {s for s, wa in self._discarding.items() if wa == work_area_id}
+        observed = not live  # 正在销毁：任务尚未结算
+        if instance is not None:
+            live.add(instance.sandbox_id)
+            if instance.status == "ready":
+                report = await self.activity(instance)
+                observed = observed and report.get("jobs_known") is True
+        now = time.time()
+        jobs, complete = self.jobs.snapshot(work_area_id, live, now)
+        return {"known": observed and complete, "now": iso_utc(now), "jobs": jobs}
 
     async def delete_work_area(self, work_area_id: str, *, force: bool = False) -> dict:
         if not valid_id(work_area_id):
@@ -798,7 +869,9 @@ class WorkAreaService:
                             holders=[instance.holder()],
                         )
                     await self._discard(instance, "work_area_deleted")
-                return await self.work_areas.remove(work_area_id)
+                result = await self.work_areas.remove(work_area_id)
+                self.jobs.remove(work_area_id)
+                return result
         finally:
             self._deleting.discard(work_area_id)
 
@@ -806,15 +879,25 @@ class WorkAreaService:
         return work_area_id in self._deleting
 
     async def _discard(self, instance: WorkAreaInstance, reason: str) -> None:
-        """摘册 + 销毁容器 + 释放挂载引用 + 删实例目录（工作区不动）。"""
-        await self.registry.remove(instance.sandbox_id)
-        info = instance.container_info
-        if info is not None:
-            try:
-                await close_client(info.container_ip)
-            except Exception:
-                pass
-            await self._manager.remove_container(info.container_id)
+        """摘册 + 销毁容器 + 释放挂载引用 + 删实例目录（工作区不动）。
+
+        销毁前尽力做最后一次任务观测；销毁后仍未结束的任务按销毁时刻结束。
+        """
+        self._discarding[instance.sandbox_id] = instance.work_area_id
+        try:
+            await self.registry.remove(instance.sandbox_id)
+            info = instance.container_info
+            if info is not None:
+                if instance.status == "ready" and reason not in _UNREACHABLE_REASONS:
+                    await self.activity(instance)
+                try:
+                    await close_client(info.container_ip)
+                except Exception:
+                    pass
+                await self._manager.remove_container(info.container_id)
+            self.jobs.settle_sandbox(instance.work_area_id, instance.sandbox_id, time.time())
+        finally:
+            self._discarding.pop(instance.sandbox_id, None)
         if instance.mounts_held:
             instance.mounts_held = False
             await self.mounts.release(instance.mount_keys)
@@ -866,6 +949,11 @@ class WorkAreaService:
             ttl = settings.WORK_AREA_IDLE_BACKSTOP_TTL
             if ttl > 0 and (now - instance.last_active_at).total_seconds() > ttl:
                 await self._discard(instance, "idle_backstop_ttl")
+            elif self.jobs.needs_observation(
+                instance.work_area_id, instance.sandbox_id, time.time()
+            ):
+                # 有未观测的启动或未结束的任务：周期观测，缩小实例意外消失时的来源空白
+                await self.activity(instance)
         tracked = self.registry.tracked_container_ids()
         starting = {
             r.sandbox_id for r in self.registry.list_all() if r.status == "starting"

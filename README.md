@@ -249,6 +249,10 @@ its child processes, so `/proc` activity also protects `nohup`, background `&`, 
 is excluded from saved session environment; zombies do not count. Idle reclaim
 requires all three counters to be zero. Unreadable process activity, missing fields,
 and unavailable or old container APIs are preserved rather than assumed idle.
+The same response carries the job-origin ledger used by v2 `GET /v2/work-areas/{id}/jobs`:
+`jobs` (`job_id`, `session_id`, `turn_id`, `started_at`, `ended_at` as epoch seconds) and
+`unattributed_live` (live marked jobs without an origin record). A job ends once its
+window has exited and no marked descendant remains (tracked about once per second).
 
 `POST /api/file/view` accepts `max_chars` (default 16000) and `column` (default 0),
 and returns `path`, `next_offset`, `next_column`, `truncated`, and `total_lines`
@@ -553,7 +557,8 @@ rejects allocation without falling back to v1.
 | `/v2/sandboxes/{id}/proxy/{path}` | Forward tool requests with the instance's API token |
 | `POST /v2/sandboxes/policy/apply` | Broadcast effective network policy to registered v2 instances |
 | `GET /v2/work-areas/{id}/usage` | Usage plus soft cap and `over_soft_cap` |
-| `GET /v2/work-areas/{id}/files?root=deliverables` | Bounded listing, reporting truncated or skipped entries |
+| `GET /v2/work-areas/{id}/files?root=deliverables` | Bounded listing, reporting truncated or skipped entries; `observed_at` is the Hub clock taken before listing |
+| `GET /v2/work-areas/{id}/jobs` | Origin `(session_id, turn_id)` and start/end time of terminal jobs; `known=false` when completeness cannot be guaranteed |
 | `GET /v2/work-areas/{id}/files/content?root=deliverables&path=...` | Host snapshot, refusing symlinks and path escape |
 | `POST /v2/work-areas/{id}/files/checksums?root=work` | SHA-256 and stability for 1–128 paths (`{"paths": [...]}`); missing files reported individually, symlinks refused |
 | `POST /v2/work-areas/{id}/import?root=work` | Safe tar import for migration |
@@ -571,6 +576,32 @@ The host persists the latest session and turn that acquired each instance in
 `origin.json`, outside tenant mounts, and restores it after restart. Missing,
 invalid or mismatched origin data yields an unknown source; archive callers
 retain the user asset without guessing which conversation produced it.
+
+Terminal jobs started through the proxy (`api/terminal/execute`, `execute/stream`,
+including jobs that later continue in the background) are tagged with the instance's
+current session and turn at request time. The Hub passes them in the trusted
+`X-Sandbox-Job-Origin` header (callers' copies are dropped); the container stores the
+origin with the job and reports it through terminal activity. Every activity query
+(platform idle checks, `/jobs`, reconcile for instances with unobserved starts or open
+jobs, and a final probe before quiesce/release) merges the report into
+`WORK_AREA_ROOT/job-ledger/<work_area_id>.json`, so records survive instance rebuilds
+and Hub restarts. `GET /v2/work-areas/{id}/jobs` returns:
+
+```json
+{"known": true, "now": "2026-10-22T08:00:00.123456Z",
+ "jobs": [{"job_id": "j_…", "session_id": "…", "turn_id": "…",
+           "started_at": "2026-10-22T07:59:00.000000Z", "ended_at": null}]}
+```
+
+All times are ISO-8601 UTC with `Z` on the host clock (containers share the host
+kernel's real-time clock). `ended_at` is an upper bound; `null` means still running.
+Jobs still open when their instance is stopped or removed end at that moment.
+`known=false` when the live instance cannot be probed or runs an image without the
+ledger, a live job has no origin, an instance vanished after terminal starts that were
+never observed, or the ledger file is unreadable; the last three keep the ledger
+unknown until they age past `job_max_lifetime` (one day when 0). Ended records are
+removed after the same period. A missing work area returns
+`404 {"detail": {"reason": "work_area_not_found", ...}}`.
 
 Resource settings belong to `config/system.yaml`, under `work_area`:
 

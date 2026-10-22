@@ -128,7 +128,7 @@ async def test_proxy_injects_instance_token(client, service, with_key, monkeypat
     service.get.return_value = _instance()
     captured = {}
 
-    async def fake_forward(ip, path, request, api_token=""):
+    async def fake_forward(ip, path, request, api_token="", extra_headers=None):
         captured.update(ip=ip, path=path, token=api_token, hub_key=request.headers.get("x-api-key"))
         from fastapi.responses import JSONResponse
 

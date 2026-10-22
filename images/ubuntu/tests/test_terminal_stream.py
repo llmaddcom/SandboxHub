@@ -94,16 +94,26 @@ def test_execute_while_running_runs_in_parallel(client):
     client.post("/api/terminal/kill", json={"job_id": running["job_id"], "signal": "KILL"})
 
 
+COUNTERS = ("running_jobs", "live_panes", "marked_processes")
+
+
+def _counters(body: dict) -> dict:
+    return {k: body[k] for k in COUNTERS}
+
+
 def test_activity_reports_background_jobs_and_then_empty(client):
     empty = client.get("/api/terminal/activity")
     assert empty.status_code == 200
-    assert empty.json() == {"running_jobs": 0, "live_panes": 0, "marked_processes": 0}
+    assert _counters(empty.json()) == {"running_jobs": 0, "live_panes": 0, "marked_processes": 0}
+    assert empty.json()["jobs"] == [] and empty.json()["unattributed_live"] == []
     job = client.post("/api/terminal/execute", json={"command": "sleep 30", "wait": 0}).json()
     busy = client.get("/api/terminal/activity").json()
     assert busy["running_jobs"] == 1 and busy["live_panes"] == 1
     client.post("/api/terminal/kill", json={"job_id": job["job_id"], "signal": "KILL"})
     client.post("/api/terminal/wait", json={"job_id": job["job_id"], "wait": 5})
-    assert client.get("/api/terminal/activity").json() == {"running_jobs": 0, "live_panes": 0, "marked_processes": 0}
+    assert _counters(client.get("/api/terminal/activity").json()) == {
+        "running_jobs": 0, "live_panes": 0, "marked_processes": 0,
+    }
 
 
 @pytest.mark.parametrize("launcher", ["nohup", "setsid"])
@@ -128,7 +138,7 @@ def test_detached_descendants_keep_activity_after_parent_exit_and_job_pruning(cl
         terminal.bash_tool.session.jobs.clear()
         activity = client.get("/api/terminal/activity")
         assert activity.status_code == 200
-        assert activity.json() == {"running_jobs": 0, "live_panes": 0, "marked_processes": 1}
+        assert _counters(activity.json()) == {"running_jobs": 0, "live_panes": 0, "marked_processes": 1}
         os.kill(child_pid, signal.SIGKILL)
         for _ in range(100):
             if not (Path("/proc") / str(child_pid)).exists():
