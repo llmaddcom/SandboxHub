@@ -38,6 +38,9 @@ from .base import CLIResult, ToolError, ToolResult
 DEFAULT_WAIT = 30.0
 MAX_WAIT = 120.0
 KILL_GRACE = 5.0          # timeout 到期：SIGINT → 等这么久 → SIGKILL
+# 单个 job 最长存活（秒，0 = 不限）：SandboxHub v2 注入，到期按 kill_reason=max_lifetime 终止，
+# 与调用方 timeout 互不替代（timeout 是单条命令的预期，max_lifetime 是平台兜底）。
+MAX_JOB_LIFETIME = float(os.getenv("SANDBOX_JOB_MAX_LIFETIME") or 0)
 JOB_DIR = Path(os.getenv("CR_JOB_DIR", "/tmp/cr-jobs"))
 MAX_JOB_RECORDS = 200     # 内存保留的 job 记录数（日志文件不删）
 
@@ -221,7 +224,7 @@ class Job:
     pane_id: str = ""
     status: str = STATUS_RUNNING
     exit_code: int | None = None
-    kill_reason: str | None = None      # "timeout" | "kill:INT" | "restart" | "evicted" | "window_closed"
+    kill_reason: str | None = None      # "timeout" | "max_lifetime" | "kill:INT" | "restart" | "evicted" | "window_closed"
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     dead_ticks: int = 0
@@ -387,7 +390,9 @@ class JobSession:
 
     def __init__(self, cwd: str | None = None, env: dict[str, str] | None = None,
                  tmux: Tmux | None = None):
-        self._initial_cwd = cwd or os.getcwd()
+        # SANDBOX_CWD：v2 实例的工作目录（/workspace/work）；不存在时退回进程 cwd。
+        preset = os.getenv("SANDBOX_CWD", "")
+        self._initial_cwd = cwd or (preset if preset and os.path.isdir(preset) else os.getcwd())
         self._initial_env = {
             k: v for k, v in (env if env is not None else os.environ).items()
             if k not in _ENV_SKIP and _ENV_NAME_RE.match(k)
@@ -539,6 +544,12 @@ class JobSession:
                     self._settle(job, rc, job.kill_reason)
                 elif job.timeout is not None and now - job.started_at >= job.timeout:
                     asyncio.get_running_loop().create_task(self._terminate(job, "timeout"))
+                elif (
+                    MAX_JOB_LIFETIME > 0
+                    and job.kill_reason is None
+                    and now - job.started_at >= MAX_JOB_LIFETIME
+                ):
+                    asyncio.get_running_loop().create_task(self._terminate(job, "max_lifetime"))
 
     def _settle(self, job: Job, exit_code: int | None, kill_reason: str | None) -> None:
         job.exit_code = exit_code

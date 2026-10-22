@@ -87,7 +87,10 @@ class JobResponse(BaseModel):
     log_path: str = Field(description="全量输出日志路径，可在容器内 tail / grep")
     kill_reason: str | None = Field(
         default=None,
-        description="被终止原因：timeout | kill:INT | kill:KILL | restart | evicted | window_closed",
+        description=(
+            "被终止原因：timeout | max_lifetime（超过平台最长存活时间）| kill:INT | kill:KILL "
+            "| restart | evicted | window_closed"
+        ),
     )
 
 

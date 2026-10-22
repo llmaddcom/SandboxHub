@@ -12,11 +12,12 @@ SandboxHub 配置（issue #28，对齐 createrole#400「三个家」口径）
 """
 from __future__ import annotations
 
-import os
+import ipaddress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 from loguru import logger
@@ -58,6 +59,22 @@ SYSTEM_KNOBS: tuple[SystemKnob, ...] = (
     SystemKnob("workspace.rclone_dir_cache_time", "RCLONE_DIR_CACHE_TIME", "目录列表缓存时长"),
     SystemKnob("workspace.mount_ready_retries", "MOUNT_READY_RETRIES", "挂载就绪探测轮询次数"),
     SystemKnob("workspace.mount_ready_interval", "MOUNT_READY_INTERVAL", "挂载就绪探测间隔（秒）"),
+    SystemKnob("gateway.minio_forward", "GATEWAY_MINIO_FORWARD", "v1 网关是否自动转发 MinIO（v2 网关从不转发）"),
+    SystemKnob("work_area.enabled", "WORK_AREA_ENABLED", "v2 按工作区分配执行实例的总开关"),
+    SystemKnob("work_area.image_code", "DOCKER_IMAGE_CODE_V2", "v2 code 实例镜像（须带 sandboxhub.api_auth=1）"),
+    SystemKnob("work_area.image_ubuntu", "DOCKER_IMAGE_UBUNTU_V2", "v2 desktop 实例镜像（须带 sandboxhub.api_auth=1）"),
+    SystemKnob("work_area.image_fs", "DOCKER_IMAGE_FS", "cr-fs 特权 sidecar 镜像"),
+    SystemKnob("work_area.max_per_role", "WORK_AREA_MAX_PER_ROLE", "每个数字人同时存活的实例上限"),
+    SystemKnob("work_area.max_per_user", "WORK_AREA_MAX_PER_USER", "每个用户同时存活的实例上限"),
+    SystemKnob("work_area.job_max_lifetime", "WORK_AREA_JOB_MAX_LIFETIME", "实例内单个后台 job 最长存活（秒，0=不限）"),
+    SystemKnob("work_area.idle_backstop_ttl", "WORK_AREA_IDLE_BACKSTOP_TTL", "Hub 兜底回收：无 API 往来超过此时长删实例（秒，0=关闭）"),
+    SystemKnob("work_area.idle_release_seconds", "WORK_AREA_IDLE_RELEASE_SECONDS", "平台侧空闲回收：回合结束且无后台 job 后空闲多久释放实例（秒，经 capabilities 下发给平台）"),
+    SystemKnob("work_area.soft_cap_bytes", "WORK_AREA_SOFT_CAP_BYTES", "工作区软上限（字节，平台在写类工具执行前检查，0=不限）"),
+    SystemKnob("work_area.selftest_interval", "WORK_AREA_SELFTEST_INTERVAL", "隔离自检周期（秒）"),
+    SystemKnob("work_area.inputs_cache_max_bytes", "INPUTS_CACHE_MAX_BYTES", "inputs blob 缓存总量上限（字节，0=不限）"),
+    SystemKnob("work_area.unmount_grace_seconds", "ROLE_MOUNT_UNMOUNT_GRACE", "角色目录挂载引用归零后延迟卸载（秒）"),
+    SystemKnob("work_area.list_max_files", "WORK_AREA_LIST_MAX_FILES", "工作区文件列表单次最多条目"),
+    SystemKnob("work_area.usage_cache_seconds", "WORK_AREA_USAGE_CACHE_SECONDS", "工作区用量统计缓存（秒）"),
 )
 SYSTEM_FIELDS: frozenset[str] = frozenset(k.field for k in SYSTEM_KNOBS)
 # 退役的 ENV：与系统键同名的旧覆盖口。启动期发现即告警并忽略（一个版本后删清单）。
@@ -171,10 +188,14 @@ class _WithoutSystemKeys(PydanticBaseSettingsSource):
 class Settings(BaseSettings):
     # ── 部署接入（.env）：本机 ───────────────────────────────────────────────
     SANDBOX_HUB_PORT: int = 8088
-    # 监听地址：默认 0.0.0.0。私有化部署建议收紧为 127.0.0.1 或指定内网 IP。
-    SANDBOX_HUB_HOST: str = "0.0.0.0"
+    # 监听地址：默认只绑本机回环。v2 要求回环 + API key，否则 /v2/capabilities 判不安全。
+    SANDBOX_HUB_HOST: str = "127.0.0.1"
     # 受管容器标签（同机多实例隔离用，属本机属性）
     CONTAINER_LABEL: str = "sandboxhub.managed"
+    # v2 宿主数据根：工作区、实例 inputs/context、blob 缓存、角色目录挂载点都在其下。
+    # 空 = 仓库下 var/sandboxhub。所在文件系统须是 shared 挂载传播（findmnt -o PROPAGATION），
+    # cr-fs 里的 rclone 挂载才能传播到宿主再 bind 给实例。
+    WORK_AREA_ROOT: str = ""
 
     # ── 部署接入（.env）：网络 ───────────────────────────────────────────────
     # 容器所在 Docker 网络（联网态）。须是用户自定义 bridge 网络（Hub 启动时幂等创建）：
@@ -202,6 +223,12 @@ class Settings(BaseSettings):
     # 8.8.8.8/1.1.1.1（会顶掉 --dns 注入）。SANDBOX_DNS 非空时自动向容器注入
     # SANDBOX_KEEP_DNS=1 跳过覆写；此开关允许在不配 SANDBOX_DNS 时也强制保留。
     SANDBOX_KEEP_DNS: bool = False
+    # v2 隔离（netguard）：实例默认连不上宿主任何端口、其他沙盒和私网地址，只能经网关。
+    # 逗号分隔的宿主端口白名单（实例可直连宿主的端口，如宿主上的 HTTP 代理端口）。
+    # SANDBOX_HTTP_PROXY 指向 host.docker.internal 时其端口自动加入。
+    NETGUARD_HOST_ALLOW_PORTS: str = ""
+    # 逗号分隔的私网 CIDR 白名单（默认私网 / CGNAT / 链路本地全部拦截）。
+    NETGUARD_EGRESS_ALLOW_CIDRS: str = ""
 
     # ── 部署接入（.env）：对象存储连接 ───────────────────────────────────────
     # rclone S3 remote 指向的 MinIO 连接信息（留空=不具备挂载能力，acquire 里的
@@ -238,6 +265,22 @@ class Settings(BaseSettings):
     RCLONE_DIR_CACHE_TIME: str = "2s"
     MOUNT_READY_RETRIES: int = 20
     MOUNT_READY_INTERVAL: float = 0.5
+    GATEWAY_MINIO_FORWARD: bool = True
+    WORK_AREA_ENABLED: bool = True
+    DOCKER_IMAGE_CODE_V2: str = "sandbox-code:2026.10.04-1"
+    DOCKER_IMAGE_UBUNTU_V2: str = "sandbox-ubuntu:2026.10.04-1"
+    DOCKER_IMAGE_FS: str = "sandbox-fs:2026.10.06-1"
+    WORK_AREA_MAX_PER_ROLE: int = 2
+    WORK_AREA_MAX_PER_USER: int = 4
+    WORK_AREA_JOB_MAX_LIFETIME: int = 21600
+    WORK_AREA_IDLE_BACKSTOP_TTL: int = 86400
+    WORK_AREA_IDLE_RELEASE_SECONDS: int = 900
+    WORK_AREA_SOFT_CAP_BYTES: int = 10 * 1024**3
+    WORK_AREA_SELFTEST_INTERVAL: int = 600
+    INPUTS_CACHE_MAX_BYTES: int = 20 * 1024**3
+    ROLE_MOUNT_UNMOUNT_GRACE: int = 60
+    WORK_AREA_LIST_MAX_FILES: int = 5000
+    WORK_AREA_USAGE_CACHE_SECONDS: int = 15
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
@@ -283,14 +326,18 @@ class Settings(BaseSettings):
         """策略 → 容器应在的 Docker 网络：deny=隔离网，其余=联网态网络。"""
         return self.SANDBOX_NETWORK_ISOLATED if mode == "deny" else self.SANDBOX_NETWORK
 
-    def gateway_forwards(self) -> list[tuple[int, str]]:
+    def gateway_forwards(self, *, include_minio: bool | None = None) -> list[tuple[int, str]]:
         """网关容器的端口转发表 ``[(listen_port, "upstream_host:port")]``。
 
         MinIO 转发按 ``MINIO_ENDPOINT`` 自动加入（监听端口 = MinIO 端口，上游 = MINIO_ENDPOINT
-        原值，宿主可达地址）；其余来自 ``SANDBOX_GATEWAY_FORWARDS``。坏条目告警并跳过。
+        原值，宿主可达地址），受 ``gateway.minio_forward`` 控制；v2 网关传 ``include_minio=False``
+        （实例不持有存储凭据，也不该能连到 MinIO）。其余来自 ``SANDBOX_GATEWAY_FORWARDS``。
+        坏条目告警并跳过。
         """
+        if include_minio is None:
+            include_minio = self.GATEWAY_MINIO_FORWARD and not self.files_cutover_active
         forwards: dict[int, str] = {}
-        if self.MINIO_ENDPOINT:
+        if self.MINIO_ENDPOINT and include_minio:
             forwards[_endpoint_port(self.MINIO_ENDPOINT)] = self.MINIO_ENDPOINT
         for raw in self.SANDBOX_GATEWAY_FORWARDS.split(","):
             raw = raw.strip()
@@ -305,7 +352,16 @@ class Settings(BaseSettings):
                 logger.warning("SANDBOX_GATEWAY_FORWARDS 条目非法，跳过：{!r}（期望 listen=host:port）", raw)
                 continue
             forwards[port] = upstream.strip()
+        if not include_minio and self.MINIO_ENDPOINT:
+            storage_port = _endpoint_port(self.MINIO_ENDPOINT)
+            forwards = {port: upstream for port, upstream in forwards.items()
+                        if port != storage_port and upstream != self.MINIO_ENDPOINT}
         return sorted(forwards.items())
+
+    @property
+    def files_cutover_active(self) -> bool:
+        """管理 API 持久化的切换状态；Hub 重启也不恢复 v1 或 MinIO 转发。"""
+        return (Path(self.WORK_AREA_ROOT) / '.files-cutover.json').is_file()
 
     def minio_endpoint_for_container(self) -> str:
         """容器内访问 MinIO 的地址：网络策略可用时经网关主机名（两张网都通），否则原值。"""
@@ -337,21 +393,92 @@ class Settings(BaseSettings):
             and self.MINIO_SECRET_KEY
         )
 
-    def minio_rclone_env(self) -> dict[str, str]:
-        """供容器内 rclone 用的 S3(MinIO) remote 配置（经 RCLONE_CONFIG_* 环境变量内联，
-        无需落 rclone.conf）。remote 名固定为 ``minio``。"""
+    def minio_rclone_env(self, *, from_host: bool = False) -> dict[str, str]:
+        """供 rclone 用的 S3(MinIO) remote 配置（经 RCLONE_CONFIG_* 环境变量内联，
+        无需落 rclone.conf）。remote 名固定为 ``minio``。
+
+        ``from_host=True``：给 host 网络的 cr-fs 用，直接用 MINIO_ENDPOINT 原值（宿主可达地址）；
+        否则给 v1 容器内 rclone 用，经网关主机名访问。"""
         scheme = "https" if self.MINIO_SECURE else "http"
+        endpoint = self.MINIO_ENDPOINT if from_host else self.minio_endpoint_for_container()
         return {
             "RCLONE_CONFIG_MINIO_TYPE": "s3",
             "RCLONE_CONFIG_MINIO_PROVIDER": "Minio",
             "RCLONE_CONFIG_MINIO_ENV_AUTH": "false",
             "RCLONE_CONFIG_MINIO_ACCESS_KEY_ID": self.MINIO_ACCESS_KEY,
             "RCLONE_CONFIG_MINIO_SECRET_ACCESS_KEY": self.MINIO_SECRET_KEY,
-            "RCLONE_CONFIG_MINIO_ENDPOINT": f"{scheme}://{self.minio_endpoint_for_container()}",
+            "RCLONE_CONFIG_MINIO_ENDPOINT": f"{scheme}://{endpoint}",
             # MinIO 用 path-style 寻址，且固定 region 占位避免签名差异。
             "RCLONE_CONFIG_MINIO_FORCE_PATH_STYLE": "true",
             "RCLONE_CONFIG_MINIO_REGION": "us-east-1",
         }
+
+    # ── v2：按工作区分配的执行实例（ADR 0025）───────────────────────────────
+
+    @property
+    def work_area_root(self) -> Path:
+        return Path(self.WORK_AREA_ROOT) if self.WORK_AREA_ROOT else REPO_ROOT / "var" / "sandboxhub"
+
+    @property
+    def wa_network(self) -> str:
+        """v2 联网态网络：关闭 ICC（实例之间互不可达），netguard 只管这两张网。"""
+        return f"{self.SANDBOX_NETWORK}-wa"
+
+    @property
+    def wa_network_isolated(self) -> str:
+        return f"{self.SANDBOX_NETWORK_ISOLATED}-wa"
+
+    def wa_network_for_mode(self, mode: str) -> str:
+        return self.wa_network_isolated if mode == "deny" else self.wa_network
+
+    @property
+    def wa_gateway_name(self) -> str:
+        """v2 网关容器名；在 v2 网络上带别名 SANDBOX_GATEWAY_NAME，实例内主机名与 v1 一致。"""
+        return f"{self.SANDBOX_GATEWAY_NAME}-wa"
+
+    @property
+    def fs_sidecar_name(self) -> str:
+        return f"{self.SANDBOX_GATEWAY_NAME}-fs"
+
+    def image_v2_for_type(self, sandbox_type: str) -> str:
+        mapping = {"ubuntu": self.DOCKER_IMAGE_UBUNTU_V2, "code": self.DOCKER_IMAGE_CODE_V2}
+        if sandbox_type not in mapping:
+            raise ValueError(f"未知 sandbox_type: {sandbox_type}")
+        return mapping[sandbox_type]
+
+    @property
+    def hub_bound_to_loopback(self) -> bool:
+        return self.SANDBOX_HUB_HOST in {"127.0.0.1", "::1", "localhost"}
+
+    def netguard_host_allow_ports(self) -> list[int]:
+        """实例可直连的宿主端口：显式白名单 + 指向宿主的 HTTP 代理端口。坏条目告警跳过。"""
+        ports: set[int] = set()
+        for raw in self.NETGUARD_HOST_ALLOW_PORTS.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            if raw.isdigit() and 0 < int(raw) < 65536:
+                ports.add(int(raw))
+            else:
+                logger.warning("NETGUARD_HOST_ALLOW_PORTS 条目非法，跳过：{!r}", raw)
+        proxy = self.SANDBOX_HTTP_PROXY.strip()
+        if proxy:
+            parts = urlsplit(proxy)
+            if parts.hostname == "host.docker.internal" and parts.port:
+                ports.add(parts.port)
+        return sorted(ports)
+
+    def netguard_egress_allow_cidrs(self) -> list[str]:
+        cidrs: list[str] = []
+        for raw in self.NETGUARD_EGRESS_ALLOW_CIDRS.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                cidrs.append(str(ipaddress.ip_network(raw, strict=False)))
+            except ValueError:
+                logger.warning("NETGUARD_EGRESS_ALLOW_CIDRS 条目非法，跳过：{!r}", raw)
+        return cidrs
 
 
 def load_settings(

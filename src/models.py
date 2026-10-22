@@ -5,6 +5,7 @@ ContainerInfo：运行中容器的基础信息（由 ContainerManager 产出）
 SandboxRecord：已分配沙盒的完整记录（由 Registry 管理）
 ManagedContainer：Docker 侧受管容器的对账视图（由 ContainerManager.list_managed 产出）
 """
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal, Optional
@@ -13,6 +14,15 @@ SandboxType = Literal["ubuntu", "code"]
 SandboxStatus = Literal["ready", "released"]
 # 网络策略二值（createrole#449 / SandboxHub#42）：allow=联网态网络，deny=隔离网。
 NetworkMode = Literal["allow", "deny"]
+
+# v2 实例（按工作区分配，ADR 0025）的容器标签：Hub 重启后据此恢复在册记录。
+V2_LABEL = "sandboxhub.v2"
+WORK_AREA_LABEL = "sandboxhub.work-area"
+SANDBOX_ID_LABEL = "sandboxhub.sandbox-id"
+USER_LABEL = "sandboxhub.user"
+ROLE_LABEL = "sandboxhub.role"
+SESSION_LABEL = "sandboxhub.session"
+MOUNT_LAYOUT_LABEL = "sandboxhub.mount-layout"
 
 
 @dataclass
@@ -76,3 +86,87 @@ class ManagedContainer:
     container_ip: str = ""  # 仅 running 且拿得到 IP 时非空
     env_injected: bool = False  # 注入过租户 env 的容器：启动恢复不收养回池，直接销毁
     network: str = ""  # 容器实际所在 Docker 网络名（running 时），供 registry 网络对齐
+    # v2 实例（按工作区分配）的标签与环境：v1 对账逻辑整体跳过 v2 容器，由 v2 对账处理。
+    labels: dict[str, str] = field(default_factory=dict)
+    api_token: str = ""  # v2 实例的每实例 API token（容器 env SANDBOX_API_TOKEN），用于重启恢复
+
+    @property
+    def is_v2(self) -> bool:
+        return self.labels.get(V2_LABEL) == "true"
+
+
+# ── v2：按工作区分配的执行实例（ADR 0025）──────────────────────────────────────
+
+RoleMountMode = Literal["ro", "rw"]
+
+
+@dataclass(frozen=True)
+class RoleMountSpec:
+    """一个角色空间目录：MinIO ``bucket/prefix`` 经 cr-fs rclone 挂载，再 bind 到
+    实例 ``/workspace/role/<name>``。同一 (bucket, prefix, mode) 的多个实例共用一个挂载。"""
+    name: str
+    bucket: str
+    prefix: str
+    mode: RoleMountMode = "ro"
+
+    @property
+    def key(self) -> str:
+        raw = f"{self.bucket}\0{self.prefix.strip('/')}\0{self.mode}".encode()
+        return hashlib.sha256(raw).hexdigest()[:20]
+
+    @property
+    def target(self) -> str:
+        return f"/workspace/role/{self.name}"
+
+
+@dataclass(frozen=True)
+class InputFileSpec:
+    """inputs 里的一个文件：用户空间 blob（按 sha256 寻址），以 ``path`` 出现在 /workspace/inputs。"""
+    path: str
+    bucket: str
+    key: str
+    sha256: str
+    size: int
+
+
+@dataclass
+class WorkAreaInstance:
+    """v2 执行实例在册记录（按 work_area_id 唯一）。
+
+    ``status``：starting = 正在创建（占名额，防并发越限）；ready = 可用。
+    释放即销毁容器（不回池），工作区目录保留。
+    """
+    sandbox_id: str
+    work_area_id: str
+    user_id: str
+    role_id: str
+    sandbox_type: SandboxType
+    api_token: str
+    status: Literal["starting", "ready", "quiesced"] = "starting"
+    container_info: Optional[ContainerInfo] = None
+    mounts: tuple[RoleMountSpec, ...] = ()
+    session_id: str = ""
+    turn_id: str = ""
+    network_mode: NetworkMode = "allow"
+    # 是否持有角色目录挂载引用（创建中途失败时尚未取得，释放时不得多减）
+    mounts_held: bool = False
+    acquired_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    last_active_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
+
+    @property
+    def mount_keys(self) -> tuple[str, ...]:
+        return tuple(sorted(m.key for m in self.mounts))
+
+    def holder(self) -> dict:
+        """409 忙碌 / 超限时返回给调用方的占用者描述。"""
+        return {
+            "sandbox_id": self.sandbox_id,
+            "work_area_id": self.work_area_id,
+            "user_id": self.user_id,
+            "role_id": self.role_id,
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "status": self.status,
+            "acquired_at": self.acquired_at.isoformat(),
+            "last_active_at": self.last_active_at.isoformat(),
+        }

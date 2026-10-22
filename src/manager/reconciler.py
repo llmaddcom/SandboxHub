@@ -47,12 +47,21 @@ class SandboxReconciler:
         self._manager = container_manager
         # 已完成版本对账的容器 id（探测成功即记录，避免每轮重复请求；随容器消失修剪）
         self._version_checked: set[str] = set()
+        # v2 实例（按工作区分配）由 WorkAreaService 自行对账；这里只在周期里调用它。
+        self._work_areas = None
+
+    def attach_work_areas(self, service) -> None:
+        self._work_areas = service
+
+    async def _list_v1(self) -> list[ManagedContainer]:
+        """v1 对账只看 v1 容器：v2 实例绝不能被收养回 warm pool 或按 v1 闲置规则回收。"""
+        return [c for c in await self._manager.list_managed() if not c.is_v2]
 
     # ── 启动恢复 ─────────────────────────────────────────────────────────────
 
     async def startup(self) -> None:
         """服务启动时对 Docker 遗留的受管容器做一次性处置（在开始服务前完成）。"""
-        managed = await self._manager.list_managed()
+        managed = await self._list_v1()
         adopted = 0
         for c in managed:
             if c.status != "running":
@@ -116,9 +125,14 @@ class SandboxReconciler:
                 await self._manager.ensure_gateway()
             except Exception as e:
                 logger.warning(f"网关容器保活失败，下一轮重试 | err={e}")
+            if self._work_areas is not None:
+                try:
+                    await self._work_areas.reconcile_once()
+                except Exception as e:
+                    logger.warning(f"v2 实例对账失败，下一轮重试 | err={e}")
 
     async def reconcile_once(self) -> None:
-        managed = await self._manager.list_managed()
+        managed = await self._list_v1()
         now = datetime.now(tz=timezone.utc)
 
         # 1) 已停止的受管容器：从 registry/pool 摘除并删除本体。
@@ -155,7 +169,7 @@ class SandboxReconciler:
         #     否则 maintain 以为池是满的不再补充、acquire 才能兜底发现。
         #     取新鲜列表防「刚建好尚未入池」的误摘：容器总是先创建成功才入池，
         #     在池的容器必然已存在于 Docker，新列表缺失即真消失。
-        fresh_ids = {c.container_id for c in await self._manager.list_managed()}
+        fresh_ids = {c.container_id for c in await self._list_v1()}
         for cid in self._pool.container_ids() - fresh_ids:
             removed = await self._pool.remove_by_id(cid)
             if removed is not None:
