@@ -191,6 +191,10 @@ RUN mkdir -p /etc/sandbox && { \
     grep -q "^| .doc" /etc/sandbox/MANIFEST.md && \
     echo "MANIFEST.md: $(wc -l < /etc/sandbox/MANIFEST.md) 行"
 
+# 能力标签：app 支持 SANDBOX_API_TOKEN（X-Sandbox-Token）校验。SandboxHub v2 自检据此判定镜像可用，
+# 缺此标签的旧镜像不会被用于按工作区分配的实例。
+LABEL sandboxhub.api_auth="1"
+
 WORKDIR /app
 EXPOSE 8000
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/entrypoint.sh"]

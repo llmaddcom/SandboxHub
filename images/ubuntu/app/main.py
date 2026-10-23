@@ -13,10 +13,12 @@ SANDBOX_PROFILE:
 """
 
 import os
+import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from . import APP_VERSION
 from .routers import (
@@ -85,6 +87,20 @@ app.add_middleware(
     allow_methods=["*"],        # 允许所有 HTTP 方法
     allow_headers=["*"],        # 允许所有请求头
 )
+
+# 每实例 API token（SandboxHub v2 创建实例时注入，转发器带 X-Sandbox-Token）。未设置时不校验，
+# 与 v1 行为一致。健康检查豁免（Hub 版本对账用，不含敏感信息）。
+_API_TOKEN = os.getenv("SANDBOX_API_TOKEN", "")
+_TOKEN_EXEMPT_PATHS = frozenset({"/api/system/health"})
+
+
+@app.middleware("http")
+async def _sandbox_token(request: Request, call_next):
+    if _API_TOKEN and request.url.path not in _TOKEN_EXEMPT_PATHS:
+        provided = request.headers.get("X-Sandbox-Token", "")
+        if not secrets.compare_digest(provided, _API_TOKEN):
+            return JSONResponse(status_code=401, content={"detail": "invalid or missing X-Sandbox-Token"})
+    return await call_next(request)
 
 # 始终注册的核心路由
 app.include_router(terminal_router.router)

@@ -7,6 +7,11 @@
 - POST /api/terminal/kill:           向 job 进程组发 INT / KILL
 - POST /api/terminal/execute/stream: SSE 流式执行（旧契约，保留）
 - POST /api/terminal/restart:        重启终端会话（kill 该会话在跑的 job，cwd / env 复位）
+- GET  /api/terminal/activity:       任务活性计数 + 任务来源台账（SandboxHub#47）
+
+任务来源：SandboxHub v2 经 proxy 启动任务时带受信头 ``X-Sandbox-Job-Origin``
+（``{"session_id": ..., "turn_id": ...}``，调用方自带的同名头由 Hub 丢弃）；job 随来源落盘，
+activity 回报保留期内每个 job 的来源与起止时间，Hub 据此回答「哪个回合的任务在什么时候跑过」。
 
 会话隔离：请求体 ``session`` 字段指定对话会话，对应容器内一个同名 tmux session（缺省
 ``default``）；同一 session 的 job 之间 cwd / 导出环境跨调用保留，模型可用 ``tmux
@@ -19,12 +24,12 @@ send-keys / capture-pane / kill-window -t <job_id>`` 与仍在跑的 job 交互�
 
 import asyncio
 import json
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..tools import BashTool, ToolError
-from ..tools.bash import DEFAULT_WAIT, MAX_WAIT, Job, count_marked_processes
+from ..tools.bash import DEFAULT_WAIT, MAX_WAIT, Job, scan_marked_processes
 
 # 创建终端操作路由，设置前缀和标签
 router = APIRouter(prefix="/api/terminal", tags=["终端操作"])
@@ -87,7 +92,10 @@ class JobResponse(BaseModel):
     log_path: str = Field(description="全量输出日志路径，可在容器内 tail / grep")
     kill_reason: str | None = Field(
         default=None,
-        description="被终止原因：timeout | kill:INT | kill:KILL | restart | evicted | window_closed",
+        description=(
+            "被终止原因：timeout | max_lifetime（超过平台最长存活时间）| kill:INT | kill:KILL "
+            "| restart | evicted | window_closed"
+        ),
     )
 
 
@@ -125,6 +133,22 @@ class RestartResponse(BaseModel):
     message: str = Field(description="重启结果信息")
 
 
+def _origin(raw: str | None) -> dict | None:
+    """受信头 ``X-Sandbox-Job-Origin`` → {"session_id", "turn_id"}；缺失或形状不对 = 来源未知。"""
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    session, turn = value.get("session_id"), value.get("turn_id")
+    if not isinstance(session, str) or not isinstance(turn, str):
+        return None
+    return {"session_id": session, "turn_id": turn}
+
+
 def _job_payload(job: Job, start: int = 0) -> dict:
     output, cursor = job.read(start)
     return {
@@ -141,23 +165,28 @@ def _job_payload(job: Job, start: int = 0) -> dict:
 
 @router.get("/activity", summary="查询终端任务活性（闲置回收前使用）")
 async def terminal_activity():
+    """计数供闲置判定；``jobs`` / ``unattributed_live`` 为任务来源台账（时间为 epoch 秒）。"""
     session = get_bash_tool().session
     try:
         panes = await session.tmux.list_panes(strict=True)
-        marked_processes = await asyncio.to_thread(count_marked_processes)
+        marked = await asyncio.to_thread(scan_marked_processes)
     except ToolError as exc:
         raise HTTPException(status_code=503, detail=f"任务活性未知: {exc.message}") from exc
     return {
         "running_jobs": len(session.running),
         "live_panes": sum(not pane["dead"] for pane in panes),
-        "marked_processes": marked_processes,
+        "marked_processes": len(marked),
+        **session.ledger(set(marked)),
     }
 
 
 # ==================== API 接口 ====================
 
 @router.post("/execute", response_model=ExecuteResponse, summary="执行 bash 命令")
-async def execute_command(request: ExecuteRequest):
+async def execute_command(
+    request: ExecuteRequest,
+    job_origin: str | None = Header(default=None, alias="X-Sandbox-Job-Origin"),
+):
     """在 ``session`` 对应的 tmux session 里开一个窗口跑命令。
 
     - job 契约（带 ``wait``）：最多等 ``wait`` 秒；没结束返回 ``status=running`` 与目前
@@ -166,18 +195,20 @@ async def execute_command(request: ExecuteRequest):
     - 同 session 的 cwd / 导出环境跨调用保留（``cd`` / ``export`` / ``source venv``）。
     """
     tool = get_bash_tool()
+    origin = _origin(job_origin)
     try:
         if request.wait is None:
             # 旧契约：阻塞至结束
             job, result = await tool.execute_job(
-                request.command, timeout=request.timeout, session=request.session
+                request.command, timeout=request.timeout, session=request.session, origin=origin
             )
             payload = _job_payload(job)
             payload["output"] = result.output or ""
             return ExecuteResponse(**payload, success=True, error=result.error, system=result.system)
 
         job = await tool.submit(
-            request.command, wait=request.wait, timeout=request.timeout, session=request.session
+            request.command, wait=request.wait, timeout=request.timeout, session=request.session,
+            origin=origin,
         )
         return ExecuteResponse(**_job_payload(job), success=True, system=tool.pop_notes(request.session))
     except ToolError as e:
@@ -212,7 +243,10 @@ async def kill_job(request: KillRequest):
 
 
 @router.post("/execute/stream", summary="流式执行 bash 命令 (SSE)")
-async def execute_command_stream(request: ExecuteRequest):
+async def execute_command_stream(
+    request: ExecuteRequest,
+    job_origin: str | None = Header(default=None, alias="X-Sandbox-Job-Origin"),
+):
     """流式执行 bash 命令，通过 SSE 实时推送输出（旧契约：timeout 默认 30s / 上限 300s）。
 
     事件格式：
@@ -223,7 +257,8 @@ async def execute_command_stream(request: ExecuteRequest):
     async def event_gen():
         try:
             async for event in get_bash_tool().execute_stream(
-                request.command, request.timeout, session=request.session
+                request.command, request.timeout, session=request.session,
+                origin=_origin(job_origin),
             ):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:

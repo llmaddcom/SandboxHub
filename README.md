@@ -56,6 +56,7 @@ Preferred: the build script (tags both `latest` and the version from `images/ubu
 ```bash
 scripts/build-images.sh          # build code + ubuntu
 scripts/build-images.sh code     # code only
+NO_LATEST=1 scripts/build-images.sh fs   # cr-fs uses images/fs/VERSION
 ```
 
 Manual builds:
@@ -248,6 +249,10 @@ its child processes, so `/proc` activity also protects `nohup`, background `&`, 
 is excluded from saved session environment; zombies do not count. Idle reclaim
 requires all three counters to be zero. Unreadable process activity, missing fields,
 and unavailable or old container APIs are preserved rather than assumed idle.
+The same response carries the job-origin ledger used by v2 `GET /v2/work-areas/{id}/jobs`:
+`jobs` (`job_id`, `session_id`, `turn_id`, `started_at`, `ended_at` as epoch seconds) and
+`unattributed_live` (live marked jobs without an origin record). A job ends once its
+window has exited and no marked descendant remains (tracked about once per second).
 
 `POST /api/file/view` accepts `max_chars` (default 16000) and `column` (default 0),
 and returns `path`, `next_offset`, `next_column`, `truncated`, and `total_lines`
@@ -524,3 +529,100 @@ docker run -d --name sandbox --shm-size=2g \
 **Terminal jobs** run as tmux windows (`script -q -f -e` gives each command a PTY and records it to the job log); completion is detected by polling `pane_dead`, the exit code comes from the wrapper's EXIT trap (`pane_dead_status` is only a fallback — tmux 3.2a occasionally never fills it). The streaming variant (`execute_stream`) tails the job log line-by-line.
 
 **VLM vs LLM routing**: The sandbox supports both modalities. LLMs should use terminal/CDP endpoints (low token cost). VLMs can use screenshot + mouse/keyboard for pixel-level interaction.
+
+## Work-area v2 (ADR 0025)
+
+v2 allocates compute by `work_area_id`. A work area persists independently of its
+container; releasing a container preserves `work/` and `deliverables/`. The v1
+examples above describe the legacy protocol, available until the file-space cutover.
+
+The host owns privileged rclone mounts through the `cr-fs` sidecar. Tenant
+containers receive no storage credentials, FUSE device or mount capability. The
+`/workspace` root is a read-only skeleton mounted before its children; cwd is
+`/workspace/work`. `inputs/` and `context/` are read-only views, work and deliverables
+are writable, and each role directory has the requested access mode. Every acquire
+returns the effective layout, mounts, policy and isolation report. A failed self-test
+rejects allocation without falling back to v1.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /v2/capabilities?refresh=true` | Refresh isolation checks and return limits and ready image types |
+| `POST /v2/work-areas/{id}/acquire` | Allocate/reuse an instance; optional inputs and context replace views |
+| `GET /v2/sandboxes` | Registered instances with owner/work/session/turn metadata |
+| `PUT /v2/sandboxes/{id}/inputs` | Update live inputs in place; removed grants disappear immediately |
+| `PUT /v2/sandboxes/{id}/context` | Update generated instructions |
+| `GET /v2/sandboxes/{id}/activity` | Known activity and running jobs |
+| `POST /v2/sandboxes/{id}/quiesce` | Stop all tenant processes, preserving mounts for archive reads |
+| `POST /v2/sandboxes/{id}/release` | Remove a running or quiesced instance, preserving the work area |
+| `/v2/sandboxes/{id}/proxy/{path}` | Forward tool requests with the instance's API token |
+| `POST /v2/sandboxes/policy/apply` | Broadcast effective network policy to registered v2 instances |
+| `GET /v2/work-areas/{id}/usage` | Usage plus soft cap and `over_soft_cap` |
+| `GET /v2/work-areas/{id}/files?root=deliverables` | Bounded listing, reporting truncated or skipped entries; `observed_at` is the Hub clock taken before listing |
+| `GET /v2/work-areas/{id}/jobs` | Origin `(session_id, turn_id)` and start/end time of terminal jobs; `known=false` when completeness cannot be guaranteed |
+| `GET /v2/work-areas/{id}/files/content?root=deliverables&path=...` | Host snapshot, refusing symlinks and path escape |
+| `POST /v2/work-areas/{id}/files/checksums?root=work` | SHA-256 and stability for 1–128 paths (`{"paths": [...]}`); missing files reported individually, symlinks refused |
+| `POST /v2/work-areas/{id}/import?root=work` | Safe tar import for migration |
+| `DELETE /v2/work-areas/{id}?force=true` | Explicit removal; the platform must complete archiving first |
+| `GET/POST /v2/admin/drain` | Inspect/pause v1 acquisition and warm pool, wait for old jobs and drain |
+| `POST /v2/admin/files-cutover` | After drain, persist v2-only state and remove MinIO gateway forwarding |
+| `DELETE /v2/admin/drain` | Restore v1 and configured gateway forwarding during rollback |
+
+v2 requires the deployment Hub API key (`X-API-Key`); tool APIs inside each tenant
+require a distinct `X-Sandbox-Token`. Content responses include `X-File-Size`,
+`X-File-Mtime-Ns`, `X-File-Sha256` and `X-File-Stable`. Files can be read after
+quiesce or release; a quiesced container is rebuilt on the next acquire.
+
+The host persists the latest session and turn that acquired each instance in
+`origin.json`, outside tenant mounts, and restores it after restart. Missing,
+invalid or mismatched origin data yields an unknown source; archive callers
+retain the user asset without guessing which conversation produced it.
+
+Terminal jobs started through the proxy (`api/terminal/execute`, `execute/stream`,
+including jobs that later continue in the background) are tagged with the instance's
+current session and turn at request time. The Hub passes them in the trusted
+`X-Sandbox-Job-Origin` header (callers' copies are dropped); the container stores the
+origin with the job and reports it through terminal activity. Every activity query
+(platform idle checks, `/jobs`, reconcile for instances with unobserved starts or open
+jobs, and a final probe before quiesce/release) merges the report into
+`WORK_AREA_ROOT/job-ledger/<work_area_id>.json`, so records survive instance rebuilds
+and Hub restarts. `GET /v2/work-areas/{id}/jobs` returns:
+
+```json
+{"known": true, "now": "2026-10-22T08:00:00.123456Z",
+ "jobs": [{"job_id": "j_…", "session_id": "…", "turn_id": "…",
+           "started_at": "2026-10-22T07:59:00.000000Z", "ended_at": null}]}
+```
+
+All times are ISO-8601 UTC with `Z` on the host clock (containers share the host
+kernel's real-time clock). `ended_at` is an upper bound; `null` means still running.
+Jobs still open when their instance is stopped or removed end at that moment.
+`known=false` when the live instance cannot be probed or runs an image without the
+ledger, a live job has no origin, an instance vanished after terminal starts that were
+never observed, or the ledger file is unreadable; the last three keep the ledger
+unknown until they age past `job_max_lifetime` (one day when 0). Ended records are
+removed after the same period. A missing work area returns
+`404 {"detail": {"reason": "work_area_not_found", ...}}`.
+
+Resource settings belong to `config/system.yaml`, under `work_area`:
+
+| Key | Default | Behavior |
+| --- | --- | --- |
+| `max_per_role` | 2 | Concurrent instances per digital person |
+| `max_per_user` | 4 | Concurrent instances per owner |
+| `idle_release_seconds` | 900 | Platform idle reclaim threshold, advertised in capabilities |
+| `soft_cap_bytes` | 10737418240 | 10 GiB; platform checks before file writes, not a hard filesystem quota |
+| `job_max_lifetime` | 21600 | Kill a background job after 6 hours, `kill_reason=max_lifetime` |
+| `idle_backstop_ttl` | 86400 | Hub backstop for instances without API traffic; work areas remain |
+
+Both v2 networks deny peer access and unapproved host ports. v2 gateway forwarding
+always excludes MinIO, including explicit manual forwards to its endpoint/port.
+After a verified file-space migration, cutover also removes legacy MinIO forwarding
+and persists `.files-cutover.json` under `WORK_AREA_ROOT`. A Hub restart retains
+v1 drain, warm-pool pause and forwarding restrictions. Rollback clears this state,
+releases v2 instances while retaining their volumes, and restores the configured v1
+behavior. Drain does not force-kill busy old jobs unless explicitly requested.
+
+Build with version tags (`NO_LATEST=1 bash scripts/build-images.sh all`). Real
+isolation tests use temporary networks, sidecar, gateway and a dedicated test bucket:
+`SANDBOXHUB_LIVE=1 python -m pytest tests/integration/test_work_area_live.py` with
+MinIO credentials supplied by the environment. They do not restart existing Hubs.

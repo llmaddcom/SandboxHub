@@ -28,7 +28,8 @@ import urllib.parse
 import urllib.request
 
 DEFAULT_CREDENTIALS_FILE = os.path.expanduser("~/.config/createrole/credentials.json")
-DEFAULT_SKILLS_DIR = "/workspace/skills"
+# v2 实例（按工作区分配）里技能在 /workspace/role/skills，由 SandboxHub 注入 CR_SKILLS_DIR。
+DEFAULT_SKILLS_DIR = os.environ.get("CR_SKILLS_DIR") or "/workspace/skills"
 TIMEOUT_SECONDS = 20
 
 # 容器内直连宿主后端，不走任何代理（env 里的 http_proxy 等一律忽略）。

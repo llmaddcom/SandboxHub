@@ -22,6 +22,7 @@
 """
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -38,8 +39,16 @@ from .base import CLIResult, ToolError, ToolResult
 DEFAULT_WAIT = 30.0
 MAX_WAIT = 120.0
 KILL_GRACE = 5.0          # timeout 到期：SIGINT → 等这么久 → SIGKILL
+# 单个 job 最长存活（秒，0 = 不限）：SandboxHub v2 注入，到期按 kill_reason=max_lifetime 终止，
+# 与调用方 timeout 互不替代（timeout 是单条命令的预期，max_lifetime 是平台兜底）。
+MAX_JOB_LIFETIME = float(os.getenv("SANDBOX_JOB_MAX_LIFETIME") or 0)
 JOB_DIR = Path(os.getenv("CR_JOB_DIR", "/tmp/cr-jobs"))
 MAX_JOB_RECORDS = 200     # 内存保留的 job 记录数（日志文件不删）
+# 任务来源台账（SandboxHub#47）：每个 job 落 ``<job_id>.origin``（来源 + 开始时间）与
+# ``<job_id>.end``（窗口结束且不再有带该 job 标记的存活进程的时刻）。activity 回报保留期内的条目。
+END_POLL_INTERVAL = 1.0   # 窗口已结束、后代进程仍在时，轮询其消失的间隔（结束时间精度）
+LEDGER_RETENTION = MAX_JOB_LIFETIME or 86400.0
+JOB_ID_RE = re.compile(r"^j_[0-9A-HJKMNP-TV-Z]{26}$")
 
 # ---- tmux ----
 TMUX_SOCKET = os.getenv("CR_TMUX_SOCKET") or None   # None = 默认 socket（容器内 tmux ls 直接可见）
@@ -66,7 +75,7 @@ _SIGNALS = {"INT": signal.SIGINT, "KILL": signal.SIGKILL, "TERM": signal.SIGTERM
 # 不跨 job 传递的环境变量：shell 自行维护的、tmux/script 按窗口注入的
 JOB_ACTIVITY_ENV = "CR_SANDBOX_JOB_ID"
 PROC_ROOT = Path("/proc")
-_JOB_ACTIVITY_RE = re.compile(rb"(?:^|\x00)CR_SANDBOX_JOB_ID=j_[0-9A-HJKMNP-TV-Z]{26}(?:\x00|$)")
+_JOB_ACTIVITY_RE = re.compile(rb"(?:^|\x00)CR_SANDBOX_JOB_ID=(j_[0-9A-HJKMNP-TV-Z]{26})(?:\x00|$)")
 _ENV_SKIP = {"_", "PWD", "OLDPWD", "SHLVL", "TMUX", "TMUX_PANE", "LINES", "COLUMNS", JOB_ACTIVITY_ENV}
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -78,7 +87,12 @@ def count_marked_processes() -> int:
     retention and process groups. Read only; never log process environments.
     An unreadable process makes an otherwise empty result unknown, not idle.
     """
-    count = 0
+    return len(scan_marked_processes())
+
+
+def scan_marked_processes() -> list[str]:
+    """One job ID per live marked process (see ``count_marked_processes``)."""
+    found: list[str] = []
     uncertain = False
     try:
         processes = list(PROC_ROOT.iterdir())
@@ -87,7 +101,7 @@ def count_marked_processes() -> int:
     for process in processes:
         if not process.name.isdigit():
             continue
-        marked = False
+        marked = None
         try:
             # comm can contain spaces and ')'; fields after the final ')' start
             # at state (field 3), and starttime is field 22. Recheck identity so
@@ -95,26 +109,26 @@ def count_marked_processes() -> int:
             before = (process / "stat").read_text().rsplit(")", 1)[1].split()
             if before[0] in ("Z", "X", "x"):
                 continue
-            marked = bool(_JOB_ACTIVITY_RE.search((process / "environ").read_bytes()))
+            marked = _JOB_ACTIVITY_RE.search((process / "environ").read_bytes())
             after = (process / "stat").read_text().rsplit(")", 1)[1].split()
             if before[19] != after[19]:
                 uncertain = True
             elif marked and after[0] not in ("Z", "X", "x"):
-                count += 1
+                found.append(marked.group(1).decode())
         except OSError:
             if marked:
                 # A marked parent may have just forked and exited after /proc
                 # was enumerated. Preserve this lease until a later probe.
-                count += 1
+                found.append(marked.group(1).decode())
             else:
                 # Even an exited PID may have spawned a child after this scan
                 # began. A later complete scan can safely establish idleness.
                 uncertain = True
         except (IndexError, ValueError):
             uncertain = True
-    if uncertain and not count:
+    if uncertain and not found:
         raise ToolError("部分进程活性无法确认，保留现有任务。")
-    return count
+    return found
 
 # job 包装脚本（经 script 在 PTY 里由 bash 执行）：$1 = 状态文件基名。
 # 先落 pid（kill 用），载入上一 job 的导出环境，EXIT trap 保证 exit / 报错 / SIGINT 后
@@ -221,9 +235,13 @@ class Job:
     pane_id: str = ""
     status: str = STATUS_RUNNING
     exit_code: int | None = None
-    kill_reason: str | None = None      # "timeout" | "kill:INT" | "restart" | "evicted" | "window_closed"
+    kill_reason: str | None = None      # "timeout" | "max_lifetime" | "kill:INT" | "restart" | "evicted" | "window_closed"
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
+    # 来源（Hub 经受信头交来的 session_id / turn_id）；None = 未带来源
+    origin: dict | None = None
+    # 窗口结束且不再有带本 job 标记的存活进程的时刻（上界）；None = 仍可能在跑
+    ended_at: float | None = None
     dead_ticks: int = 0
     sigkilled: bool = False             # 我方已对进程组发过 SIGKILL（退出码兜底 137）
     done: asyncio.Event = field(default_factory=asyncio.Event)
@@ -387,7 +405,9 @@ class JobSession:
 
     def __init__(self, cwd: str | None = None, env: dict[str, str] | None = None,
                  tmux: Tmux | None = None):
-        self._initial_cwd = cwd or os.getcwd()
+        # SANDBOX_CWD：v2 实例的工作目录（/workspace/work）；不存在时退回进程 cwd。
+        preset = os.getenv("SANDBOX_CWD", "")
+        self._initial_cwd = cwd or (preset if preset and os.path.isdir(preset) else os.getcwd())
         self._initial_env = {
             k: v for k, v in (env if env is not None else os.environ).items()
             if k not in _ENV_SKIP and _ENV_NAME_RE.match(k)
@@ -396,6 +416,8 @@ class JobSession:
         self.states: dict[str, _SessionState] = {}
         self.jobs: dict[str, Job] = {}
         self._supervisor: asyncio.Task | None = None
+        self._end_tracker: asyncio.Task | None = None
+        self._starting: set[str] = set()   # 已落来源、窗口尚未建好的 job
         self._submit_lock = asyncio.Lock()
         JOB_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -415,13 +437,13 @@ class JobSession:
 
     # ------------------------------------------------------------------ 提交
     async def start_job(self, command: str, timeout: float | None = None,
-                        session: str | None = None) -> Job:
+                        session: str | None = None, origin: dict | None = None) -> Job:
         # 容量检查与创建窗口原子化，避免并发提交越过窗口上限。
         async with self._submit_lock:
-            return await self._start_job(command, timeout, session)
+            return await self._start_job(command, timeout, session, origin)
 
     async def _start_job(self, command: str, timeout: float | None,
-                         session: str | None) -> Job:
+                         session: str | None, origin: dict | None = None) -> Job:
         """在该 session 的 tmux 会话里开一个窗口跑命令；返回 running 的 job。"""
         if not command:
             raise ToolError("未提供命令。")
@@ -439,6 +461,7 @@ class JobSession:
             log_path=base.with_suffix(".log"),
             state_base=base,
             timeout=timeout,
+            origin=origin,
         )
         base.with_suffix(".sh").write_text(command + "\n")
         base.with_suffix(".run.sh").write_text(_WRAPPER)
@@ -457,7 +480,16 @@ class JobSession:
             f"{shlex.quote(str(base))}"
         )
         window_cmd = f"exec script -q -f -e -c {shlex.quote(inner)} {shlex.quote(str(job.log_path))}"
-        job.pane_id = await self._open_window(st.name, job_id, cwd, window_cmd)
+        # 来源先于进程落盘：台账不会漏掉已经在跑的 job
+        self._write_origin(job)
+        self._starting.add(job_id)
+        try:
+            job.pane_id = await self._open_window(st.name, job_id, cwd, window_cmd)
+        except BaseException:
+            base.with_suffix(".origin").unlink(missing_ok=True)
+            raise
+        finally:
+            self._starting.discard(job_id)
 
         self.jobs[job_id] = job
         self._prune()
@@ -539,6 +571,12 @@ class JobSession:
                     self._settle(job, rc, job.kill_reason)
                 elif job.timeout is not None and now - job.started_at >= job.timeout:
                     asyncio.get_running_loop().create_task(self._terminate(job, "timeout"))
+                elif (
+                    MAX_JOB_LIFETIME > 0
+                    and job.kill_reason is None
+                    and now - job.started_at >= MAX_JOB_LIFETIME
+                ):
+                    asyncio.get_running_loop().create_task(self._terminate(job, "max_lifetime"))
 
     def _settle(self, job: Job, exit_code: int | None, kill_reason: str | None) -> None:
         job.exit_code = exit_code
@@ -547,6 +585,7 @@ class JobSession:
         job.finished_at = time.time()
         self._load_state(job)
         job.done.set()
+        self._ensure_end_tracker()
         if kill_reason:
             # 被终止的 job：包装 bash 退出不代表进程组已清空（非交互 shell 的后台子进程
             # 默认忽略 SIGINT），宽限后 SIGKILL 扫尾整个组
@@ -634,6 +673,99 @@ class JobSession:
         if env:
             st.env = env
 
+    # ------------------------------------------------------------------ 来源台账
+    @staticmethod
+    def _write_origin(job: Job) -> None:
+        origin = job.origin or {}
+        value = {
+            "session_id": origin.get("session_id"),
+            "turn_id": origin.get("turn_id"),
+            "started_at": job.started_at,
+        }
+        job.state_base.with_suffix(".origin").write_text(json.dumps(value))
+
+    @staticmethod
+    def _write_end(job_id: str, at: float) -> None:
+        try:
+            (JOB_DIR / job_id).with_suffix(".end").write_text(repr(at))
+        except OSError:
+            pass
+
+    def _ensure_end_tracker(self) -> None:
+        if self._end_tracker is None or self._end_tracker.done():
+            self._end_tracker = asyncio.get_running_loop().create_task(self._track_ends())
+
+    async def _track_ends(self) -> None:
+        """窗口已结束的 job：等带其标记的进程（nohup / setsid 后代）全部消失后记结束时间。"""
+        while True:
+            pending = [j for j in self.jobs.values() if j.finished and j.ended_at is None]
+            if not pending:
+                return
+            try:
+                live = set(await asyncio.to_thread(scan_marked_processes))
+            except ToolError:
+                live = None   # 活性不明：本轮不结算
+            if live is not None:
+                now = time.time()
+                for job in pending:
+                    if job.id not in live:
+                        job.ended_at = now
+                        self._write_end(job.id, now)
+            await asyncio.sleep(END_POLL_INTERVAL)
+
+    def ledger(self, marked: set[str], now: float | None = None) -> dict:
+        """保留期内的 job 来源与起止时间 + 存活却无来源记录的 job（``marked`` 来自同一次进程扫描）。
+
+        时间为容器内 ``time.time()``（与宿主共用内核实时钟）。结束时间是上界：没被
+        后台追踪到的（服务重启前的 job 等）按本次查询时刻结束。
+        """
+        now = time.time() if now is None else now
+        live = set(marked) | {j.id for j in self.running} | set(self._starting)
+        entries: list[dict] = []
+        recorded: set[str] = set()
+        cutoff = now - LEDGER_RETENTION
+        try:
+            paths = list(JOB_DIR.glob("j_*.origin"))
+        except OSError:
+            paths = []
+        for path in paths:
+            job_id = path.name[: -len(".origin")]
+            if not JOB_ID_RE.match(job_id):
+                continue
+            try:
+                meta = json.loads(path.read_text())
+                started = float(meta["started_at"])
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            job = self.jobs.get(job_id)
+            ended = job.ended_at if job is not None else None
+            if ended is None:
+                try:
+                    ended = float(path.with_suffix(".end").read_text())
+                except (OSError, ValueError):
+                    ended = None
+            if ended is None and job_id not in live:
+                ended = now
+                if job is not None:
+                    job.ended_at = now
+                self._write_end(job_id, now)
+            recorded.add(job_id)
+            if ended is not None and ended < cutoff:
+                # 超过保留期：Hub 早已观测并自行持久化，删掉以免台账随容器寿命无限增长
+                path.unlink(missing_ok=True)
+                path.with_suffix(".end").unlink(missing_ok=True)
+                continue
+            session, turn = meta.get("session_id"), meta.get("turn_id")
+            entries.append({
+                "job_id": job_id,
+                "session_id": session if isinstance(session, str) else None,
+                "turn_id": turn if isinstance(turn, str) else None,
+                "started_at": started,
+                "ended_at": ended,
+            })
+        entries.sort(key=lambda e: (e["started_at"], e["job_id"]))
+        return {"jobs": entries, "unattributed_live": sorted(live - recorded)}
+
     def _prune(self) -> None:
         if len(self.jobs) <= MAX_JOB_RECORDS:
             return
@@ -713,9 +845,9 @@ class BashTool:
 
     # ------------------------------------------------------------------ job 契约
     async def submit(self, command: str, wait: float = DEFAULT_WAIT, timeout: float | None = None,
-                     session: str | None = None) -> Job:
+                     session: str | None = None, origin: dict | None = None) -> Job:
         """提交命令并最多等 wait 秒（上限 MAX_WAIT）。"""
-        job = await self.session.start_job(command, timeout=timeout, session=session)
+        job = await self.session.start_job(command, timeout=timeout, session=session, origin=origin)
         await self.session.wait(job, min(max(wait, 0.0), MAX_WAIT))
         return job
 
@@ -739,15 +871,17 @@ class BashTool:
 
     # ------------------------------------------------------------------ 旧契约
     async def _start_legacy(self, command: str, timeout: float | None,
-                            session: str | None = None) -> tuple[Job, float]:
+                            session: str | None = None,
+                            origin: dict | None = None) -> tuple[Job, float]:
         effective = DEFAULT_TIMEOUT if timeout is None else min(timeout, MAX_TIMEOUT)
-        job = await self.session.start_job(command, timeout=effective, session=session)
+        job = await self.session.start_job(command, timeout=effective, session=session, origin=origin)
         return job, effective
 
     async def execute_job(self, command: str, timeout: float | None = None,
-                          session: str | None = None) -> tuple[Job, ToolResult]:
+                          session: str | None = None,
+                          origin: dict | None = None) -> tuple[Job, ToolResult]:
         """旧契约：阻塞至命令结束（默认 30s、最大 300s 超时），返回 (Job, ToolResult)。"""
-        job, effective = await self._start_legacy(command, timeout, session)
+        job, effective = await self._start_legacy(command, timeout, session, origin)
         await job.done.wait()
         output, _ = job.read(0)
         if job.kill_reason == "timeout":
@@ -766,9 +900,9 @@ class BashTool:
             self._session.close()
 
     async def execute_stream(self, command: str, timeout: float | None = None,
-                             session: str | None = None):
+                             session: str | None = None, origin: dict | None = None):
         """旧契约 SSE：按行推送日志增量；事件 {"type": "stdout"|"stderr"|"done"}。"""
-        job, effective = await self._start_legacy(command, timeout, session)
+        job, effective = await self._start_legacy(command, timeout, session, origin)
         note = self.pop_notes(session)
         if note:
             yield {"type": "stderr", "chunk": note}

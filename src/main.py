@@ -6,7 +6,10 @@ lifespan：
            → 启动恢复：清理已停止/孤儿容器，健康的遗留容器清理复位后收养回 pool
            → 预热 pool 到目标大小
            → 启动 pool 维护 + 沙盒对账两个后台任务
-  shutdown → 取消后台任务，清理全部容器，关闭所有 httpx 连接池
+  shutdown → 取消后台任务，清理全部 v1 容器，关闭所有 httpx 连接池
+
+v2（按工作区分配的执行实例，ADR 0025）：启动时准备 v2 网络 / 网关 / cr-fs / netguard 并收养
+遗留实例，后台跑首次隔离自检；关闭时 v2 实例、cr-fs、v2 网关一律保留（重启后从标签恢复）。
 """
 from __future__ import annotations
 
@@ -20,11 +23,14 @@ from loguru import logger
 
 from .config import settings
 from .manager.container_manager import ContainerManager
+from .manager.fs_sidecar import FsSidecar
 from .manager.reconciler import SandboxReconciler
 from .manager.registry import SandboxRegistry
+from .manager.wa_instances import WorkAreaService
 from .manager.warm_pool import WarmPool
 from .routers import proxy as proxy_router
 from .routers import sandboxes as sandboxes_router
+from .routers import v2 as v2_router
 from .proxy.forwarder import close_all_clients
 
 
@@ -34,6 +40,9 @@ async def lifespan(app: FastAPI):
     container_manager = ContainerManager()
     registry = SandboxRegistry()
     warm_pool = WarmPool(container_manager)
+    if settings.files_cutover_active:
+        sandboxes_router.set_draining(True)
+        warm_pool.paused = True
     reconciler = SandboxReconciler(registry, warm_pool, container_manager)
 
     # 网络策略地基：两张受管网络 + cr-host 网关容器（幂等；SANDBOX_NETWORK 为内置网络时跳过）
@@ -43,9 +52,18 @@ async def lifespan(app: FastAPI):
     # 启动恢复：处置 Docker 遗留的受管容器（已停止/挂载孤儿销毁，健康 warm 收养回池）
     await reconciler.startup()
 
+    # v2 地基与收养（失败只让 v2 自检不通过，不影响 v1）
+    work_areas = WorkAreaService(container_manager, FsSidecar(container_manager.docker))
+    await work_areas.startup()
+    reconciler.attach_work_areas(work_areas)
+    selftest_task = (
+        asyncio.create_task(work_areas.run_selftest()) if work_areas.started else None
+    )
+
     # 注入依赖
     sandboxes_router.set_dependencies(registry, warm_pool, container_manager, reconciler)
     proxy_router.set_dependencies(registry, reconciler)
+    v2_router.set_dependencies(work_areas, registry, warm_pool, reconciler)
 
     # 预热 pool（后台，不阻塞启动）
     for sandbox_type in settings.sandbox_types:
@@ -62,14 +80,16 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── shutdown ─────────────────────────────────────────────────────────────
-    for task in (maintain_task, reconcile_task):
+    for task in (maintain_task, reconcile_task, selftest_task):
+        if task is None:
+            continue
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
 
-    # 并发清理所有容器（warm pool + 已分配），确保无孤儿容器
+    # 并发清理所有 v1 容器（warm pool + 已分配），确保无孤儿容器。v2 实例不在 registry 里，保留。
     allocated_infos = await registry.drain()
     await asyncio.gather(
         warm_pool.drain(),
@@ -102,6 +122,7 @@ async def _api_key_auth(request: Request, call_next):
     return await call_next(request)
 
 app.include_router(sandboxes_router.router)
+app.include_router(v2_router.router)
 
 # proxy router 挂在 /v1/sandboxes 下
 _proxy_api = APIRouter(prefix="/v1/sandboxes")
@@ -114,12 +135,20 @@ async def health():
     """健康检查，返回服务状态、warm pool 状态和已分配沙盒数。"""
     pool_status = sandboxes_router._warm_pool.status() if sandboxes_router._warm_pool else {}
     ready = len(sandboxes_router._registry.list_ready()) if sandboxes_router._registry else 0
+    service = v2_router._service
     return {
         "ok": True,
         "warm_pool": pool_status,
         "sandboxes_ready": ready,
         # 网络策略能力：binary = 支持 policy.network.default 二值热切换；none = 不可用
         "network_policy": "binary" if settings.network_policy_supported else "none",
+        "draining": sandboxes_router.is_draining(),
+        # v2 概况（细节见 GET /v2/capabilities）
+        "work_area": {
+            "enabled": settings.WORK_AREA_ENABLED,
+            "ok": bool(service) and not service.selftest.result.failing(),
+            "instances": len(service.registry.list_all()) if service else 0,
+        },
     }
 
 
@@ -131,4 +160,3 @@ if __name__ == "__main__":
         port=settings.SANDBOX_HUB_PORT,
         reload=False,
     )
-
