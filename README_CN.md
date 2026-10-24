@@ -239,7 +239,7 @@ curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/kil
 ```
 
 `status` 取值 `running | exited | killed`；`kill_reason` 为 `timeout`、`kill:<SIG>` 或 `restart`。
-多个 job 可并行。请求体 `session` 字段指定对话会话 → 容器内同名 tmux session（缺省 `default`），同会话的 job 共享 cwd / 导出环境并可用 `tmux send-keys / capture-pane / kill-window -t <job_id>` 互相交互，不同会话互不可见。活跃窗口最多 64 个，容量满时拒绝新命令，已有任务继续运行；只清理已完成窗口。`GET /api/terminal/activity` 返回 `running_jobs`、`live_panes` 与 `marked_processes`。job 向后代继承不含敏感信息的内部标记，扫描 `/proc` 时可识别 `nohup`、后台 `&`、`setsid` 后仍存活的用户进程，不依赖父 shell 或已剪枝的 job 记录；标记不进入跨 job 的环境状态，zombie 不计数。仅三个计数均明确为零才允许闲置回收；进程不可读、字段缺失、探测失败或旧镜像不支持时保守保留。
+多个 job 可并行。请求体 `session` 字段指定对话会话 → 容器内同名 tmux session（缺省 `default`），同会话的 job 共享 cwd / 导出环境并可用 `tmux send-keys / capture-pane / kill-window -t <job_id>` 互相交互，不同会话互不可见。活跃窗口最多 64 个，容量满时拒绝新命令，已有任务继续运行；只清理已完成窗口。`GET /api/terminal/activity` 返回 `running_jobs`、`live_panes` 与 `marked_processes`。job 向后代继承不含敏感信息的内部标记，扫描 `/proc` 时可识别 `nohup`、后台 `&`、`setsid` 后仍存活的用户进程，不依赖父 shell 或已剪枝的 job 记录；标记不进入跨 job 的环境状态，zombie 不计数。仅三个计数均明确为零才允许闲置回收；进程不可读、字段缺失、探测失败或旧镜像不支持时保守保留。同一响应还带任务来源台账（供 v2 `GET /v2/work-areas/{id}/jobs`）：`jobs`（`job_id`、`session_id`、`turn_id`、`started_at`、`ended_at`，epoch 秒）与 `unattributed_live`（存活却无来源记录的 job）；窗口结束且不再有带标记的后代进程时记结束时间（约每秒追踪一次）。
 
 `POST /api/file/view` 支持 `max_chars`（默认 16000）与 `column`（默认 0）。返回 `path`、`next_offset`、`next_column`、`truncated` 与 `total_lines`；后者仅读到文件末尾时可知，否则为 null。按返回位置继续，超长单行可能仍在同一 `next_offset`，须同时传回 `next_column`。读取在后台线程中逐片进行，不将整文件载入内存；页正文不再叠加固定截断，调用方也应保留该分页结果。旧客户端仍可从正文末尾取得准确续读参数。
 

@@ -18,8 +18,13 @@ from src.config import settings
 # 模块级连接池，按容器 IP 缓存 client
 _client_pool: dict[str, httpx.AsyncClient] = {}
 
-# hop-by-hop 请求头，不透传给容器
-_SKIP_REQ_HEADERS = {"host", "content-length", "transfer-encoding"}
+# hop-by-hop 请求头，不透传给容器；实例 token、Hub API key 与任务来源由 Hub 掌握，调用方带来的一律丢弃
+_SKIP_REQ_HEADERS = {
+    "host", "content-length", "transfer-encoding", "x-sandbox-token", "x-api-key",
+    "x-sandbox-job-origin",
+}
+# v2 实例 API 的每实例 token 头（容器内 API 校验，由转发器注入）
+SANDBOX_TOKEN_HEADER = "X-Sandbox-Token"
 
 # httpx 会自动解压响应体；移除此头以匹配已解码的内容
 _SKIP_RESP_HEADERS = {"transfer-encoding", "content-encoding"}
@@ -53,18 +58,29 @@ async def close_all_clients() -> None:
         await close_client(ip)
 
 
-async def forward(container_ip: str, path: str, request: Request) -> Response:
+async def forward(
+    container_ip: str,
+    path: str,
+    request: Request,
+    api_token: str = "",
+    extra_headers: dict[str, str] | None = None,
+) -> Response:
     """
     透传 HTTP 请求到容器 API。
 
     - 保留原始 method / body / query string
-    - 过滤 hop-by-hop 请求头（host, content-length）
+    - 过滤 hop-by-hop 请求头（host, content-length）与调用方伪造的 token 头
+    - ``api_token`` 非空（v2 实例）时注入每实例 token；``extra_headers`` 为 Hub 注入的受信头
     - 原样返回容器响应（status / body / content-type）
     """
     req_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in _SKIP_REQ_HEADERS
     }
+    if api_token:
+        req_headers[SANDBOX_TOKEN_HEADER] = api_token
+    if extra_headers:
+        req_headers.update(extra_headers)
 
     try:
         client = _get_client(container_ip)

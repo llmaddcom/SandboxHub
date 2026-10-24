@@ -30,6 +30,17 @@ _registry = None
 _warm_pool = None
 _container_manager = None
 _reconciler = None
+# v1 排空（切换到 v2 的停机窗口，见 POST /v2/admin/drain）：期间新的 v1 acquire 一律 503
+_draining = False
+
+
+def set_draining(flag: bool) -> None:
+    global _draining
+    _draining = flag
+
+
+def is_draining() -> bool:
+    return _draining
 
 
 def set_dependencies(registry, warm_pool, container_manager, reconciler) -> None:
@@ -210,6 +221,11 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
     后台异步补充 pool，不阻塞返回。
     每条路径都把容器落到 policy 对应的网络（复用/出池的热切网，冷启动直接落网）。
     """
+    if _draining:
+        raise HTTPException(
+            status_code=503,
+            detail=_unavailable_detail("v1 sandboxes are draining for cutover", "draining"),
+        )
     mode, effective = _resolve_policy(req.policy)
     target_network = settings.network_for_mode(mode)
 

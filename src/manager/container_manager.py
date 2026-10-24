@@ -7,9 +7,11 @@ Docker 容器管理器
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -19,7 +21,20 @@ import httpx
 from loguru import logger
 
 from src.config import settings
-from src.models import ContainerInfo, ManagedContainer, NetworkMode, SandboxType, WorkspaceMount
+from src.models import (
+    MOUNT_LAYOUT_LABEL,
+    ROLE_LABEL,
+    SANDBOX_ID_LABEL,
+    SESSION_LABEL,
+    USER_LABEL,
+    V2_LABEL,
+    WORK_AREA_LABEL,
+    ContainerInfo,
+    ManagedContainer,
+    NetworkMode,
+    SandboxType,
+    WorkspaceMount,
+)
 
 # 挂载容器标签：用于启动恢复时识别并清理孤儿挂载容器（其 registry 映射在重启后已丢失）。
 _MOUNTED_LABEL = "sandboxhub.mounted"
@@ -30,6 +45,29 @@ _ENV_LABEL = "sandboxhub.env-injected"
 _GATEWAY_LABEL = "sandboxhub.gateway"
 # 容器内网络策略标记文件：环境变量不能热改，切网后写文件供镜像脚本 / MANIFEST 感知。
 _POLICY_MARKER = "/etc/sandbox/network-policy"
+# v2 实例镜像须带此标签：容器内 API 会校验每实例 token（SANDBOX_API_TOKEN）。
+API_AUTH_LABEL = "sandboxhub.api_auth"
+# v2 实例去掉的默认 capability：NET_RAW 可伪造 ARP/原始包，MKNOD 可建设备节点。
+_V2_CAP_DROP = ["NET_RAW", "MKNOD"]
+
+
+@dataclass(frozen=True)
+class Bind:
+    """v2 实例的一条宿主 bind。``propagation`` 仅角色目录（FUSE 挂载）用 rslave。"""
+    source: str
+    target: str
+    read_only: bool
+    propagation: str = ""
+
+
+@dataclass(frozen=True)
+class BridgeInfo:
+    """一张 v2 网络在宿主侧的事实，供 netguard 下发规则与自检。"""
+    network: str
+    bridge: str       # 宿主网桥接口名（br-<id[:12]> 或 bridge.name 选项）
+    host_ip: str      # 网桥在宿主侧的地址（实例看到的默认网关）
+    gateway_ip: str   # v2 网关容器在该网上的 IP（唯一放行对象）
+    internal: bool
 
 
 def _parse_docker_time(raw: str) -> Optional[datetime]:
@@ -61,6 +99,10 @@ class ContainerManager:
     def __init__(self) -> None:
         self._docker = docker.from_env()
 
+    @property
+    def docker(self) -> docker.DockerClient:
+        return self._docker
+
     # ── 内部辅助 ─────────────────────────────────────────────────────────────
 
     def _get_container_ip(self, container, prefer: Optional[str] = None) -> str:
@@ -76,9 +118,14 @@ class ContainerManager:
 
     @staticmethod
     def _container_network(container) -> str:
-        """容器实际所在网络名：优先两张受管网络，其次任一已接入网络；未接入返回空。"""
+        """容器实际所在网络名：优先受管网络（v1 两张 + v2 两张），其次任一已接入网络；未接入返回空。"""
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-        for name in (settings.SANDBOX_NETWORK, settings.SANDBOX_NETWORK_ISOLATED):
+        for name in (
+            settings.SANDBOX_NETWORK,
+            settings.SANDBOX_NETWORK_ISOLATED,
+            settings.wa_network,
+            settings.wa_network_isolated,
+        ):
             if name in networks:
                 return name
         return next(iter(networks), "")
@@ -246,6 +293,12 @@ class ContainerManager:
                         ip = self._get_container_ip(c)
                     except RuntimeError:
                         ip = ""
+                token = ""
+                if c.labels.get(V2_LABEL) == "true":
+                    env = c.attrs.get("Config", {}).get("Env") or []
+                    token = next(
+                        (e.split("=", 1)[1] for e in env if e.startswith("SANDBOX_API_TOKEN=")), ""
+                    )
                 result.append(
                     ManagedContainer(
                         container_id=c.id,
@@ -257,6 +310,8 @@ class ContainerManager:
                         container_ip=ip,
                         env_injected=c.labels.get(_ENV_LABEL) == "true",
                         network=self._container_network(c),
+                        labels=dict(c.labels),
+                        api_token=token,
                     )
                 )
             except Exception as e:
@@ -581,3 +636,282 @@ class ContainerManager:
     async def list_managed(self) -> list[ManagedContainer]:
         """列出 Docker 侧全部受管容器（含已停止的），供 Reconciler 对账。"""
         return await asyncio.to_thread(self._list_managed_sync)
+
+    # ── v2：按工作区分配的执行实例（ADR 0025）──────────────────────────────────
+
+    def _ensure_wa_network_sync(self, name: str, internal: bool) -> None:
+        """v2 网络：关闭 ICC，实例之间在网桥上互不可达（网关例外由 netguard 放行）。"""
+        try:
+            network = self._docker.networks.get(name)
+            icc = (network.attrs.get("Options") or {}).get("com.docker.network.bridge.enable_icc")
+            if icc != "false":
+                raise RuntimeError(
+                    f"v2 网络 {name} 已存在但未关闭 ICC；请删除后由 Hub 重建（docker network rm {name}）"
+                )
+        except docker.errors.NotFound:
+            self._docker.networks.create(
+                name,
+                driver="bridge",
+                internal=internal,
+                options={"com.docker.network.bridge.enable_icc": "false"},
+                labels={_GATEWAY_LABEL: "network", V2_LABEL: "true"},
+            )
+            logger.info(f"已创建 v2 网络 | name={name} | internal={internal} | icc=false")
+
+    async def ensure_wa_networks(self) -> None:
+        await asyncio.to_thread(self._ensure_wa_network_sync, settings.wa_network, False)
+        await asyncio.to_thread(self._ensure_wa_network_sync, settings.wa_network_isolated, True)
+
+    def _ensure_wa_gateway_sync(self) -> bool:
+        """v2 网关：与 v1 同镜像，但不转发 MinIO；在两张 v2 网上带别名 SANDBOX_GATEWAY_NAME。
+        返回 True 表示本次新建（IP 可能变了，netguard 须重新下发）。"""
+        name = settings.wa_gateway_name
+        alias = settings.SANDBOX_GATEWAY_NAME
+        image = settings.DOCKER_IMAGE_GATEWAY
+        forwards = ",".join(
+            f"{port}={upstream}" for port, upstream in settings.gateway_forwards(include_minio=False)
+        )
+        created = False
+        try:
+            container = self._docker.containers.get(name)
+            container.reload()
+            env = container.attrs.get("Config", {}).get("Env") or []
+            current = next((e.split("=", 1)[1] for e in env if e.startswith("FORWARDS=")), None)
+            if (
+                container.status != "running"
+                or current != forwards
+                or container.labels.get(_GATEWAY_LABEL) != "true"
+                or image not in (container.attrs.get("Config", {}).get("Image"), *container.image.tags)
+            ):
+                logger.info(f"v2 网关配置已变或未运行，重建 | name={name} | status={container.status}")
+                container.remove(force=True)
+                raise docker.errors.NotFound("recreate")
+        except docker.errors.NotFound:
+            endpoint = self._docker.api.create_endpoint_config(aliases=[alias])
+            container = self._docker.containers.run(
+                image=image,
+                detach=True,
+                name=name,
+                network=settings.wa_network,
+                networking_config={settings.wa_network: endpoint},
+                environment={"FORWARDS": forwards},
+                extra_hosts={"host.docker.internal": "host-gateway"},
+                restart_policy={"Name": "unless-stopped"},
+                labels={_GATEWAY_LABEL: "true", V2_LABEL: "true"},
+            )
+            created = True
+            logger.info(f"v2 网关已启动 | name={name} | alias={alias} | forwards={forwards or '(空)'}")
+        container.reload()
+        attached = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        if settings.wa_network_isolated not in attached:
+            self._docker.networks.get(settings.wa_network_isolated).connect(container, aliases=[alias])
+            created = True
+        return created
+
+    async def ensure_wa_gateway(self) -> bool:
+        return await asyncio.to_thread(self._ensure_wa_gateway_sync)
+
+    def _wa_bridges_sync(self) -> list[BridgeInfo]:
+        gateway = self._docker.containers.get(settings.wa_gateway_name)
+        gateway.reload()
+        attached = gateway.attrs.get("NetworkSettings", {}).get("Networks", {})
+        infos: list[BridgeInfo] = []
+        for name in (settings.wa_network, settings.wa_network_isolated):
+            network = self._docker.networks.get(name)
+            attrs = network.attrs
+            options = attrs.get("Options") or {}
+            bridge = options.get("com.docker.network.bridge.name") or f"br-{attrs['Id'][:12]}"
+            ipam = (attrs.get("IPAM") or {}).get("Config") or [{}]
+            host_ip = next((c.get("Gateway") for c in ipam if c.get("Gateway")), "")
+            gateway_ip = (attached.get(name) or {}).get("IPAddress", "")
+            if not gateway_ip:
+                raise RuntimeError(f"v2 网关不在网络 {name} 上")
+            infos.append(
+                BridgeInfo(
+                    network=name,
+                    bridge=bridge,
+                    host_ip=host_ip,
+                    gateway_ip=gateway_ip,
+                    internal=bool(attrs.get("Internal")),
+                )
+            )
+        return infos
+
+    async def wa_bridges(self) -> list[BridgeInfo]:
+        return await asyncio.to_thread(self._wa_bridges_sync)
+
+    def _image_labels_sync(self, image: str) -> Optional[dict]:
+        try:
+            return self._docker.images.get(image).labels or {}
+        except docker.errors.ImageNotFound:
+            return None
+
+    async def image_labels(self, image: str) -> Optional[dict]:
+        """镜像标签；镜像不存在返回 None。"""
+        return await asyncio.to_thread(self._image_labels_sync, image)
+
+    def _build_wa_env(
+        self, sandbox_type: SandboxType, api_token: str, extra_env: Optional[dict[str, str]]
+    ) -> dict[str, str]:
+        env = self._build_container_env(sandbox_type, extra_env)
+        env.update(
+            {
+                "SANDBOX_API_TOKEN": api_token,
+                "SANDBOX_CWD": "/workspace/work",
+                "SANDBOX_WORKSPACE": "/workspace/work",
+                "SANDBOX_LAYOUT": "work-area/v1",
+                "CR_SKILLS_DIR": "/workspace/role/skills",
+                "SANDBOX_JOB_MAX_LIFETIME": str(max(0, settings.WORK_AREA_JOB_MAX_LIFETIME)),
+            }
+        )
+        return env
+
+    def _run_wa_container_sync(
+        self,
+        *,
+        sandbox_id: str,
+        work_area_id: str,
+        user_id: str,
+        role_id: str,
+        session_id: str,
+        sandbox_type: SandboxType,
+        api_token: str,
+        binds: list[Bind],
+        mount_layout: list[dict],
+        extra_env: Optional[dict[str, str]],
+        network: str,
+        limits: dict,
+    ) -> tuple[str, str, str]:
+        image = settings.image_v2_for_type(sandbox_type)
+        name = f"cr-wa-{sandbox_type}-{sandbox_id.removeprefix('sb_')}"
+        labels = {
+            settings.CONTAINER_LABEL: "true",
+            "sandboxhub.type": sandbox_type,
+            V2_LABEL: "true",
+            WORK_AREA_LABEL: work_area_id,
+            SANDBOX_ID_LABEL: sandbox_id,
+            USER_LABEL: user_id,
+            ROLE_LABEL: role_id,
+            SESSION_LABEL: session_id,
+            MOUNT_LAYOUT_LABEL: json.dumps(mount_layout, ensure_ascii=False, separators=(",", ":")),
+        }
+        if extra_env:
+            labels[_ENV_LABEL] = "true"
+        mounts = [
+            docker.types.Mount(
+                target=b.target,
+                source=b.source,
+                type="bind",
+                read_only=b.read_only,
+                propagation=b.propagation or None,
+            )
+            for b in binds
+        ]
+        security_opt = ["no-new-privileges"]
+        if sandbox_type == "ubuntu":
+            security_opt.append("seccomp=unconfined")
+        run_kwargs = dict(
+            image=image,
+            detach=True,
+            name=name,
+            network=network,
+            shm_size="2g",
+            extra_hosts={"host.docker.internal": "host-gateway"},
+            environment=self._build_wa_env(sandbox_type, api_token, extra_env),
+            labels=labels,
+            mounts=mounts,
+            cap_drop=_V2_CAP_DROP,
+            security_opt=security_opt,
+            # 不改容器工作目录：镜像入口依赖 WORKDIR（/app、/root）启动 app；终端初始 cwd 由 SANDBOX_CWD 决定
+        )
+        if limits.get("memory_mb"):
+            run_kwargs["mem_limit"] = f"{int(limits['memory_mb'])}m"
+        if limits.get("cpus"):
+            run_kwargs["nano_cpus"] = int(float(limits["cpus"]) * 1e9)
+        if limits.get("pids"):
+            run_kwargs["pids_limit"] = int(limits["pids"])
+        dns = settings.dns_servers()
+        if dns:
+            run_kwargs["dns"] = dns
+            run_kwargs["dns_opt"] = ["use-vc"]
+
+        try:
+            container = self._docker.containers.run(**run_kwargs)
+        except docker.errors.APIError:
+            # 创建成功但启动失败（如 bind 源不可用）会留下 created 状态的容器；名字含随机 ID，只会是自己的
+            try:
+                self._docker.containers.get(name).remove(force=True)
+            except docker.errors.APIError:
+                pass
+            raise
+        deadline = time.time() + 30
+        ip = ""
+        while time.time() < deadline:
+            container.reload()
+            if container.status not in ("running", "created"):
+                logs = container.logs(tail=20).decode(errors="replace")
+                container.remove(force=True)
+                raise RuntimeError(f"v2 实例意外退出 | name={name} | status={container.status} | logs={logs[-500:]}")
+            try:
+                ip = self._get_container_ip(container, prefer=network)
+                break
+            except RuntimeError:
+                time.sleep(0.3)
+        if not ip:
+            container.remove(force=True)
+            raise RuntimeError(f"v2 实例无法获取 IP | name={name}")
+        return container.id, name, ip
+
+    def _container_logs_sync(self, container_id: str) -> str:
+        try:
+            raw = self._docker.containers.get(container_id).logs(tail=20)
+            return raw.decode(errors="replace")[-500:]
+        except docker.errors.APIError:
+            return ""
+
+    async def run_wa_container(self, **kwargs) -> ContainerInfo:
+        """创建 v2 实例：无特权、只有 bind 列表、每实例 token；不进 warm pool。等待 API 可连。"""
+        sandbox_type: SandboxType = kwargs["sandbox_type"]
+        network: str = kwargs["network"]
+        container_id, name, ip = await asyncio.to_thread(lambda: self._run_wa_container_sync(**kwargs))
+        if not await self.wait_healthy(ip):
+            logs = await asyncio.to_thread(self._container_logs_sync, container_id)
+            await asyncio.to_thread(self._stop_and_remove_sync, container_id)
+            raise RuntimeError(f"v2 实例健康检查超时 | name={name} | logs={logs}")
+        if network == settings.wa_network_isolated:
+            await asyncio.to_thread(self._write_policy_marker_sync, container_id, "deny")
+        logger.info(f"v2 实例就绪 | name={name} | ip={ip} | work_area={kwargs['work_area_id']}")
+        return ContainerInfo(
+            container_id=container_id,
+            container_name=name,
+            container_ip=ip,
+            sandbox_type=sandbox_type,
+            mounted=False,
+            mount_path="/workspace",
+            env_injected=bool(kwargs.get("extra_env")),
+            network=network,
+        )
+
+    async def stop_wa_container(self, container_id: str) -> None:
+        """归档前停止全部进程；工作区挂载和容器暂时保留，重试停止幂等。"""
+        def stop() -> None:
+            try:
+                self._docker.containers.get(container_id).stop(timeout=10)
+            except docker.errors.NotFound:
+                return
+        await asyncio.to_thread(stop)
+
+    async def switch_wa_network(self, info: ContainerInfo, mode: NetworkMode) -> ContainerInfo:
+        """v2 实例按策略在两张 v2 网之间热切换（语义同 switch_network）。"""
+        target = settings.wa_network_for_mode(mode)
+        if info.network == target:
+            return info
+        old_ip = info.container_ip
+        new_ip = await asyncio.to_thread(self._switch_network_sync, info.container_id, target)
+        if not await self.wait_healthy(new_ip, timeout=10):
+            raise RuntimeError(f"切网后 v2 实例不可达 | name={info.container_name} | ip={new_ip}")
+        await asyncio.to_thread(self._write_policy_marker_sync, info.container_id, mode)
+        info.container_ip = new_ip
+        info.network = target
+        logger.info(f"v2 实例已切网 | name={info.container_name} | mode={mode} | ip={old_ip}->{new_ip}")
+        return info

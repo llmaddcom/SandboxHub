@@ -26,6 +26,8 @@ class WarmPool:
         self._lock = asyncio.Lock()
         # sandbox types currently being refilled; prevents concurrent _refill double-spawning
         self._refilling: set[str] = set()
+        # v1 排空（切换到 v2 的停机窗口）期间停止补池
+        self.paused = False
 
     async def acquire(self, sandbox_type: SandboxType) -> ContainerInfo | None:
         """
@@ -119,9 +121,9 @@ class WarmPool:
             await self._refill(sandbox_type, target)
 
     async def _refill(self, sandbox_type: SandboxType, target: int) -> None:
-        """补充指定类型到目标数量，并发启动缺少的容器数。已在补充中则跳过。"""
+        """补充指定类型到目标数量，并发启动缺少的容器数。已在补充中或已暂停则跳过。"""
         async with self._lock:
-            if sandbox_type in self._refilling:
+            if self.paused or sandbox_type in self._refilling:
                 return
             current = len(self._pools[sandbox_type])
             needed = target - current

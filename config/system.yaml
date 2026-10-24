@@ -67,3 +67,41 @@ workspace:
   # 挂载就绪探测：mountpoint 轮询次数与间隔（秒）
   mount_ready_retries: 20
   mount_ready_interval: 0.5
+
+gateway:
+  # v1 网关 cr-host 是否按 MINIO_ENDPOINT 自动转发 MinIO（v1 容器内 rclone 经它访问 MinIO）。
+  # 切换到 v2 后关闭；回滚到 v1 时恢复。v2 网关从不转发 MinIO。
+  minio_forward: true
+
+work_area:
+  # v2：按工作区分配执行实例（ADR 0025）。实例无特权、无存储凭据，文件经宿主 bind 进入。
+  enabled: true
+  # v2 实例镜像：须是带 sandboxhub.api_auth=1 标签的新镜像（容器内 API 校验每实例 token）。
+  # 用版本标签，不用 :latest（v1 仍在用 :latest，回滚不受影响）。
+  image_code: "sandbox-code:2026.10.22-1"
+  image_ubuntu: "sandbox-ubuntu:2026.10.22-1"
+  # cr-fs 特权 sidecar（host 网络）：rclone 角色目录挂载、netguard iptables、工作区文件操作
+  image_fs: "sandbox-fs:2026.10.06-1"
+  # 同时存活的实例上限：超限 acquire 返回 409 并列出占用者
+  max_per_role: 2
+  max_per_user: 4
+  # 实例内单个后台 job 最长存活（秒），到期由容器内监督器终止；0 = 不限
+  job_max_lifetime: 21600
+  # Hub 兜底：实例无任何 API 往来超过此时长即删除（只删实例，不删工作区）。平台侧空闲 15 分钟
+  # 就会主动释放，这里只兜平台失联。0 = 关闭
+  idle_backstop_ttl: 86400
+  # 平台侧空闲回收（秒）：回合结束且没有存活的后台 job，空闲这么久后平台先归档交付再释放实例。
+  # Hub 不执行，只经 capabilities 下发，使工作区的资源参数集中在这一处调整
+  idle_release_seconds: 900
+  # 工作区软上限（字节）：平台在写类工具执行前查用量，超过即拒绝写入（终端仍可用来清理）；0 = 不限
+  soft_cap_bytes: 10737418240
+  # 隔离自检周期（秒）：探针容器验证实例互访、连宿主端口、连 MinIO 均不可达
+  selftest_interval: 600
+  # inputs blob 缓存总量上限（字节），超出按最近最少使用淘汰未被任何实例引用的 blob；0 = 不限
+  inputs_cache_max_bytes: 21474836480
+  # 角色目录挂载引用归零后延迟卸载（秒），避免同一数字人连续回合反复挂卸
+  unmount_grace_seconds: 60
+  # 工作区文件列表单次最多返回条目，超出标记 truncated
+  list_max_files: 5000
+  # 工作区用量统计缓存（秒）：平台在写类工具前查询容量，缓存避免每次全量遍历
+  usage_cache_seconds: 15
