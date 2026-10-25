@@ -15,7 +15,7 @@ import pytest
 from src.config import settings
 from src.manager.fs_sidecar import FsOpError
 from src.manager.inputs_cache import InputsCache
-from src.manager.netguard import Capabilities, Capability
+from src.manager.netguard import Capabilities, Capability, ImageFeatures
 from src.manager.wa_instances import AcquireSpec, WorkAreaError, WorkAreaService
 from src.models import (
     MOUNT_LAYOUT_LABEL,
@@ -287,6 +287,20 @@ async def test_selftest_pending_refuses(env):
     with pytest.raises(WorkAreaError) as ei:
         await service.acquire(_spec())
     assert ei.value.extra["failing"] == ["selftest_pending"]
+
+
+def test_capabilities_add_procs_and_engines_without_changing_existing_fields(env):
+    service, _, _, _ = env
+    caps = service.selftest.result
+    before = service.capabilities()
+    caps.images = {"code": ImageFeatures(procs=True, engines={"pi": "1.4.0", "dsh": "0.2.1-rc.3"})}
+    data = service.capabilities()
+    assert data["procs"] == {"ubuntu": False, "code": True}
+    assert data["engines"] == {"ubuntu": {}, "code": {"pi": "1.4.0", "dsh": "0.2.1-rc.3"}}
+    unchanged = {k: v for k, v in data.items() if k not in ("procs", "engines")}
+    assert unchanged == {k: v for k, v in before.items() if k not in ("procs", "engines")}
+    for key in ("ok", "checked_at", "failing", "items", "sandbox_types", "layout_version", "cwd", "limits", "instances"):
+        assert key in data
 
 
 async def test_create_failure_rolls_back(env):

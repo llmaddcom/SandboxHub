@@ -47,6 +47,10 @@ _GATEWAY_LABEL = "sandboxhub.gateway"
 _POLICY_MARKER = "/etc/sandbox/network-policy"
 # v2 实例镜像须带此标签：容器内 API 会校验每实例 token（SANDBOX_API_TOKEN）。
 API_AUTH_LABEL = "sandboxhub.api_auth"
+# 镜像能力标签（SandboxHub#52）：app 提供 /api/procs 长驻进程接口（"1"）；预置的执行引擎及版本
+# （JSON 对象，如 {"pi":"1.4.0","dsh":"0.2.1-rc.3"}）。经 /v2/capabilities 的 procs / engines 上报。
+PROCS_LABEL = "sandboxhub.procs"
+ENGINES_LABEL = "sandboxhub.engines"
 # v2 实例去掉的默认 capability：NET_RAW 可伪造 ARP/原始包，MKNOD 可建设备节点。
 _V2_CAP_DROP = ["NET_RAW", "MKNOD"]
 
@@ -618,13 +622,14 @@ class ContainerManager:
 
     async def clean_and_reset(self, container_ip: str) -> None:
         """
-        清理 workspace + 重置 bash session（归还 pool / 启动收养回 pool 前调用）。
-        失败抛 RuntimeError，由调用方销毁容器——上一任租户的文件与会话状态未清干净的
+        回收长驻进程 + 清理 workspace + 重置 bash session（归还 pool / 启动收养回 pool 前调用）。
+        失败抛 RuntimeError，由调用方销毁容器——上一任租户的文件、会话状态与进程未清干净的
         容器绝不能回 pool（跨租户串台）。
         """
         api_base = f"http://{container_ip}:{settings.SANDBOX_API_PORT}"
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
+                await self._remove_procs(client, api_base)
                 await client.post(f"{api_base}/api/terminal/restart")
                 await client.post(
                     f"{api_base}/api/terminal/execute",
@@ -632,6 +637,19 @@ class ContainerManager:
                 )
         except Exception as e:
             raise RuntimeError(f"clean_and_reset 失败 | ip={container_ip} | err={e}") from e
+
+    @staticmethod
+    async def _remove_procs(client: httpx.AsyncClient, api_base: str) -> None:
+        """上一任租户的长驻进程（/api/procs，SandboxHub#52）不能留给下一任：逐个 DELETE（先 KILL 进程组）。
+        旧镜像没有该接口（404）视为没有；其余失败抛出，由调用方销毁容器。"""
+        response = await client.get(f"{api_base}/api/procs")
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+        for proc in response.json().get("procs", []):
+            removed = await client.delete(f"{api_base}/api/procs/{proc['proc_id']}")
+            if removed.status_code != 404:   # 404 = 已被回收
+                removed.raise_for_status()
 
     async def list_managed(self) -> list[ManagedContainer]:
         """列出 Docker 侧全部受管容器（含已停止的），供 Reconciler 对账。"""

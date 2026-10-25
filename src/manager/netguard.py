@@ -33,7 +33,13 @@ import docker.errors
 from loguru import logger
 
 from src.config import _endpoint_port, settings
-from src.manager.container_manager import API_AUTH_LABEL, BridgeInfo, ContainerManager
+from src.manager.container_manager import (
+    API_AUTH_LABEL,
+    ENGINES_LABEL,
+    PROCS_LABEL,
+    BridgeInfo,
+    ContainerManager,
+)
 from src.manager.fs_sidecar import FsSidecar
 
 PRIVATE_CIDRS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16")
@@ -219,10 +225,40 @@ class Capability:
 
 
 @dataclass
+class ImageFeatures:
+    """v2 实例镜像的能力标签（SandboxHub#52）：是否提供 /api/procs、预置哪些执行引擎及版本。"""
+
+    procs: bool = False
+    engines: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_labels(cls, labels: Optional[dict]) -> "ImageFeatures":
+        """镜像不存在（None）或缺标签 = 不支持；engines 标签不是 {名字: 版本} 对象时按无引擎处理。"""
+        if not labels:
+            return cls()
+        engines: dict[str, str] = {}
+        raw = labels.get(ENGINES_LABEL)
+        if raw:
+            try:
+                value = json.loads(raw)
+            except ValueError:
+                value = None
+            if isinstance(value, dict) and all(
+                isinstance(k, str) and k and isinstance(v, str) and v for k, v in value.items()
+            ):
+                engines = dict(value)
+            else:
+                logger.warning(f"镜像标签 {ENGINES_LABEL} 不是 {{引擎: 版本}} 对象，按无引擎处理 | value={raw!r}")
+        return cls(procs=labels.get(PROCS_LABEL) == "1", engines=engines)
+
+
+@dataclass
 class Capabilities:
     items: dict[str, Capability] = field(default_factory=dict)
     checked_at: Optional[datetime] = None
     duration_ms: int = 0
+    # sandbox_type → 镜像能力；随自检刷新（自检前与镜像缺失时为不支持）
+    images: dict[str, ImageFeatures] = field(default_factory=dict)
 
     # 全局必需项：任一不满足 v2 分配一律 503
     REQUIRED = (
@@ -251,6 +287,7 @@ class Capabilities:
         return not self.failing(sandbox_type)
 
     def to_dict(self) -> dict:
+        features = {t: self.images.get(t) or ImageFeatures() for t in settings.sandbox_types}
         return {
             "ok": not self.failing(),
             "checked_at": self.checked_at.isoformat() if self.checked_at else None,
@@ -258,6 +295,8 @@ class Capabilities:
             "failing": self.failing(),
             "items": {k: {"ok": v.ok, "detail": v.detail} for k, v in self.items.items()},
             "sandbox_types": {t: self.ok_for(t) for t in settings.sandbox_types},
+            "procs": {t: f.procs for t, f in features.items()},
+            "engines": {t: dict(f.engines) for t, f in features.items()},
         }
 
 
@@ -288,18 +327,20 @@ class SelfTest:
             ),
         }
 
-    async def _image_items(self) -> dict[str, Capability]:
+    async def _image_items(self) -> tuple[dict[str, Capability], dict[str, ImageFeatures]]:
         items: dict[str, Capability] = {}
+        features: dict[str, ImageFeatures] = {}
         for sandbox_type in settings.sandbox_types:
             image = settings.image_v2_for_type(sandbox_type)
             labels = await self._manager.image_labels(image)
+            features[sandbox_type] = ImageFeatures.from_labels(labels)
             if labels is None:
                 items[f"image_{sandbox_type}"] = Capability(False, f"镜像 {image} 不存在")
             elif labels.get(API_AUTH_LABEL) != "1":
                 items[f"image_{sandbox_type}"] = Capability(False, f"镜像 {image} 缺少标签 {API_AUTH_LABEL}=1")
             else:
                 items[f"image_{sandbox_type}"] = Capability(True, image)
-        return items
+        return items, features
 
     # ── 探针 ────────────────────────────────────────────────────────────────
 
@@ -415,7 +456,8 @@ class SelfTest:
         async with self._lock:
             started = time.monotonic()
             items = self.static_items()
-            items.update(await self._image_items())
+            image_items, images = await self._image_items()
+            items.update(image_items)
             fs_ok = await self._fs.running()
             items["fs_sidecar"] = Capability(fs_ok, self._fs.name if fs_ok else f"{self._fs.name} 未运行")
             probe_names = ("isolation_peer", "isolation_host", "isolation_storage", "gateway_reachable")
@@ -439,6 +481,7 @@ class SelfTest:
                 items=items,
                 checked_at=datetime.now(tz=timezone.utc),
                 duration_ms=int((time.monotonic() - started) * 1000),
+                images=images,
             )
             failing = result.failing()
             if failing:

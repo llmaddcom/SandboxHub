@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 
 from src.config import settings
@@ -12,6 +14,7 @@ from src.manager.fs_sidecar import FsOpError, ReadResult
 from src.manager.netguard import Capabilities
 from src.manager.wa_instances import WorkAreaError
 from src.models import ContainerInfo, SandboxRecord, WorkAreaInstance
+from src.proxy import forwarder
 from src.routers import sandboxes as v1_router
 from src.routers import v2 as v2_router
 
@@ -140,6 +143,45 @@ async def test_proxy_injects_instance_token(client, service, with_key, monkeypat
     assert r.status_code == 200
     assert captured["ip"] == "172.30.0.9" and captured["token"] == "tok" and captured["path"] == "api/terminal/execute"
     service.registry.touch.assert_called_with("sb_1")
+
+
+async def test_proxy_round_trips_proc_requests_untagged(client, service, with_key):
+    """/api/procs 经真实转发器到「容器」：GET 带查询串、POST 数 MB 的 JSON、DELETE 都原样到达；
+    不按终端任务打来源（引擎进程跨多个回合，SandboxHub#52）。"""
+    service.get.return_value = _instance()
+    container = FastAPI()
+
+    @container.api_route("/{path:path}", methods=["GET", "POST", "DELETE"])
+    async def echo(path: str, request: Request):
+        body = await request.body()
+        return {
+            "method": request.method,
+            "path": path,
+            "query": dict(request.query_params),
+            "size": len(body),
+            "token": request.headers.get("x-sandbox-token"),
+            "origin": request.headers.get("x-sandbox-job-origin"),
+        }
+
+    forwarder._client_pool["172.30.0.9"] = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=container), base_url="http://172.30.0.9:8000"
+    )
+    start = {"name": "engine", "argv": ["dsh"], "files": [{"path": "/tmp/f", "content_b64": "A" * (3 << 20)}]}
+    try:
+        async with client:
+            posted = (await client.post("/v2/sandboxes/sb_1/proxy/api/procs", json=start, headers=HEADERS)).json()
+            listed = (
+                await client.get("/v2/sandboxes/sb_1/proxy/api/procs", params={"name": "engine"}, headers=HEADERS)
+            ).json()
+            deleted = (await client.delete("/v2/sandboxes/sb_1/proxy/api/procs/p_1", headers=HEADERS)).json()
+    finally:
+        await forwarder.close_client("172.30.0.9")
+    assert posted["method"] == "POST" and posted["path"] == "api/procs" and posted["size"] > 3 << 20
+    assert listed["method"] == "GET" and listed["query"] == {"name": "engine"}
+    assert deleted["method"] == "DELETE" and deleted["path"] == "api/procs/p_1"
+    for reply in (posted, listed, deleted):
+        assert reply["token"] == "tok" and reply["origin"] is None
+    service.terminal_start.assert_not_called()
 
 
 async def test_policy_apply_broadcasts_to_v2_instances(client, service, with_key):
