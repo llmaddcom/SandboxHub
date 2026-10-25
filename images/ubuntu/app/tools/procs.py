@@ -476,7 +476,7 @@ class Proc:
         written = 0
         try:
             while written < len(view):
-                if self._reaped.is_set():
+                if self._reaped.is_set() or self._stop.is_set():   # 已退出 / 正被回收
                     raise ProcError(409, "proc_exited", "进程已结束，stdin 写入中止", written=written)
                 try:
                     written += os.write(fd, view[written:])
