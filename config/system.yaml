@@ -78,8 +78,8 @@ work_area:
   enabled: true
   # v2 实例镜像：须是带 sandboxhub.api_auth=1 标签的新镜像（容器内 API 校验每实例 token）。
   # 用版本标签，不用 :latest（v1 仍在用 :latest，回滚不受影响）。
-  image_code: "sandbox-code:2026.10.25-1"
-  image_ubuntu: "sandbox-ubuntu:2026.10.25-1"
+  image_code: "sandbox-code:2026.10.25-2"
+  image_ubuntu: "sandbox-ubuntu:2026.10.25-2"
   # cr-fs 特权 sidecar（host 网络）：rclone 角色目录挂载、netguard iptables、工作区文件操作
   image_fs: "sandbox-fs:2026.10.06-1"
   # 同时存活的实例上限：超限 acquire 返回 409 并列出占用者

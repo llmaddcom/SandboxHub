@@ -267,8 +267,8 @@ class Settings(BaseSettings):
     MOUNT_READY_INTERVAL: float = 0.5
     GATEWAY_MINIO_FORWARD: bool = True
     WORK_AREA_ENABLED: bool = True
-    DOCKER_IMAGE_CODE_V2: str = "sandbox-code:2026.10.25-1"
-    DOCKER_IMAGE_UBUNTU_V2: str = "sandbox-ubuntu:2026.10.25-1"
+    DOCKER_IMAGE_CODE_V2: str = "sandbox-code:2026.10.25-2"
+    DOCKER_IMAGE_UBUNTU_V2: str = "sandbox-ubuntu:2026.10.25-2"
     DOCKER_IMAGE_FS: str = "sandbox-fs:2026.10.06-1"
     WORK_AREA_MAX_PER_ROLE: int = 2
     WORK_AREA_MAX_PER_USER: int = 4

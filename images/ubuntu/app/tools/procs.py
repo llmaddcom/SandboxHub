@@ -176,7 +176,8 @@ def _check_spec(spec: StartSpec) -> str:
     cwd = spec.cwd or _default_cwd()
     if not os.path.isabs(cwd) or "\x00" in cwd:
         raise _invalid(f"cwd 须是绝对路径：{cwd!r}")
-    if not os.path.isdir(cwd):
+    # cwd 可以是本次写入的文件所在的目录（如每次重建的引擎主目录）：写完文件后再核对一次。
+    if not os.path.isdir(cwd) and not _created_by_files(cwd, spec.files):
         raise _invalid(f"cwd 不存在或不是目录：{cwd}")
     for item in spec.files:
         _check_abs_path(item.path, "files.path")
@@ -187,6 +188,12 @@ def _check_spec(spec: StartSpec) -> str:
         for path in spec.reset_dirs:
             _check_reset_dir(path, mounts)
     return cwd
+
+
+def _created_by_files(cwd: str, files) -> bool:
+    """cwd 是否会在写入 ``files`` 时作为某个文件的上级目录被建出来。"""
+    prefix = os.path.normpath(cwd).rstrip("/") + "/"
+    return any(os.path.normpath(item.path).startswith(prefix) for item in files)
 
 
 def _reset_dir(path: str) -> None:
@@ -642,6 +649,8 @@ class ProcManager:
                     _write_file(item)
             except OSError as exc:
                 raise _invalid(f"启动前准备目录 / 文件失败：{exc}") from exc
+            if not os.path.isdir(cwd):
+                raise _invalid(f"cwd 不存在或不是目录：{cwd}")
             proc_id = new_ulid("p_")
             with self._lock:
                 self.used = True

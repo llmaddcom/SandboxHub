@@ -372,6 +372,36 @@ def test_reset_dirs_wipes_planted_files_before_files_are_written(client, tmp_pat
     assert (sibling / "keep").read_text() == "keep"
 
 
+def test_cwd_may_be_created_by_files_after_reset(client, tmp_path):
+    # 引擎主目录每次启动前被清空重建，它同时是 DSH 的启动目录：写文件后才存在，照样可以作 cwd。
+    home = tmp_path / "engine-home" / "s1"
+    (home / "stale").mkdir(parents=True)
+    proc = _start(
+        client,
+        argv=["pwd"],
+        cwd=str(home),
+        reset_dirs=[str(home)],
+        files=[{"path": str(home / "acp.patch.yml"), "content_b64": _b64(b"[]")}],
+    )
+    out, _, _ = _drain(client, proc["proc_id"])
+    assert out == f"{home}\n".encode() and not (home / "stale").exists()
+
+
+def test_cwd_that_files_do_not_create_is_still_rejected(client, tmp_path):
+    missing = tmp_path / "nope"
+    response = client.post(
+        "/api/procs",
+        json={
+            "name": "x",
+            "argv": ["true"],
+            "cwd": str(missing),
+            "files": [{"path": str(tmp_path / "elsewhere" / "f"), "content_b64": _b64(b"x")}],
+        },
+    )
+    assert response.status_code == 400 and response.json()["detail"]["reason"] == "invalid_request"
+    assert not (tmp_path / "elsewhere").exists()  # 校验在任何副作用之前
+
+
 def test_reset_dirs_removes_a_planted_symlink_without_following_it(client, tmp_path):
     victim = tmp_path / "victim"
     victim.mkdir()
