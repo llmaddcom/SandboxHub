@@ -79,7 +79,9 @@ docker build -f images/code/Dockerfile -t sandbox-code:latest images
 > - noVNC、websockify（GitHub）
 > - pyenv（GitHub）
 
-> **Code 镜像工具链：** Python 3.11 + Node 20（yarn/pnpm）、`git`/`ripgrep`/`jq`/`vim`、build-essential，以及日常 Python 库（pandas、openpyxl、python-docx/pptx、reportlab、pypdf、matplotlib、markitdown…）。Agent 可在运行时通过 `GET /api/system/env` 自检环境。
+> **Code 镜像工具链：** Python 3.11 + Node 20（yarn/pnpm）、`git`/`ripgrep`/`fd`/`jq`/`vim`、build-essential，以及日常 Python 库（pandas、openpyxl、python-docx/pptx、reportlab、pypdf、matplotlib、markitdown…）。Agent 可在运行时通过 `GET /api/system/env` 自检环境。
+
+> **执行引擎运行时（code 镜像）：** 平台托管的执行引擎单独装在 `/opt/cr-engines`，与系统 Node 20 分开：一套 Node 24 LTS（`/opt/cr-engines/node`）+ 固定版本的 `@earendil-works/pi-coding-agent`（命令 `pi`）与 `@deepseek-ai/dsh`（命令 `dsh`）。`/opt/cr-engines/bin/pi`、`/opt/cr-engines/bin/dsh` 是包装脚本，不管 `PATH` 怎样都用这套 Node 执行；两者不在 `PATH` 里，由平台经 `/api/procs` 启动。构建参数：`ENGINE_NODE_VERSION`（默认 24.22.1）、`PI_VERSION`（1.4.0）、`DSH_VERSION`（0.2.1-rc.3，须写精确版本，npm `latest` 还是 rc.2）、`NPM_REGISTRY`（npmmirror）、`ENGINE_ALLOW_SCRIPTS`（npm 11 默认不跑依赖的安装脚本，node-pty / koffi 需要放行）。`pi --version` / `dsh --version` 与参数不一致、node-pty 不可用、DSH 的 ACP `initialize` 或 pi 的 RPC `get_state` 走不通一个来回，构建都会失败。镜像带标签 `sandboxhub.procs="1"` 与 `sandboxhub.engines='{"pi":"…","dsh":"…"}'`（ubuntu 镜像只带 `sandboxhub.procs`）；引擎运行时约占 1.3 GB。
 
 #### 使用代理构建
 
@@ -239,7 +241,7 @@ curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/kil
 ```
 
 `status` 取值 `running | exited | killed`；`kill_reason` 为 `timeout`、`kill:<SIG>` 或 `restart`。
-多个 job 可并行。请求体 `session` 字段指定对话会话 → 容器内同名 tmux session（缺省 `default`），同会话的 job 共享 cwd / 导出环境并可用 `tmux send-keys / capture-pane / kill-window -t <job_id>` 互相交互，不同会话互不可见。活跃窗口最多 64 个，容量满时拒绝新命令，已有任务继续运行；只清理已完成窗口。`GET /api/terminal/activity` 返回 `running_jobs`、`live_panes` 与 `marked_processes`。job 向后代继承不含敏感信息的内部标记，扫描 `/proc` 时可识别 `nohup`、后台 `&`、`setsid` 后仍存活的用户进程，不依赖父 shell 或已剪枝的 job 记录；标记不进入跨 job 的环境状态，zombie 不计数。仅三个计数均明确为零才允许闲置回收；进程不可读、字段缺失、探测失败或旧镜像不支持时保守保留。同一响应还带任务来源台账（供 v2 `GET /v2/work-areas/{id}/jobs`）：`jobs`（`job_id`、`session_id`、`turn_id`、`started_at`、`ended_at`，epoch 秒）与 `unattributed_live`（存活却无来源记录的 job）；窗口结束且不再有带标记的后代进程时记结束时间（约每秒追踪一次）。
+多个 job 可并行。请求体 `session` 字段指定对话会话 → 容器内同名 tmux session（缺省 `default`），同会话的 job 共享 cwd / 导出环境并可用 `tmux send-keys / capture-pane / kill-window -t <job_id>` 互相交互，不同会话互不可见。活跃窗口最多 64 个，容量满时拒绝新命令，已有任务继续运行；只清理已完成窗口。`GET /api/terminal/activity` 返回 `running_jobs`、`live_panes` 与 `marked_processes`（运行中的长驻进程计入 `running_jobs`，并单列 `running_procs`，见下文）。job 向后代继承不含敏感信息的内部标记，扫描 `/proc` 时可识别 `nohup`、后台 `&`、`setsid` 后仍存活的用户进程，不依赖父 shell 或已剪枝的 job 记录；标记不进入跨 job 的环境状态，zombie 不计数。仅三个计数均明确为零才允许闲置回收；进程不可读、字段缺失、探测失败或旧镜像不支持时保守保留。同一响应还带任务来源台账（供 v2 `GET /v2/work-areas/{id}/jobs`）：`jobs`（`job_id`、`session_id`、`turn_id`、`started_at`、`ended_at`，epoch 秒）与 `unattributed_live`（存活却无来源记录的 job）；窗口结束且不再有带标记的后代进程时记结束时间（约每秒追踪一次）。
 
 `POST /api/file/view` 支持 `max_chars`（默认 16000）与 `column`（默认 0）。返回 `path`、`next_offset`、`next_column`、`truncated` 与 `total_lines`；后者仅读到文件末尾时可知，否则为 null。按返回位置继续，超长单行可能仍在同一 `next_offset`，须同时传回 `next_column`。读取在后台线程中逐片进行，不将整文件载入内存；页正文不再叠加固定截断，调用方也应保留该分页结果。旧客户端仍可从正文末尾取得准确续读参数。
 
@@ -267,6 +269,58 @@ curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/exe
 # data: {"type": "stdout", "chunk": "loss: 0.42\n"}
 # data: {"type": "done"}
 ```
+
+### 长驻进程（`/api/procs`）
+
+经 stdio 驱动的程序——平台托管的执行引擎（pi `--mode rpc`、DeepSeek Harness `--profile acp`）——以
+**proc** 运行（SandboxHub#52）。容器内应用直接持有它们的管道（不经 tmux / PTY，不清洗输出）：stdin
+可写（有背压）、可关闭，stdout 与 stderr **分开、逐字节原样**写入追加日志，按绝对字节偏移读取。
+proc 属于应用而不属于启动它的请求：调用方断线、长轮询被取消、后端重启都不影响它——按 `proc_id`
+（或按 `name` 查到）重新接上，从自己的游标续读即可。**没有存活上限**（不套用 `job_max_lifetime`），
+由调用方回收。经 v2 时下面每个调用都走 `/v2/sandboxes/{id}/proxy/...` 并带 `X-API-Key`。
+
+```bash
+P=http://localhost:8088/v2/sandboxes/sb_abc123/proxy
+# 启动：先清空 reset_dirs，再写 files，然后起进程
+curl -X POST $P/api/procs -H "X-API-Key: $KEY" -H "Content-Type: application/json" -d '{
+  "name": "engine:conv-42", "argv": ["/opt/cr-engines/bin/dsh", "--profile", "acp"],
+  "env": {"DSH_HOME": "/tmp/cr-engines/conv-42"}, "inherit_env": ["PATH", "HOME", "LANG", "TZ"],
+  "cwd": "/workspace/work", "reset_dirs": ["/tmp/cr-engines/conv-42"],
+  "files": [{"path": "/tmp/cr-engines/conv-42/profiles/acp/user.yml", "content_b64": "…", "mode": 384}],
+  "log_retain_bytes": 8388608}'
+# → 201 {"proc_id": "p_01K…", "name": "engine:conv-42", "pid": 312, "state": "running",
+#        "exit_code": null, "started_at": "2026-10-25T08:00:00.000000Z", "ended_at": null,
+#        "stdin_open": true, "stdout_size": 0, "stderr_size": 0}
+
+# 写 stdin：全部字节进了管道才返回（子进程不读时一直等）
+curl -X POST $P/api/procs/p_01K…/stdin -d '{"data_b64": "eyJqc29ucnBjIjoi…", "close": false}'
+# → {"written": 512, "stdin_open": true}
+
+# 按字节游标长轮询：任一路有游标之后的新字节、或进程已不在运行即返回，否则等满 wait 秒（上限 120）
+curl -X POST $P/api/procs/p_01K…/read -d '{"stdout_cursor": 0, "stderr_cursor": 0, "wait": 60}'
+# → {"stdout_b64": "…", "stdout_cursor": 4096, "stderr_b64": "", "stderr_cursor": 0,
+#    "truncated": false, "proc": {…ProcessInfo…}}
+
+curl -X POST $P/api/procs/p_01K…/signal -d '{"signal": "TERM"}'   # INT | TERM | HUP | KILL → {"ok": true}
+curl -X DELETE $P/api/procs/p_01K…        # 仍在运行先 KILL 进程组，再删记录与日志 → {"ok": true}
+curl "$P/api/procs?name=engine:conv-42"   # → {"procs": [ProcessInfo, …]}（不带 name 列全部）
+```
+
+错误体为 `{"detail": {"reason": …, "message": …}}`：`400 invalid_request`（请求体不对、可执行文件或
+cwd 不存在也是它）、`404 proc_not_found`、`409 proc_exists`（带 `proc_id`）、`409 stdin_closed` /
+`proc_exited`。
+
+| 方面 | 行为 |
+| --- | --- |
+| `name` | 同名的**运行中** proc 只能有一个（否则 409 `proc_exists` 并给出它）；同名的已结束 proc 在新启动前回收（记录 + 日志）。 |
+| 环境 | 只有 `env`，加上 `inherit_env` 点名、本应用环境里存在的变量（与 `env` 同名时 `env` 优先），再加 `CR_SANDBOX_PROC_ID=<proc_id>`。其余一概不继承——除非显式传入，绝不带 `SANDBOX_API_TOKEN`。`CR_SANDBOX_PROC_ID` / `CR_SANDBOX_JOB_ID` 为保留名。 |
+| `reset_dirs` | 写 `files` 之前整个删除：`/tmp` 下的引擎主目录租户可写，先清空才能防止上一轮预埋配置（如 `$DSH_HOME/cordis.patch.yml`）。每项须是规范化绝对路径，不能是 `/` 或顶层目录（`/tmp`、`/workspace` 等），不能是挂载点、也不能包含挂载点（`/workspace/work`、角色目录），上级路径不能有符号链接；该位置本身若是符号链接只删链接、不跟随。全部校验先于任何删除。 |
+| `files` | 绝对路径；缺失的上级目录按 0700 创建；先写临时文件再原子改名到位，权限取 `mode`（默认 0600）。 |
+| 进程 | 新会话 / 进程组（信号发给整组）；`cwd` 须已存在（缺省为终端初始目录）。 |
+| stdin | `close: true` 在写完后关闭——pi 与 DSH 都以 EOF 作为有序退出。重复关闭是幂等的。 |
+| 日志 | `/tmp/cr-procs/<proc_id>/stdout`、`stderr`；每路偏移从 0 起算，`stdout_size` / `stderr_size` 计入写出过的全部字节。`log_retain_bytes > 0` 时每路保证最近这么多字节可读（分段 `stdout.<偏移>`，更早的段删除）；游标早于该窗口时从窗口起点返回并标 `truncated: true`。`0` = 不限。`max_bytes`（默认 1 MiB，上限 16 MiB）限制每路单次读取量。读写都经已打开的 fd，沙盒里删掉日志文件不会打断输出流。 |
+| 结束 | 主进程退出后把剩余输出读尽（后代仍持有管道时最多等 2 秒），随后状态、退出码与两路大小定格。经 `/signal` 或 `DELETE` 发过信号后结束的记 `killed`，否则 `exited`；`exit_code` 为负表示被该号信号终止。`state != running` 且两路游标都追上大小即读完。 |
+| 活性 | 运行中的 proc 计入 `running_jobs`（并单列 `running_procs`）；带 proc 标记的存活进程（含主进程结束后仍在跑的后代）计入 `marked_processes`。因此闲置回收不会收走跑着引擎的实例。proc 不是终端 job：Hub 不给它打任务来源，也不进任务台账——一个引擎进程跨多个产品回合。 |
 
 ### 截图
 
@@ -297,6 +351,7 @@ Ubuntu 容器对外暴露 40+ REST 接口和 30+ MCP 工具，主要分类：
 | 分类 | 接口 | 说明 |
 |------|------|------|
 | 终端 | `/api/terminal/execute`、`/wait`、`/kill`、`/restart`、`/execute/stream` | 持久会话里 job 化执行 bash、长轮询、终止、SSE 流式输出 |
+| 长驻进程 | `/api/procs`、`/{id}/stdin`、`/{id}/read`、`/{id}/signal`、`DELETE /{id}` | 经 stdio 驱动的长驻进程（执行引擎）：显式环境、stdout/stderr 分开逐字节落日志、按游标长轮询 |
 | 屏幕 | `/api/screen/screenshot`、`/screenshot/region` | 全屏或区域截图 |
 | 鼠标 | `/api/mouse/click`、`/move`、`/drag`、`/scroll` | 像素级鼠标控制 |
 | 键盘 | `/api/keyboard/key`、`/type` | 按键、文本输入 |
