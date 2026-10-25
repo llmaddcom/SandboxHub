@@ -16,6 +16,12 @@ NODE="$ROOT/node/bin/node"
 fail() { echo "执行引擎安装失败：$*" >&2; exit 1; }
 check() { [ "$2" = "$3" ] || fail "$1 得到 '$2'，期望 '$3'"; }
 
+# npm 与引擎运行时会在 TMPDIR 下留编译缓存、原生模块解包等临时文件：整个安装与核对期间指向
+# 临时目录，最后删除，不把构建期的临时产物带进镜像的 /tmp
+scratch="$(mktemp -d)"
+mkdir -p "$scratch/tmp" "$scratch/dsh" "$scratch/home"
+export TMPDIR="$scratch/tmp"
+
 # fd：pi 的文件检索用 rg / fd（ripgrep 已在系统依赖层）
 apt-get update
 apt-get install -y --no-install-recommends fd-find
@@ -31,18 +37,18 @@ esac
 mkdir -p "$ROOT/node"
 curl -fsSL --retry 3 --retry-delay 5 \
     "https://cdn.npmmirror.com/binaries/node/v${ENGINE_NODE_VERSION}/node-v${ENGINE_NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
-    -o /tmp/engine-node.tar.xz
-tar -xJf /tmp/engine-node.tar.xz -C "$ROOT/node" --strip-components=1
-rm -f /tmp/engine-node.tar.xz
+    -o "$scratch/node.tar.xz"
+tar -xJf "$scratch/node.tar.xz" -C "$ROOT/node" --strip-components=1
+rm -f "$scratch/node.tar.xz"
 check "引擎 node --version" "$("$NODE" --version)" "v${ENGINE_NODE_VERSION}"
 
 # npm 11 默认不执行依赖的安装脚本：负责原生模块（node-pty / koffi 等）就位的几个包显式放行
 PATH="$ROOT/node/bin:$PATH" npm install -g --prefix "$ROOT" \
-    --registry "$NPM_REGISTRY" --cache /tmp/engine-npm-cache \
+    --registry "$NPM_REGISTRY" --cache "$scratch/npm-cache" \
     --no-fund --no-audit --no-update-notifier \
     --allow-scripts="$ENGINE_ALLOW_SCRIPTS" \
     "@earendil-works/pi-coding-agent@${PI_VERSION}" "@deepseek-ai/dsh@${DSH_VERSION}"
-rm -rf /tmp/engine-npm-cache
+rm -rf "$scratch/npm-cache"
 
 # 包装脚本替换 npm 生成的软链（入口的 #!/usr/bin/env node 会在 PATH 里先撞上系统 Node 20）
 wrap() {   # wrap <命令名> <包名>
@@ -57,11 +63,6 @@ wrap pi @earendil-works/pi-coding-agent
 wrap dsh @deepseek-ai/dsh
 
 # ── 构建期核对（沿用镜像默认 PATH：系统 Node 20 在前，证明包装脚本不依赖 PATH）──
-# 引擎运行时会在 TMPDIR 下留编译缓存、原生模块解包等临时文件：核对期间指向探针目录，随之删除，
-# 不把构建期的临时产物带进镜像的 /tmp
-probe="$(mktemp -d)"
-mkdir -p "$probe/tmp" "$probe/dsh" "$probe/home"
-export TMPDIR="$probe/tmp"
 check "系统 node --version" "$(node --version)" "v${NODE_VERSION}"
 check "pi --version" "$("$ROOT/bin/pi" --version)" "$PI_VERSION"
 check "dsh --version" "$("$ROOT/bin/dsh" --version)" "$DSH_VERSION"
@@ -76,18 +77,18 @@ term.onExit((e) => { if (e.exitCode !== 0 || !out.includes('pty-ok')) { console.
 
 # 管道末端 head 读到首行即退出，引擎随之收到 SIGPIPE / EOF：只看回复内容，不看管道退出码
 reply="$({ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}'; sleep 5; } \
-    | DSH_HOME="$probe/dsh" timeout 60 "$ROOT/bin/dsh" --profile acp 2>"$probe/dsh.err" | head -n 1)" || true
+    | DSH_HOME="$scratch/dsh" timeout 60 "$ROOT/bin/dsh" --profile acp 2>"$scratch/dsh.err" | head -n 1)" || true
 case "$reply" in
     *'"id":1'*'"result"'*) echo "DSH ACP initialize：ok" ;;
-    *) fail "DSH ACP initialize 无回复：$reply $(head -c 2000 "$probe/dsh.err")" ;;
+    *) fail "DSH ACP initialize 无回复：$reply $(head -c 2000 "$scratch/dsh.err")" ;;
 esac
 reply="$({ printf '%s\n' '{"type":"get_state","id":"1"}'; sleep 5; } \
-    | HOME="$probe/home" timeout 60 "$ROOT/bin/pi" --mode rpc --no-session 2>"$probe/pi.err" | head -n 1)" || true
+    | HOME="$scratch/home" timeout 60 "$ROOT/bin/pi" --mode rpc --no-session 2>"$scratch/pi.err" | head -n 1)" || true
 case "$reply" in
     *'"command":"get_state"'*'"success":true'*) echo "pi RPC get_state：ok" ;;
-    *) fail "pi RPC get_state 无回复：$reply $(head -c 2000 "$probe/pi.err")" ;;
+    *) fail "pi RPC get_state 无回复：$reply $(head -c 2000 "$scratch/pi.err")" ;;
 esac
 unset TMPDIR
-rm -rf "$probe"
+rm -rf "$scratch"
 
 echo "执行引擎运行时：node $("$NODE" --version)，pi $PI_VERSION，dsh $DSH_VERSION，$(du -sh "$ROOT" | cut -f1)"
