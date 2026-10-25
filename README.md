@@ -81,7 +81,9 @@ docker build -f images/code/Dockerfile -t sandbox-code:latest images
 > - noVNC, websockify (GitHub)
 > - pyenv (GitHub)
 
-> **Code image toolchain:** Python 3.11 + Node 20 (yarn/pnpm), `git`/`ripgrep`/`jq`/`vim`, build-essential, daily Python libs (pandas, openpyxl, python-docx/pptx, reportlab, pypdf, pymupdf, matplotlib, markitdown with docx/xlsx/pdf extras…), legacy Office readers (olefile, xlrd, msoffcrypto-tool, `antiword`, `catdoc`), `file`/`xxd` and `poppler-utils`. Agents can introspect it at runtime via `GET /api/system/env` or read `/etc/sandbox/MANIFEST.md` (includes a file-format → tool table).
+> **Code image toolchain:** Python 3.11 + Node 20 (yarn/pnpm), `git`/`ripgrep`/`fd`/`jq`/`vim`, build-essential, daily Python libs (pandas, openpyxl, python-docx/pptx, reportlab, pypdf, pymupdf, matplotlib, markitdown with docx/xlsx/pdf extras…), legacy Office readers (olefile, xlrd, msoffcrypto-tool, `antiword`, `catdoc`), `file`/`xxd` and `poppler-utils`. Agents can introspect it at runtime via `GET /api/system/env` or read `/etc/sandbox/MANIFEST.md` (includes a file-format → tool table).
+
+> **Engine runtime (code image):** the platform-hosted execution engines live in `/opt/cr-engines`, separate from the system Node 20: a Node 24 LTS (`/opt/cr-engines/node`) plus pinned `@earendil-works/pi-coding-agent` (bin `pi`) and `@deepseek-ai/dsh` (bin `dsh`). `/opt/cr-engines/bin/pi` and `/opt/cr-engines/bin/dsh` are wrappers that always run that Node, whatever `PATH` says; they are not on `PATH` (the platform starts them through `/api/procs`). Build args: `ENGINE_NODE_VERSION` (default 24.22.1), `PI_VERSION` (1.4.0), `DSH_VERSION` (0.2.1-rc.3 — pinned exactly, npm `latest` is still rc.2), `NPM_REGISTRY` (npmmirror) and `ENGINE_ALLOW_SCRIPTS` (npm 11 skips dependency install scripts unless allowed; node-pty / koffi need theirs). The build fails unless `pi --version` / `dsh --version` print the requested versions, node-pty works, and one DSH ACP `initialize` and one pi RPC `get_state` round-trip succeed. The image is labelled `sandboxhub.procs="1"` and `sandboxhub.engines='{"pi":"…","dsh":"…"}'` (the ubuntu image carries `sandboxhub.procs` only); the engine runtime adds about 1.3 GB.
 
 #### Building with a proxy
 
@@ -243,7 +245,8 @@ running jobs, destroys its tmux session and resets cwd / env.
 
 The server retains a capacity of 64 live windows and rejects new commands when full;
 existing jobs keep running. `GET /api/terminal/activity` reports `running_jobs`,
-`live_panes`, and `marked_processes`. Each job passes an internal, non-secret ID to
+`live_panes`, and `marked_processes` (running long-lived procs are included in
+`running_jobs` and also reported as `running_procs`, see below). Each job passes an internal, non-secret ID to
 its child processes, so `/proc` activity also protects `nohup`, background `&`, and
 `setsid` descendants after their shell exits or the job record is pruned. The marker
 is excluded from saved session environment; zombies do not count. Idle reclaim
@@ -290,6 +293,62 @@ curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/exe
 # data: {"type": "done"}
 ```
 
+### Long-lived processes (`/api/procs`)
+
+Programs driven over stdio — the platform's execution engines (pi `--mode rpc`, DeepSeek Harness
+`--profile acp`) — run as **procs** (SandboxHub#52). The container app holds their pipes directly
+(no tmux / PTY, no output cleaning): stdin is writable with backpressure and closable, stdout and
+stderr are recorded **separately and byte-exact** to append-only logs addressed by absolute byte
+offsets. A proc belongs to the app, not to the request that started it: client disconnects,
+cancelled long-polls and backend restarts do not touch it — reattach by `proc_id` (or find it by
+`name`) and resume reading from your cursors. There is **no lifetime cap** (`job_max_lifetime` does
+not apply); the caller removes it. Through v2, every call below goes to
+`/v2/sandboxes/{id}/proxy/...` with `X-API-Key`.
+
+```bash
+P=http://localhost:8088/v2/sandboxes/sb_abc123/proxy
+# start: reset_dirs are wiped, then files written, then the process spawned
+curl -X POST $P/api/procs -H "X-API-Key: $KEY" -H "Content-Type: application/json" -d '{
+  "name": "engine:conv-42", "argv": ["/opt/cr-engines/bin/dsh", "--profile", "acp"],
+  "env": {"DSH_HOME": "/tmp/cr-engines/conv-42"}, "inherit_env": ["PATH", "HOME", "LANG", "TZ"],
+  "cwd": "/workspace/work", "reset_dirs": ["/tmp/cr-engines/conv-42"],
+  "files": [{"path": "/tmp/cr-engines/conv-42/profiles/acp/user.yml", "content_b64": "…", "mode": 384}],
+  "log_retain_bytes": 8388608}'
+# → 201 {"proc_id": "p_01K…", "name": "engine:conv-42", "pid": 312, "state": "running",
+#        "exit_code": null, "started_at": "2026-10-25T08:00:00.000000Z", "ended_at": null,
+#        "stdin_open": true, "stdout_size": 0, "stderr_size": 0}
+
+# write stdin: returns once every byte is in the pipe (blocks while the child is not reading)
+curl -X POST $P/api/procs/p_01K…/stdin -d '{"data_b64": "eyJqc29ucnBjIjoi…", "close": false}'
+# → {"written": 512, "stdin_open": true}
+
+# long-poll from byte cursors: returns as soon as either stream has bytes past its cursor or the
+# proc is no longer running, otherwise after `wait` seconds (server cap 120)
+curl -X POST $P/api/procs/p_01K…/read -d '{"stdout_cursor": 0, "stderr_cursor": 0, "wait": 60}'
+# → {"stdout_b64": "…", "stdout_cursor": 4096, "stderr_b64": "", "stderr_cursor": 0,
+#    "truncated": false, "proc": {…ProcessInfo…}}
+
+curl -X POST $P/api/procs/p_01K…/signal -d '{"signal": "TERM"}'   # INT | TERM | HUP | KILL → {"ok": true}
+curl -X DELETE $P/api/procs/p_01K…        # KILL the group if running, drop record + logs → {"ok": true}
+curl "$P/api/procs?name=engine:conv-42"   # → {"procs": [ProcessInfo, …]} (all procs without name)
+```
+
+Errors are `{"detail": {"reason": …, "message": …}}`: `400 invalid_request` (also for malformed
+bodies, a missing executable or cwd), `404 proc_not_found`, `409 proc_exists` (with `proc_id`),
+`409 stdin_closed` / `proc_exited`.
+
+| Topic | Behavior |
+| --- | --- |
+| `name` | At most one **running** proc per name (else 409 `proc_exists` naming it). An exited / killed proc with the same name is removed (record + logs) before the new start. |
+| Environment | Exactly `env`, plus each `inherit_env` name copied from the app's own environment when present (`env` wins on overlap), plus `CR_SANDBOX_PROC_ID=<proc_id>`. Nothing else is inherited — never `SANDBOX_API_TOKEN` unless passed explicitly. `CR_SANDBOX_PROC_ID` / `CR_SANDBOX_JOB_ID` are reserved. |
+| `reset_dirs` | Removed recursively before `files` are written: engine homes under `/tmp` are tenant-writable, so wiping them stops a previous run from planting configuration (e.g. `$DSH_HOME/cordis.patch.yml`). Each entry must be a normalized absolute path, not `/` or a top-level directory (`/tmp`, `/workspace`, …), not a mount point and not containing one (`/workspace/work`, role directories), with no symlink among its parents; a symlink at the path itself is unlinked, never followed. Validation happens before any side effect. |
+| `files` | Absolute paths; missing parents are created (0700); each file is written to a temporary file and renamed into place with `mode` (default 0600). |
+| Process | Own session / process group (signals go to the whole group); `cwd` must exist (default: the terminal's initial directory). |
+| stdin | `close: true` closes it after writing — pi and DSH treat EOF as an orderly shutdown. Repeated `close` is idempotent. |
+| Logs | `/tmp/cr-procs/<proc_id>/stdout` and `stderr`; offsets start at 0 per stream and `stdout_size` / `stderr_size` count every byte ever written. `log_retain_bytes > 0` keeps the latest that many bytes of each stream readable (segments `stdout.<offset>`, older ones deleted); a cursor before that window returns data from the window start with `truncated: true`. `0` = unlimited. `max_bytes` (default 1 MiB, cap 16 MiB) bounds one read per stream. Logs are read and written through open descriptors, so deleting the files from inside the sandbox does not break a stream. |
+| End | After the main process exits, remaining output is drained (up to 2 s if descendants still hold the pipes), then state, exit code and sizes are final. `killed` = it ended after a signal sent through `/signal` or `DELETE`; otherwise `exited`; a negative `exit_code` means death by that signal. A reader is done once `state != running` and both cursors reached the sizes. |
+| Activity | Running procs count in `running_jobs` (and `running_procs`); live processes that carry the proc marker — including descendants that outlive their proc — count in `marked_processes`. Idle reclaim therefore never takes an instance with a live engine. Procs are not terminal jobs: the Hub does not tag them with a job origin and they are not in the job ledger, because one engine process spans many product turns. |
+
 ### Take a screenshot
 
 ```bash
@@ -319,6 +378,7 @@ The Ubuntu container exposes 40+ REST endpoints and 30+ MCP tools. Key categorie
 | Category | Endpoints | Description |
 |----------|-----------|-------------|
 | Terminal | `/api/terminal/execute`, `/wait`, `/kill`, `/restart`, `/execute/stream` | Job-based bash execution in per-conversation tmux sessions, long-poll, kill, SSE streaming |
+| Procs | `/api/procs`, `/{id}/stdin`, `/{id}/read`, `/{id}/signal`, `DELETE /{id}` | Long-lived stdio processes (execution engines): explicit env, separate byte-exact stdout/stderr logs, cursor long-poll |
 | Screen | `/api/screen/screenshot`, `/screenshot/region` | Full-screen or region capture |
 | Mouse | `/api/mouse/click`, `/move`, `/drag`, `/scroll` | Pixel-level mouse control |
 | Keyboard | `/api/keyboard/key`, `/type` | Key press, text input |
@@ -546,12 +606,12 @@ rejects allocation without falling back to v1.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /v2/capabilities?refresh=true` | Refresh isolation checks and return limits and ready image types |
+| `GET /v2/capabilities?refresh=true` | Refresh isolation checks and return limits, ready image types, and per-type `procs` / `engines` |
 | `POST /v2/work-areas/{id}/acquire` | Allocate/reuse an instance; optional inputs and context replace views |
 | `GET /v2/sandboxes` | Registered instances with owner/work/session/turn metadata |
 | `PUT /v2/sandboxes/{id}/inputs` | Update live inputs in place; removed grants disappear immediately |
 | `PUT /v2/sandboxes/{id}/context` | Update generated instructions |
-| `GET /v2/sandboxes/{id}/activity` | Known activity and running jobs |
+| `GET /v2/sandboxes/{id}/activity` | Known activity and running jobs (`running_jobs` includes running procs; `running_procs` separately, `null` for images without procs) |
 | `POST /v2/sandboxes/{id}/quiesce` | Stop all tenant processes, preserving mounts for archive reads |
 | `POST /v2/sandboxes/{id}/release` | Remove a running or quiesced instance, preserving the work area |
 | `/v2/sandboxes/{id}/proxy/{path}` | Forward tool requests with the instance's API token |
@@ -603,6 +663,31 @@ unknown until they age past `job_max_lifetime` (one day when 0). Ended records a
 removed after the same period. A missing work area returns
 `404 {"detail": {"reason": "work_area_not_found", ...}}`.
 
+**Execution engines (SandboxHub#52).** Engine processes run through the proxy as
+`/api/procs` (see *Long-lived processes* above). They are deliberately **not** in
+`TERMINAL_START_PATHS`: one engine process serves many product turns, so tagging it with the
+turn that started it would attribute every later turn's output to that first turn, and the
+job ledger above stays terminal-jobs-only. `GET /v2/capabilities` reports, for each configured
+v2 image (refreshed with every self-test; a missing image or label reads as unsupported):
+
+```json
+{"procs":   {"ubuntu": true, "code": true},
+ "engines": {"ubuntu": {}, "code": {"pi": "1.4.0", "dsh": "0.2.1-rc.3"}}}
+```
+
+from the image labels `sandboxhub.procs="1"` and `sandboxhub.engines` (JSON); all other
+fields are unchanged. Running procs count as activity, so neither the platform's idle release
+nor the v1 reaper reclaims an instance with a live engine, and the engine supervisor's
+long-polls through the proxy (≤ 120 s each, under the 330 s proxy read timeout) keep the
+instance's API traffic flowing, so `idle_backstop_ttl` only removes it once the platform has
+been gone that long. v1 warm containers delete leftover procs during their reset before
+returning to the pool. Engines reach the platform (model-gateway proxy, platform MCP) at the
+same address the sandbox CLIs use, the gateway host alias and forwarded port in
+`SANDBOX_MARKET_CLI_API_BASE` (e.g. `http://cr-host:8013`): the v2 gateway is attached to both
+v2 networks under the `SANDBOX_GATEWAY_NAME` alias and forwards `SANDBOX_GATEWAY_FORWARDS`,
+and netguard admits instance → gateway and gateway → host on both, so isolated (`deny`)
+instances keep that path and no extra egress rule is needed.
+
 Resource settings belong to `config/system.yaml`, under `work_area`:
 
 | Key | Default | Behavior |
@@ -611,7 +696,7 @@ Resource settings belong to `config/system.yaml`, under `work_area`:
 | `max_per_user` | 4 | Concurrent instances per owner |
 | `idle_release_seconds` | 900 | Platform idle reclaim threshold, advertised in capabilities |
 | `soft_cap_bytes` | 10737418240 | 10 GiB; platform checks before file writes, not a hard filesystem quota |
-| `job_max_lifetime` | 21600 | Kill a background job after 6 hours, `kill_reason=max_lifetime` |
+| `job_max_lifetime` | 21600 | Kill a background terminal job after 6 hours, `kill_reason=max_lifetime` (procs are not capped) |
 | `idle_backstop_ttl` | 86400 | Hub backstop for instances without API traffic; work areas remain |
 
 Both v2 networks deny peer access and unapproved host ports. v2 gateway forwarding

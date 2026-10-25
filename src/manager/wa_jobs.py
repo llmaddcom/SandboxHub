@@ -35,7 +35,9 @@ from src.manager.paths import require_id
 
 SCHEMA_VERSION = 1
 JOB_ORIGIN_HEADER = "X-Sandbox-Job-Origin"
-# 经 proxy 启动终端任务的容器路径（相对，无前导斜杠）
+# 经 proxy 启动终端任务的容器路径（相对，无前导斜杠）。长驻进程（api/procs，SandboxHub#52）不在此列：
+# 一个引擎进程跨多个产品回合，按启动时的回合打标会把之后各回合的产出都记到首个回合名下；
+# 它也不进本台账（容器只回报终端 job），活性另经 activity 的 running_jobs / running_procs 体现。
 TERMINAL_START_PATHS = frozenset({"api/terminal/execute", "api/terminal/execute/stream"})
 JOB_ID_RE = re.compile(r"^j_[0-9A-HJKMNP-TV-Z]{26}$")
 DEFAULT_RETENTION = 86400.0

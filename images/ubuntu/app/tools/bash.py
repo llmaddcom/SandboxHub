@@ -92,6 +92,15 @@ def count_marked_processes() -> int:
 
 def scan_marked_processes() -> list[str]:
     """One job ID per live marked process (see ``count_marked_processes``)."""
+    return scan_marked(_JOB_ACTIVITY_RE)
+
+
+def scan_marked(marker: re.Pattern) -> list[str]:
+    """One marker value per live process whose environment matches ``marker``.
+
+    Shared by terminal jobs (``CR_SANDBOX_JOB_ID``) and long-lived procs
+    (``CR_SANDBOX_PROC_ID``, app/tools/procs.py); each caller scans its own marker.
+    """
     found: list[str] = []
     uncertain = False
     try:
@@ -109,7 +118,7 @@ def scan_marked_processes() -> list[str]:
             before = (process / "stat").read_text().rsplit(")", 1)[1].split()
             if before[0] in ("Z", "X", "x"):
                 continue
-            marked = _JOB_ACTIVITY_RE.search((process / "environ").read_bytes())
+            marked = marker.search((process / "environ").read_bytes())
             after = (process / "stat").read_text().rsplit(")", 1)[1].split()
             if before[19] != after[19]:
                 uncertain = True
@@ -205,15 +214,19 @@ def _read_span(path: Path, start: int, end: int) -> str:
     )
 
 
-def _new_job_id() -> str:
-    """时间有序的 job id：j_ + 48bit 毫秒时间戳 + 80bit 随机（Crockford base32，26 位）。"""
+def new_ulid(prefix: str) -> str:
+    """时间有序的 id：前缀 + 48bit 毫秒时间戳 + 80bit 随机（Crockford base32，26 位）。"""
     alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
     value = (int(time.time() * 1000) << 80) | secrets.randbits(80)
     out = []
     for _ in range(26):
         out.append(alphabet[value & 31])
         value >>= 5
-    return "j_" + "".join(reversed(out))
+    return prefix + "".join(reversed(out))
+
+
+def _new_job_id() -> str:
+    return new_ulid("j_")
 
 
 def session_name(raw: str | None) -> str:

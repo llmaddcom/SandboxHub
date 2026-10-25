@@ -96,3 +96,47 @@ def test_env_keep_dns_when_forced_by_flag(mock_docker, monkeypatch):
     monkeypatch.setattr(settings, "SANDBOX_KEEP_DNS", True)
     env = ContainerManager()._build_container_env("ubuntu")
     assert env["SANDBOX_KEEP_DNS"] == "1"
+
+
+# ── v1 归还复位：上一任租户的长驻进程（SandboxHub#52）一并回收 ───────────────────
+
+
+def _reset_calls(monkeypatch, procs_status: int, procs: list[dict]) -> list[tuple[str, str]]:
+    import httpx
+
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/api/procs":
+            return httpx.Response(procs_status, json={"procs": procs} if procs_status == 200 else {"detail": "Not Found"})
+        return httpx.Response(200, json={"ok": True})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        "src.manager.container_manager.httpx.AsyncClient",
+        lambda **kwargs: real(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_clean_and_reset_removes_leftover_procs_first(mock_docker, monkeypatch):
+    calls = _reset_calls(monkeypatch, 200, [{"proc_id": "p_1"}, {"proc_id": "p_2"}])
+    await ContainerManager().clean_and_reset("172.17.0.5")
+    assert calls[:3] == [("GET", "/api/procs"), ("DELETE", "/api/procs/p_1"), ("DELETE", "/api/procs/p_2")]
+    assert ("POST", "/api/terminal/restart") in calls
+
+
+@pytest.mark.asyncio
+async def test_clean_and_reset_tolerates_images_without_procs(mock_docker, monkeypatch):
+    calls = _reset_calls(monkeypatch, 404, [])
+    await ContainerManager().clean_and_reset("172.17.0.5")
+    assert not any(method == "DELETE" for method, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_clean_and_reset_fails_when_procs_cannot_be_listed(mock_docker, monkeypatch):
+    _reset_calls(monkeypatch, 500, [])
+    with pytest.raises(RuntimeError, match="clean_and_reset"):
+        await ContainerManager().clean_and_reset("172.17.0.5")   # 调用方据此销毁容器，不回池

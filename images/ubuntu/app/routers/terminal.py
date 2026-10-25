@@ -9,6 +9,10 @@
 - POST /api/terminal/restart:        重启终端会话（kill 该会话在跑的 job，cwd / env 复位）
 - GET  /api/terminal/activity:       任务活性计数 + 任务来源台账（SandboxHub#47）
 
+活性：运行中的长驻进程（/api/procs，SandboxHub#52）计入 ``running_jobs``（另报 ``running_procs``），
+带 proc 标记的存活进程计入 ``marked_processes``——闲置回收不会收走跑着引擎的实例。它们不进
+任务来源台账：一个引擎进程跨多个产品回合，不能按某个回合归属。
+
 任务来源：SandboxHub v2 经 proxy 启动任务时带受信头 ``X-Sandbox-Job-Origin``
 （``{"session_id": ..., "turn_id": ...}``，调用方自带的同名头由 Hub 丢弃）；job 随来源落盘，
 activity 回报保留期内每个 job 的来源与起止时间，Hub 据此回答「哪个回合的任务在什么时候跑过」。
@@ -30,6 +34,7 @@ from pydantic import BaseModel, Field
 
 from ..tools import BashTool, ToolError
 from ..tools.bash import DEFAULT_WAIT, MAX_WAIT, Job, scan_marked_processes
+from . import procs as procs_router
 
 # 创建终端操作路由，设置前缀和标签
 router = APIRouter(prefix="/api/terminal", tags=["终端操作"])
@@ -165,17 +170,22 @@ def _job_payload(job: Job, start: int = 0) -> dict:
 
 @router.get("/activity", summary="查询终端任务活性（闲置回收前使用）")
 async def terminal_activity():
-    """计数供闲置判定；``jobs`` / ``unattributed_live`` 为任务来源台账（时间为 epoch 秒）。"""
+    """计数供闲置判定（全为 0 才算闲置）；``jobs`` / ``unattributed_live`` 为任务来源台账
+    （时间为 epoch 秒，只含终端 job）。"""
     session = get_bash_tool().session
+    procs = procs_router.get_manager()
     try:
         panes = await session.tmux.list_panes(strict=True)
         marked = await asyncio.to_thread(scan_marked_processes)
+        proc_marked = await asyncio.to_thread(procs.marked_processes)
     except ToolError as exc:
         raise HTTPException(status_code=503, detail=f"任务活性未知: {exc.message}") from exc
+    running_procs = procs.running_count()
     return {
-        "running_jobs": len(session.running),
+        "running_jobs": len(session.running) + running_procs,
+        "running_procs": running_procs,
         "live_panes": sum(not pane["dead"] for pane in panes),
-        "marked_processes": len(marked),
+        "marked_processes": len(marked) + proc_marked,
         **session.ledger(set(marked)),
     }
 

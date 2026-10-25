@@ -191,8 +191,10 @@ RUN chmod +x /root/entrypoint.sh
 # profile=desktop：加载完整 GUI 路由（screen/mouse/keyboard/browser/CDP）
 ENV SANDBOX_PROFILE=desktop
 
-# 能力标签：app 支持 SANDBOX_API_TOKEN（X-Sandbox-Token）校验，见 images/code/Dockerfile 同名标签。
-LABEL sandboxhub.api_auth="1"
+# 能力标签：app 支持 SANDBOX_API_TOKEN（X-Sandbox-Token）校验、提供 /api/procs 长驻进程接口，
+# 见 images/code/Dockerfile 同名标签。桌面镜像不预置执行引擎（无 sandboxhub.engines）。
+LABEL sandboxhub.api_auth="1" \
+      sandboxhub.procs="1"
 
 ARG DISPLAY_NUM=1
 ARG HEIGHT=768

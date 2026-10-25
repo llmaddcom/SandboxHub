@@ -799,10 +799,13 @@ class WorkAreaService:
             report = None
         if report is not None:
             self.jobs.merge(instance.work_area_id, instance.sandbox_id, report, time.time(), token)
+        # 运行中的长驻进程（引擎）已计入 running_jobs；单列出来供平台区分。旧镜像没有该字段 → None
+        procs = data.get("running_procs")
         return {
             "known": True,
             "idle": all(v == 0 for v in counts),
             "running_jobs": counts[0],
+            "running_procs": procs if type(procs) is int and procs >= 0 else None,
             "live_panes": counts[1],
             "marked_processes": counts[2],
             "last_active_at": instance.last_active_at.isoformat(),

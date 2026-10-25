@@ -8,7 +8,7 @@ FastAPI 主入口模块 - 沙盒操作服务。
 - 管理应用生命周期（启动/关闭时初始化/清理工具实例）
 
 SANDBOX_PROFILE:
-- code（轻量镜像）：仅 terminal/file/system/process，不加载 GUI 与其依赖（playwright/X 等）
+- code（轻量镜像）：仅 terminal/file/system/process/procs，不加载 GUI 与其依赖（playwright/X 等）
 - desktop（桌面镜像）：在 code 基础上增加 screen/mouse/keyboard/browser/CDP
 """
 
@@ -24,10 +24,12 @@ from . import APP_VERSION
 from .routers import (
     file as file_router,
     process as process_router,
+    procs as procs_router,
     system as system_router,
     terminal as terminal_router,
 )
 from .tools import BashTool, EditTool
+from .tools.procs import ProcManager
 
 PROFILE = os.getenv("SANDBOX_PROFILE", "desktop")
 
@@ -39,8 +41,10 @@ async def lifespan(app: FastAPI):
 
     bash = BashTool()
     edit = EditTool()
+    procs = ProcManager()
     terminal_router.bash_tool = bash
     file_router.edit_tool = edit
+    procs_router.proc_manager = procs
 
     if PROFILE == "desktop":
         # GUI 工具与其依赖仅桌面 profile 加载，避免轻量镜像引入 X/playwright
@@ -65,6 +69,7 @@ async def lifespan(app: FastAPI):
     yield
 
     print("正在关闭沙盒操作服务...")
+    procs.close()
     bash.close()
 
 
@@ -73,7 +78,7 @@ app = FastAPI(
     title="沙盒操作服务",
     description=(
         "基于 Docker 沙盒环境的操作接口服务。\n\n"
-        "终端/文件/系统/进程接口始终可用；屏幕/鼠标/键盘/浏览器接口仅 desktop profile 提供。"
+        "终端/文件/系统/进程/长驻进程接口始终可用；屏幕/鼠标/键盘/浏览器接口仅 desktop profile 提供。"
     ),
     version="2.0.0",
     lifespan=lifespan,
@@ -107,6 +112,7 @@ app.include_router(terminal_router.router)
 app.include_router(file_router.router)
 app.include_router(system_router.router)
 app.include_router(process_router.router)
+app.include_router(procs_router.router)
 
 # GUI 路由仅 desktop profile 注册
 if PROFILE == "desktop":
@@ -133,6 +139,7 @@ async def root():
         "file": "/api/file",
         "system": "/api/system",
         "process": "/api/process",
+        "procs": "/api/procs",
     }
     if PROFILE == "desktop":
         endpoints.update({
