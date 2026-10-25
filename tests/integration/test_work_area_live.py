@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 RAND = uuid.uuid4().hex[:6]
-IMAGE_CODE = os.environ.get("LIVE_IMAGE_CODE", "sandbox-code:2026.10.22-1")
+IMAGE_CODE = os.environ.get("LIVE_IMAGE_CODE", "sandbox-code:2026.10.25-1")
 IMAGE_FS = os.environ.get("LIVE_IMAGE_FS", "sandbox-fs:2026.10.06-1")
 GW_PORT = 18555
 # 测试里所有命令都受这个上限约束（平台对每个 job 生效），单条命令须远短于它

@@ -1,6 +1,7 @@
 # ============================================================
 # 轻量 code 沙箱镜像（无 GUI）
-# 提供 Python + Node 双语言环境 + 常用开发/办公库 + 终端/文件/系统/进程接口
+# 提供 Python + Node 双语言环境 + 常用开发/办公库 + 终端/文件/系统/进程/长驻进程接口
+# + 平台托管的执行引擎运行时（/opt/cr-engines：Node 24 + pi + DSH，见第 5d 步）
 # 目标：秒级冷启动、国内镜像源直连、适合跑编码 Agent（参考 opencode / codex）与日常办公脚本
 # 构建上下文 = SandboxHub/images（复用 ubuntu/app 同一套 app 代码）
 #   docker build -f images/code/Dockerfile -t sandbox-code:latest images
@@ -124,6 +125,22 @@ print('CJK font:', fm.findfont(fm.FontProperties(family=['Noto Sans CJK SC', 'We
 COPY code/verify-office.py /tmp/verify-office.py
 RUN python /tmp/verify-office.py && rm -f /tmp/verify-office.py
 
+# ===== 5d. 执行引擎运行时（SandboxHub#52，createrole_com_api#160）=====
+# 平台托管的执行引擎（pi = @earendil-works/pi-coding-agent，要求 Node ≥ 22.19；DeepSeek Harness =
+# @deepseek-ai/dsh，要求 Node ≥ 24.9）单独装在 /opt/cr-engines：自带 Node 24 LTS，系统 Node 20 与全局
+# npm 包不动。/opt/cr-engines/bin/{pi,dsh} 是包装脚本，固定用这套 Node 执行、与 PATH 无关；两个 CLI
+# 不进 PATH，由平台经 /api/procs 按绝对路径启动。版本由构建参数固定（DSH 的 npm latest 落后于 rc.3，
+# 须写精确版本）。构建期核对 --version 与参数一致、原生模块可用、两种 stdio 协议各走通一个来回，否则
+# 构建失败（见 code/install-engines.sh）。另装 fd（pi 用 rg / fd 检索文件）。
+ARG ENGINE_NODE_VERSION=24.22.1
+ARG PI_VERSION=1.4.0
+ARG DSH_VERSION=0.2.1-rc.3
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+# npm 11 默认不执行依赖的安装脚本；这几个包的脚本负责原生模块（node-pty / koffi 等）就位，须放行
+ARG ENGINE_ALLOW_SCRIPTS=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,protobufjs,@google/genai
+COPY code/install-engines.sh /tmp/install-engines.sh
+RUN bash /tmp/install-engines.sh && rm -f /tmp/install-engines.sh
+
 # ===== 6. 预装单文件 CLI（issue #15/#16/#24：skills / todo / memory）=====
 # code/bin/ 下的脚本装进 /usr/local/bin（去 .py 扩展名，须自带 shebang）。
 # CLI 本体由上游仓维护（createrole 仓 server/infrastructure/sandbox_cli/），落地后
@@ -158,10 +175,11 @@ RUN mkdir -p /etc/sandbox && { \
       echo "- 系统：$(. /etc/os-release && echo "$PRETTY_NAME")，root，时区 $TZ，locale $LANG"; \
       echo "- Python：$(python --version 2>&1)，pip $(pip --version | awk '{print $2}')，源 $(pip config get global.index-url)"; \
       echo "- Node：$(node --version)，npm $(npm --version)，yarn $(yarn --version)，pnpm $(pnpm --version)，源 $NPM_CONFIG_REGISTRY"; \
+      echo "- 执行引擎运行时（平台托管，不在 PATH）：/opt/cr-engines，Node $(/opt/cr-engines/node/bin/node --version)，pi $(/opt/cr-engines/node/bin/node -p "require('/opt/cr-engines/lib/node_modules/@earendil-works/pi-coding-agent/package.json').version")，dsh $(/opt/cr-engines/node/bin/node -p "require('/opt/cr-engines/lib/node_modules/@deepseek-ai/dsh/package.json').version")"; \
       echo "- playwright 浏览器：$(ls /opt/ms-playwright | tr '\n' ' ')（headless chromium，\`playwright screenshot\` 可直接用）"; \
       echo "- 中文字体：$(fc-list :lang=zh family | sort -u | tr '\n' ';' )"; \
       echo; echo "## 命令行工具"; echo; \
-      for c in git curl wget rg jq tree less vim nano zip unzip xz tmux rclone gcc make pkg-config todo memory skills \
+      for c in git curl wget rg fd jq tree less vim nano zip unzip xz tmux rclone gcc make pkg-config todo memory skills \
                file xxd antiword catdoc xls2csv catppt pdftotext pdfinfo pdftoppm pdfimages; do \
         if command -v "$c" >/dev/null 2>&1; then echo "- $c：已装"; else echo "- $c：未装"; fi; done; \
       echo; echo "常见但**没有预装**的工具（断网时不可用，联网时可 apt-get 安装）："; \
@@ -187,13 +205,19 @@ RUN mkdir -p /etc/sandbox && { \
     grep -q "^pandas==" /etc/sandbox/MANIFEST.md && \
     grep -q "^- todo：已装" /etc/sandbox/MANIFEST.md && \
     grep -q "^- antiword：已装" /etc/sandbox/MANIFEST.md && \
+    grep -q "^- fd：已装" /etc/sandbox/MANIFEST.md && \
+    grep -q "^- 执行引擎运行时.*pi ${PI_VERSION}，dsh ${DSH_VERSION}$" /etc/sandbox/MANIFEST.md && \
     grep -q "^olefile==" /etc/sandbox/MANIFEST.md && \
     grep -q "^| .doc" /etc/sandbox/MANIFEST.md && \
     echo "MANIFEST.md: $(wc -l < /etc/sandbox/MANIFEST.md) 行"
 
 # 能力标签：app 支持 SANDBOX_API_TOKEN（X-Sandbox-Token）校验。SandboxHub v2 自检据此判定镜像可用，
 # 缺此标签的旧镜像不会被用于按工作区分配的实例。
-LABEL sandboxhub.api_auth="1"
+# procs = app 提供 /api/procs 长驻进程接口；engines = 预置的执行引擎及版本（JSON）。SandboxHub 读取后经
+# /v2/capabilities 的 procs / engines 上报，平台据此判断能否在这类实例里托管引擎。
+LABEL sandboxhub.api_auth="1" \
+      sandboxhub.procs="1" \
+      sandboxhub.engines="{\"pi\":\"${PI_VERSION}\",\"dsh\":\"${DSH_VERSION}\"}"
 
 WORKDIR /app
 EXPOSE 8000
