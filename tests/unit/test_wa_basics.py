@@ -2,7 +2,9 @@
 netguard 规则生成、自检汇总与能力判定。不碰 Docker。"""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -12,6 +14,7 @@ from src.manager.netguard import (
     PRIVATE_CIDRS,
     Capabilities,
     Capability,
+    ImageFeatures,
     SelfTest,
     _is_loopback,
     build_rules,
@@ -273,6 +276,48 @@ def test_capabilities_require_every_item_and_image():
     assert caps.failing("ubuntu") == ["image_ubuntu"]  # 缺项即不满足
     items["isolation_storage"] = Capability(False, "x")
     assert "isolation_storage" in caps.failing("code")
+
+
+def test_image_features_from_labels():
+    assert ImageFeatures.from_labels(None) == ImageFeatures()   # 镜像不存在
+    assert ImageFeatures.from_labels({"sandboxhub.api_auth": "1"}) == ImageFeatures()   # 旧镜像缺标签
+    features = ImageFeatures.from_labels(
+        {"sandboxhub.procs": "1", "sandboxhub.engines": '{"pi":"1.4.0","dsh":"0.2.1-rc.3"}'}
+    )
+    assert features.procs is True and features.engines == {"pi": "1.4.0", "dsh": "0.2.1-rc.3"}
+    assert ImageFeatures.from_labels({"sandboxhub.procs": "0"}).procs is False
+    for bad in ("not json", "[]", '{"pi": 1}', '{"": "1.0"}', '{"pi": ""}'):
+        assert ImageFeatures.from_labels({"sandboxhub.procs": "1", "sandboxhub.engines": bad}).engines == {}
+
+
+def test_capabilities_report_procs_and_engines_per_type():
+    pending = Capabilities().to_dict()
+    assert pending["procs"] == {t: False for t in settings.sandbox_types}
+    assert pending["engines"] == {t: {} for t in settings.sandbox_types}
+    caps = Capabilities(images={"code": ImageFeatures(True, {"pi": "1.4.0"})}).to_dict()
+    assert caps["procs"] == {"ubuntu": False, "code": True}
+    assert caps["engines"] == {"ubuntu": {}, "code": {"pi": "1.4.0"}}
+
+
+async def test_selftest_reads_image_features_from_configured_images():
+    labels = {
+        settings.image_v2_for_type("code"): {
+            "sandboxhub.api_auth": "1",
+            "sandboxhub.procs": "1",
+            "sandboxhub.engines": json.dumps({"pi": "1.4.0", "dsh": "0.2.1-rc.3"}),
+        },
+        settings.image_v2_for_type("ubuntu"): {"sandboxhub.api_auth": "1"},
+    }
+    manager = MagicMock()
+    manager.image_labels = AsyncMock(side_effect=lambda image: labels.get(image))
+    sidecar = MagicMock()
+    sidecar.name = "cr-test-fs"
+    sidecar.running = AsyncMock(return_value=False)   # 只跑静态项与镜像项
+    result = await SelfTest(sidecar, MagicMock(), manager).run()
+    data = result.to_dict()
+    assert data["procs"] == {"ubuntu": False, "code": True}
+    assert data["engines"] == {"ubuntu": {}, "code": {"pi": "1.4.0", "dsh": "0.2.1-rc.3"}}
+    assert data["items"]["image_code"]["ok"] and data["items"]["image_ubuntu"]["ok"]
 
 
 @pytest.mark.parametrize("host,loop", [("127.0.0.1", True), ("localhost", True), ("[::1]", True), ("minio", False), ("10.0.0.5", False)])

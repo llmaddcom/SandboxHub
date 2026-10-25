@@ -185,6 +185,19 @@ async def test_job_report_lists_tagged_jobs(svc):
     assert activity["known"] and activity["jobs_known"] and activity["marked_processes"] == 1
 
 
+async def test_activity_keeps_instances_with_running_procs_busy(svc):
+    service, _ = svc
+    instance, _ = await service.acquire(_spec(session_id="s1", turn_id="t1"))
+    # 容器把运行中的长驻进程（引擎）计入 running_jobs，并单列 running_procs；它们不进任务台账
+    service._probe_terminal.return_value = dict(_activity(), running_jobs=1, running_procs=1)
+    activity = await service.activity(instance)
+    assert activity["idle"] is False and activity["running_jobs"] == 1 and activity["running_procs"] == 1
+    report = await service.job_report("wa1")
+    assert report["known"] is True and report["jobs"] == []
+    service._probe_terminal.return_value = _activity()   # 旧镜像不回报 running_procs
+    assert (await service.activity(instance))["running_procs"] is None
+
+
 @pytest.mark.parametrize(
     "probe",
     [
