@@ -41,6 +41,9 @@ def app_mocks():
     cm = MagicMock()
     cm.run_container = AsyncMock(return_value=_container(env_injected=True))
     cm.is_healthy = AsyncMock(return_value=True)
+    # 复用 / 出池都会按策略热切网（#42），失败时销毁容器；替身切网原地成功
+    cm.switch_network = AsyncMock()
+    cm.remove_container = AsyncMock()
 
     reconciler = MagicMock()
     reconciler.destroy_sandbox = AsyncMock()

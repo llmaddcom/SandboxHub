@@ -566,12 +566,10 @@ SandboxHub/
 # Test dependencies (includes pytest-xdist)
 pip install -e ".[dev]"
 
-# Full run, orchestrator: ~4 s, serial is faster than -n here. The temporary WORK_AREA_ROOT
-# keeps tests off the work area configured in .env
-WORK_AREA_ROOT=$(mktemp -d) python -m pytest -q tests/unit
-
-# Full run, sandbox app: real tmux and subprocesses, mostly waiting; -n auto takes ~7 s instead of ~48 s
-PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests -n auto
+# Full run (~12 s): orchestrator tests/ (unit + integration, ~4 s serial, faster than -n), then
+# the sandbox app (real tmux and subprocesses, mostly waiting; -n auto ~7 s instead of ~48 s).
+# The temporary WORK_AREA_ROOT keeps tests off the work area configured in .env
+WORK_AREA_ROOT=$(mktemp -d) python -m pytest -q && PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests -n auto
 
 # Build image for a specific architecture
 docker build --platform linux/amd64 -t sandbox-ubuntu:latest images/ubuntu/
@@ -582,9 +580,10 @@ docker run -d --name sandbox --shm-size=2g \
   sandbox-ubuntu:latest
 ```
 
-- While developing, run only the tests that cover your change, e.g. `python -m pytest -q tests/unit/test_warm_pool.py` or `PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests/test_procs.py`. Run both full commands before opening a PR.
+- While developing, run only the tests that cover your change, e.g. `python -m pytest -q tests/unit/test_warm_pool.py` or `PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests/test_procs.py`. Run the full line before opening a PR.
+- The two suites stay separate invocations: both directories are packages named `tests`, so one pytest run cannot collect them together.
 - `addopts` in `pyproject.toml` sets `--dist worksteal --maxprocesses 32`. It only applies with `-n`; the cap keeps timing-sensitive tests from starving on many-core hosts.
-- `tests/integration` is not part of the full run. The live acceptance test is opt-in (`SANDBOXHUB_LIVE=1`, see Work-area v2). The mock-based files lag behind the current acquire flow and some never return, so bare `pytest` or `pytest tests/` hangs.
+- `tests/conftest.py` fails any Hub test that runs longer than 30 s instead of letting it hang the run. The live acceptance test in `tests/integration` stays skipped unless `SANDBOXHUB_LIVE=1` (see Work-area v2).
 
 ---
 

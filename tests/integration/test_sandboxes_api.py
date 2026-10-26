@@ -58,6 +58,8 @@ def app_with_mocks():
     container_manager.run_container = AsyncMock(return_value=make_container())
     container_manager.is_healthy = AsyncMock(return_value=True)
     container_manager.remove_container = AsyncMock()
+    # 复用 / 出池都会按策略热切网（#42）；替身原地成功，不改 ip
+    container_manager.switch_network = AsyncMock()
 
     reconciler = MagicMock()
     reconciler.destroy_sandbox = AsyncMock()
