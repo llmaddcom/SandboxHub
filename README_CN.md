@@ -542,11 +542,9 @@ SandboxHub/
 # 测试依赖（含 pytest-xdist）
 pip install -e ".[dev]"
 
-# 全量·编排层：约 4 秒，串行比 -n 快。临时 WORK_AREA_ROOT 让测试不碰 .env 里配置的工作区
-WORK_AREA_ROOT=$(mktemp -d) python -m pytest -q tests/unit
-
-# 全量·沙盒应用：真实 tmux 与子进程，大部分时间在等；-n auto 约 7 秒（串行约 48 秒）
-PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests -n auto
+# 全量（约 12 秒）：先跑编排层 tests/（unit + integration，串行约 4 秒，比 -n 快），再跑沙盒应用
+# （真实 tmux 与子进程，大部分时间在等；-n auto 约 7 秒，串行约 48 秒）。临时 WORK_AREA_ROOT 让测试不碰 .env 里配置的工作区
+WORK_AREA_ROOT=$(mktemp -d) python -m pytest -q && PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests -n auto
 
 # 构建特定架构镜像
 docker build --platform linux/amd64 -t sandbox-ubuntu:latest images/ubuntu/
@@ -557,9 +555,10 @@ docker run -d --name sandbox --shm-size=2g \
   sandbox-ubuntu:latest
 ```
 
-- 开发中只跑覆盖本次改动的测试，如 `python -m pytest -q tests/unit/test_warm_pool.py` 或 `PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests/test_procs.py`；开 PR 前跑上面两条全量。
+- 开发中只跑覆盖本次改动的测试，如 `python -m pytest -q tests/unit/test_warm_pool.py` 或 `PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests/test_procs.py`；开 PR 前跑上面那行全量。
+- 两个测试集分两次调用：两个目录都是名为 `tests` 的包，一次 pytest 收不到一起。
 - `pyproject.toml` 的 `addopts` 设了 `--dist worksteal --maxprocesses 32`，只在加 `-n` 时生效；封顶 32 进程，免得多核机上带计时的用例被饿到超时。
-- `tests/integration` 不在全量内：live 验收按需开（`SANDBOXHUB_LIVE=1`，见英文 README 的 Work-area v2 一节）；基于 mock 的几个文件落后于当前 acquire 流程，部分用例不会返回，所以裸跑 `pytest` 或 `pytest tests/` 会挂住。
+- `tests/conftest.py` 让编排层单个用例超过 30 秒即判失败，不再挂住整轮；`tests/integration` 里的 live 验收不设 `SANDBOXHUB_LIVE=1` 就跳过（见英文 README 的 Work-area v2 一节）。
 
 ---
 
