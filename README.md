@@ -611,6 +611,10 @@ are writable, and each role directory has the requested access mode. Every acqui
 returns the effective layout, mounts, policy and isolation report. A failed self-test
 rejects allocation without falling back to v1.
 
+Independent role directories are prepared concurrently, with a shared limit of four
+mount operations. Concurrent requests for the same directory share one mount; if an
+acquire fails or is cancelled, references acquired by that operation are released.
+
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /v2/capabilities?refresh=true` | Refresh isolation checks and return limits, ready image types, and per-type `procs` / `engines` |

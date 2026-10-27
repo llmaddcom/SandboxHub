@@ -4,6 +4,7 @@ ContainerManager 与 cr-fs 用假实现（不碰 Docker）；工作区与实例�
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
@@ -174,6 +175,35 @@ async def test_acquire_deny_mode_uses_isolated_network(env):
     service, manager, _, _ = env
     await service.acquire(_spec(network_mode="deny"))
     assert manager.run_wa_container.await_args.kwargs["network"] == settings.wa_network_isolated
+
+
+async def test_cancel_during_mount_discards_work_area_reservation(env):
+    service, manager, sidecar, _ = env
+    started, finish = asyncio.Event(), asyncio.Event()
+    original_mount = sidecar.mount
+
+    async def delayed_mount(spec):
+        started.set()
+        await finish.wait()
+        await original_mount(spec)
+
+    sidecar.mount = delayed_mount
+    task = asyncio.create_task(service.acquire(_spec(mounts=[SKILLS])))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        (instance,) = service.registry.list_all()
+        task.cancel()
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert service.registry.list_all() == []
+        assert service.mounts.refs() == {}
+        assert not (sidecar.root / "instances" / instance.sandbox_id).exists()
+        manager.run_wa_container.assert_not_awaited()
+    finally:
+        finish.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_reuse_same_shape_updates_views_in_place(env):

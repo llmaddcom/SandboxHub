@@ -497,7 +497,12 @@ class WorkAreaService:
         await asyncio.to_thread(
             self._save_origin, instance, spec.session_id, spec.turn_id
         )
-        await self.mounts.acquire(instance.mounts)
+        try:
+            await self.mounts.acquire(instance.mounts)
+        except asyncio.CancelledError:
+            # 挂载层已回滚引用；实例尚未启动，但预留名额与实例目录也须一并释放。
+            await self._discard(instance, "mount_cancelled")
+            raise
         instance.mounts_held = True
         await self._apply_views(instance, spec.inputs or [], spec.context or {})
         sources = self.work_areas.bind_sources(instance.work_area_id)
