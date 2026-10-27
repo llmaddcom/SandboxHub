@@ -45,6 +45,8 @@ SandboxHub 在此基础上新增：
 - **SSE 流式输出** — `POST /api/terminal/execute/stream` 实时推送 stdout（扩展原始轮询模型）
 - **多架构 Dockerfile** — 同时支持 amd64（Google Chrome）和 arm64（Chromium）
 
+v2 工作区分配时，不同角色目录并发准备，所有分配共用最多四个挂载操作；同一目录的并发请求共享挂载。分配挂载失败或被取消时，该次已取得的挂载引用会回滚。
+
 ---
 
 ## 快速开始
