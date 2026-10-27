@@ -45,6 +45,8 @@ SandboxHub 在此基础上新增：
 - **SSE 流式输出** — `POST /api/terminal/execute/stream` 实时推送 stdout（扩展原始轮询模型）
 - **多架构 Dockerfile** — 同时支持 amd64（Google Chrome）和 arm64（Chromium）
 
+v2 工作区分配时，不同角色目录并发准备，所有分配共用最多四个挂载操作；同一目录的并发请求共享挂载。分配挂载失败或被取消时，该次已取得的挂载引用会回滚。
+
 ---
 
 ## 快速开始
@@ -539,11 +541,12 @@ SandboxHub/
 ## 开发
 
 ```bash
-# 运行编排层测试
-pytest tests/ -v
+# 测试依赖（含 pytest-xdist）
+pip install -e ".[dev]"
 
-# 运行沙盒应用测试
-PYTHONPATH=images/ubuntu pytest images/ubuntu/tests/ -v
+# 全量（约 12 秒）：先跑编排层 tests/（unit + integration，串行约 4 秒，比 -n 快），再跑沙盒应用
+# （真实 tmux 与子进程，大部分时间在等；-n auto 约 7 秒，串行约 48 秒）。临时 WORK_AREA_ROOT 让测试不碰 .env 里配置的工作区
+WORK_AREA_ROOT=$(mktemp -d) python -m pytest -q && PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests -n auto
 
 # 构建特定架构镜像
 docker build --platform linux/amd64 -t sandbox-ubuntu:latest images/ubuntu/
@@ -553,6 +556,11 @@ docker run -d --name sandbox --shm-size=2g \
   -p 8000:8000 -p 8001:8001 -p 6080:6080 -p 5900:5900 \
   sandbox-ubuntu:latest
 ```
+
+- 开发中只跑覆盖本次改动的测试，如 `python -m pytest -q tests/unit/test_warm_pool.py` 或 `PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests/test_procs.py`；开 PR 前跑上面那行全量。
+- 两个测试集分两次调用：两个目录都是名为 `tests` 的包，一次 pytest 收不到一起。
+- `pyproject.toml` 的 `addopts` 设了 `--dist worksteal --maxprocesses 32`，只在加 `-n` 时生效；封顶 32 进程，免得多核机上带计时的用例被饿到超时。
+- `tests/conftest.py` 让编排层单个用例超过 30 秒即判失败，不再挂住整轮；`tests/integration` 里的 live 验收不设 `SANDBOXHUB_LIVE=1` 就跳过（见英文 README 的 Work-area v2 一节）。
 
 ---
 

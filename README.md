@@ -563,11 +563,13 @@ SandboxHub/
 ## Development
 
 ```bash
-# Run orchestrator tests
-pytest tests/ -v
+# Test dependencies (includes pytest-xdist)
+pip install -e ".[dev]"
 
-# Run sandbox app tests
-PYTHONPATH=images/ubuntu pytest images/ubuntu/tests/ -v
+# Full run (~12 s): orchestrator tests/ (unit + integration, ~4 s serial, faster than -n), then
+# the sandbox app (real tmux and subprocesses, mostly waiting; -n auto ~7 s instead of ~48 s).
+# The temporary WORK_AREA_ROOT keeps tests off the work area configured in .env
+WORK_AREA_ROOT=$(mktemp -d) python -m pytest -q && PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests -n auto
 
 # Build image for a specific architecture
 docker build --platform linux/amd64 -t sandbox-ubuntu:latest images/ubuntu/
@@ -577,6 +579,11 @@ docker run -d --name sandbox --shm-size=2g \
   -p 8000:8000 -p 8001:8001 -p 6080:6080 -p 5900:5900 \
   sandbox-ubuntu:latest
 ```
+
+- While developing, run only the tests that cover your change, e.g. `python -m pytest -q tests/unit/test_warm_pool.py` or `PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests/test_procs.py`. Run the full line before opening a PR.
+- The two suites stay separate invocations: both directories are packages named `tests`, so one pytest run cannot collect them together.
+- `addopts` in `pyproject.toml` sets `--dist worksteal --maxprocesses 32`. It only applies with `-n`; the cap keeps timing-sensitive tests from starving on many-core hosts.
+- `tests/conftest.py` fails any Hub test that runs longer than 30 s instead of letting it hang the run. The live acceptance test in `tests/integration` stays skipped unless `SANDBOXHUB_LIVE=1` (see Work-area v2).
 
 ---
 
@@ -603,6 +610,10 @@ containers receive no storage credentials, FUSE device or mount capability. The
 are writable, and each role directory has the requested access mode. Every acquire
 returns the effective layout, mounts, policy and isolation report. A failed self-test
 rejects allocation without falling back to v1.
+
+Independent role directories are prepared concurrently, with a shared limit of four
+mount operations. Concurrent requests for the same directory share one mount; if an
+acquire fails or is cancelled, references acquired by that operation are released.
 
 | Endpoint | Purpose |
 | --- | --- |

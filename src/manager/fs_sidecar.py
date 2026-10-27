@@ -39,6 +39,8 @@ CONTAINER_ROOT = "/srv"
 FSOPS = ("python3", "/opt/crfs/fsops.py")
 # WORK_AREA_ROOT 下的固定子目录
 ROOT_SUBDIRS = ("work-areas", "instances", "inputs-cache", "mnt", "cache", "staging", "run")
+# 多个实例同时启动时共享此上限，避免对 cr-fs / Docker 发起无界并发。
+_ROLE_MOUNT_CONCURRENCY = 4
 
 EXIT_INVALID = 2
 EXIT_NOT_FOUND = 3
@@ -318,6 +320,7 @@ class RoleMounts:
         self._specs: dict[str, RoleMountSpec] = {}
         self._zero_since: dict[str, float] = {}
         self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._mount_slots = asyncio.Semaphore(_ROLE_MOUNT_CONCURRENCY)
 
     def host_path(self, key: str) -> Path:
         return self._fs.host_path("mnt", key)
@@ -330,25 +333,64 @@ class RoleMounts:
         specs = list(specs)
         if not specs:
             return
-        status = await self._fs.mount_status()
         taken: list[str] = []
+        pending = iter(specs)
+
+        async def worker() -> None:
+            for spec in pending:
+                await self._acquire_one(spec)
+                taken.append(spec.key)
+
+        # 固定数量的工作者不仅限制活跃挂载，也避免大请求创建无界任务。
+        tasks = [
+            asyncio.create_task(worker())
+            for _ in range(min(len(specs), _ROLE_MOUNT_CONCURRENCY))
+        ]
         try:
-            for spec in specs:
-                async with self._locks[spec.key]:
-                    alive = status.get(spec.key)
+            await asyncio.gather(*tasks)
+        except BaseException:
+            # 等所有工作者退出后再回滚，避免迟到的挂载重新增加引用；取消也必须收尾。
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self.release(taken)
+            raise
+
+    async def _acquire_one(self, spec: RoleMountSpec) -> None:
+        async with self._locks[spec.key]:
+            async with self._mount_slots:
+                async def prepare() -> None:
+                    # 锁内重查：另一实例可能刚建好，同一个旧快照不能指导两次挂载。
+                    alive = (await self._fs.mount_status()).get(spec.key)
                     if alive is False:
                         logger.warning(f"角色目录挂载已失效，重挂 | key={spec.key}")
                         await self._fs.unmount(spec.key)
                     if not alive:
                         await self._fs.mount(spec)
-                        status[spec.key] = True
                     self._refs[spec.key] = self._refs.get(spec.key, 0) + 1
                     self._specs[spec.key] = spec
                     self._zero_since.pop(spec.key, None)
-                    taken.append(spec.key)
-        except Exception:
-            await self.release(taken)
-            raise
+
+                # Docker exec 使用线程，取消协程不能取消已经发出的挂载命令。持锁等它真正
+                # 结束，再回滚引用；否则下一次分配可能与仍在后台运行的命令重复挂同一目录。
+                operation = asyncio.create_task(prepare())
+                cancelled = False
+                while True:
+                    try:
+                        await asyncio.shield(operation)
+                        break
+                    except asyncio.CancelledError:
+                        if operation.cancelled():
+                            raise
+                        cancelled = True
+                    except Exception as exc:
+                        if cancelled:
+                            logger.warning(f"取消期间角色目录挂载失败 | key={spec.key} | err={exc}")
+                            raise asyncio.CancelledError from exc
+                        raise
+                if cancelled:
+                    await self.release([spec.key])
+                    raise asyncio.CancelledError
 
     async def release(self, keys: Iterable[str]) -> None:
         now = time.monotonic()
