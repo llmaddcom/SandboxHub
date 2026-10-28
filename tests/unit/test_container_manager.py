@@ -79,6 +79,18 @@ def test_file_center_inputs_bind_is_readonly_and_tenant_dedicated(mock_docker):
     assert options["labels"]["sandboxhub.env-injected"] == "true"
 
 
+@pytest.mark.asyncio
+async def test_failed_docker_inventory_never_deletes_input_views(mock_docker, tmp_path, monkeypatch):
+    view = tmp_path / "v1-inputs" / "existing" / "inputs"
+    view.mkdir(parents=True)
+    (view / "report.txt").write_text("private source")
+    monkeypatch.setattr(settings, "WORK_AREA_ROOT", str(tmp_path))
+    mock_docker.containers.list.side_effect = RuntimeError("Docker unavailable")
+    with pytest.raises(RuntimeError, match="Docker unavailable"):
+        await ContainerManager().prune_input_views()
+    assert (view / "report.txt").read_text() == "private source"
+
+
 # ── SANDBOX_KEEP_DNS 注入（entrypoint 据此跳过 resolv.conf 覆写）─────────────────
 
 
