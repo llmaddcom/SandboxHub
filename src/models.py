@@ -51,6 +51,7 @@ class ContainerInfo:
     # 注入的 env 无法从运行中容器清除，故该容器同样不入 warm pool、释放即销毁，
     # 防止凭据泄漏给下一个租户。
     env_injected: bool = False
+    inputs_mounted: bool = False
     # 容器当前所在 Docker 网络名（联网态 SANDBOX_NETWORK / 隔离网 SANDBOX_NETWORK_ISOLATED）。
     # 空 = 未知（旧记录 / 测试构造），switch_network 会按实际状态处理。
     network: str = ""

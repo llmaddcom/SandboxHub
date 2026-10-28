@@ -13,6 +13,11 @@ ping 提供浅检查（registry 状态）和深检查（TCP 可达性）两种�
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import os
+from functools import lru_cache
+from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -20,7 +25,9 @@ from loguru import logger
 from pydantic import BaseModel
 
 from src.config import settings
-from src.models import ContainerInfo, NetworkMode, WorkspaceMount
+from src.models import ContainerInfo, NetworkMode, WorkspaceMount, InputFileSpec
+from src.manager.inputs_cache import InputsCache, InputsError, validate_inputs
+from src.manager.paths import require_id
 from src.proxy.forwarder import close_client
 
 router = APIRouter(prefix="/v1/sandboxes")
@@ -105,12 +112,14 @@ class AcquireRequest(BaseModel):
     # 可选：沙盒策略。缺省 = 联网（与历史行为一致）。每次 acquire 都会落实（复用沙盒
     # 不在对应网络上即热切网），调用方随每次工具调用带最新值即可。
     policy: Optional[PolicySpec] = None
+    inputs: Optional[list[dict]] = None
 
 
 class AcquireResponse(BaseModel):
     sandbox_id: str
     status: str
     effective_policy: Optional[EffectivePolicy] = None
+    inputs_ready: bool = False
 
 
 class PolicyApplyRequest(BaseModel):
@@ -208,10 +217,63 @@ async def _ensure_network(info: ContainerInfo, mode: NetworkMode) -> bool:
     return True
 
 
+@lru_cache(maxsize=4)
+def _inputs_cache(root: str):
+    return InputsCache(Path(root))
+
+
+_input_locks = {}
+
+
+async def _prepare_inputs(req: AcquireRequest) -> str:
+    """Make a per-owner/role readonly view; source objects are immutable versions."""
+    require_id(req.user_id, "用户 ID")
+    require_id(req.role_id, "数字人 ID")
+    specs = []
+    for raw in req.inputs or []:
+        spec = InputFileSpec(**{k: raw[k] for k in ("path", "bucket", "key", "sha256", "size")})
+        if spec.path == "INDEX.json" or spec.path.startswith("INDEX.json/"):
+            raise ValueError("INDEX.json 是文件索引保留路径")
+        if not spec.key.startswith(f"file-center/{req.user_id}/"):
+            raise ValueError("inputs 对象不属于当前用户文件中心")
+        specs.append(spec)
+    validate_inputs(specs)
+    root = Path(settings.WORK_AREA_ROOT)
+    identity = hashlib.sha256(f"{req.user_id}/{req.role_id}".encode()).hexdigest()
+    view = root / "v1-inputs" / identity
+    cache = _inputs_cache(str(root))
+    await cache.materialize(view, req.user_id, specs)
+    def write_index():
+        content = [{"path": spec.path, "size_bytes": spec.size, "sha256": spec.sha256} for spec in specs]
+        dest = view / "inputs" / "INDEX.json"
+        temp = dest.with_suffix(".tmp")
+        temp.write_text(json.dumps(content, ensure_ascii=False))
+        temp.chmod(0o444)
+        os.replace(temp, dest)
+    await asyncio.to_thread(write_index)
+    await cache.evict()
+    return str((view / "inputs").resolve())
+
+
 # ── 接口 ──────────────────────────────────────────────────────────────────────
 
 @router.post("/acquire", response_model=AcquireResponse)
 async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
+    if req.inputs is None:
+        return await _acquire_sandbox(req)
+    key = (asyncio.get_running_loop(), req.user_id, req.role_id)
+    record = _input_locks.setdefault(key, [asyncio.Lock(), 0])
+    record[1] += 1
+    try:
+        async with record[0]:
+            return await _acquire_sandbox(req)
+    finally:
+        record[1] -= 1
+        if not record[1]:
+            _input_locks.pop(key, None)
+
+
+async def _acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
     """
     获取沙盒。
 
@@ -229,18 +291,36 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
     mode, effective = _resolve_policy(req.policy)
     target_network = settings.network_for_mode(mode)
 
+    candidate = await _registry.find_active(req.user_id, req.role_id) if req.inputs else None
+    if candidate and not candidate.container_info.inputs_mounted:
+        idle = await _reconciler._probe_terminal_idle(candidate.container_info.container_ip)
+        if idle is not True:
+            raise HTTPException(409, detail={"reason": "inputs_mount_pending", "message": "现有任务结束后才能切换文件版本挂载"})
+    inputs_path = None
+    if req.inputs:
+        try:
+            inputs_path = await _prepare_inputs(req)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(400, detail={"reason": "invalid_inputs", "message": str(exc)}) from exc
+        except InputsError as exc:
+            raise HTTPException(503, detail={"reason": "inputs_unavailable", "message": str(exc)}) from exc
+
     # 1. 复用（已分配的容器，无论挂载与否，直接复用——挂载随容器持续存在）。
     #    复用前体检：容器可能已被 docker restart/OOM/手动删除干掉，registry 只是内存
     #    记录感知不到；死沙盒就地驱逐销毁，落到下面的全新分配（对调用方透明自愈）。
     #    体检通过后落实网络策略：切网失败同样驱逐重建。
     existing = await _registry.find_active(req.user_id, req.role_id)
     if existing:
-        if await _container_manager.is_healthy(existing.container_info.container_ip):
+        if req.inputs == [] and existing.container_info.inputs_mounted:
+            inputs_path = await _prepare_inputs(req)
+        shape_matches = not inputs_path or existing.container_info.inputs_mounted
+        if shape_matches and await _container_manager.is_healthy(existing.container_info.container_ip):
             if await _ensure_network(existing.container_info, mode):
                 _registry.touch(existing.sandbox_id)
                 logger.debug(f"复用 sandbox | id={existing.sandbox_id} | user={req.user_id}")
                 return AcquireResponse(
-                    sandbox_id=existing.sandbox_id, status="ready", effective_policy=effective
+                    sandbox_id=existing.sandbox_id, status="ready", effective_policy=effective,
+                    inputs_ready=bool(existing.container_info.inputs_mounted) or not req.inputs
                 )
             logger.warning(f"复用沙盒切网失败，驱逐重建 | id={existing.sandbox_id}")
         else:
@@ -279,7 +359,8 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
     if workspace is not None:
         try:
             container = await _container_manager.run_container(
-                req.sandbox_type, workspace=workspace, extra_env=extra_env, network=target_network
+                req.sandbox_type, workspace=workspace, extra_env=extra_env, network=target_network,
+                **({"inputs_path": inputs_path} if inputs_path else {}),
             )
         except Exception as e:
             logger.error(f"挂载容器冷启动失败 | type={req.sandbox_type} | err={e}")
@@ -296,18 +377,20 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
             f" | network={target_network}"
         )
         return AcquireResponse(
-            sandbox_id=record.sandbox_id, status="ready", effective_policy=effective
+            sandbox_id=record.sandbox_id, status="ready", effective_policy=effective,
+            inputs_ready=bool(container.inputs_mounted) or not req.inputs
         )
 
     # 5. 非挂载：无 env 时 warm pool 优先（出池体检 + 切网，失败销毁换下一个）；
     #    带 env 时绕过 warm pool（池内容器创建时无该 env），直接冷启动落目标网络。
-    container = None if extra_env else await _pop_healthy(req.sandbox_type, mode)
+    container = None if extra_env or inputs_path else await _pop_healthy(req.sandbox_type, mode)
     if container is None:
         if not extra_env:
             logger.warning(f"warm pool 为空，冷启动 | type={req.sandbox_type}")
         try:
             container = await _container_manager.run_container(
-                req.sandbox_type, extra_env=extra_env, network=target_network
+                req.sandbox_type, extra_env=extra_env, network=target_network,
+                **({"inputs_path": inputs_path} if inputs_path else {}),
             )
         except Exception as e:
             logger.error(f"冷启动失败 | type={req.sandbox_type} | err={e}")
@@ -325,7 +408,8 @@ async def acquire_sandbox(req: AcquireRequest) -> AcquireResponse:
         f"sandbox 已分配 | id={record.sandbox_id} | ip={container.container_ip} "
         f"| network={container.network or target_network}"
     )
-    return AcquireResponse(sandbox_id=record.sandbox_id, status="ready", effective_policy=effective)
+    return AcquireResponse(sandbox_id=record.sandbox_id, status="ready", effective_policy=effective,
+            inputs_ready=bool(container.inputs_mounted) or not req.inputs)
 
 
 async def _pop_healthy(sandbox_type: str, mode: NetworkMode = "allow") -> Optional[ContainerInfo]:

@@ -47,6 +47,12 @@ SandboxHub 在此基础上新增：
 
 v2 工作区分配时，不同角色目录并发准备，所有分配共用最多四个挂载操作；同一目录的并发请求共享挂载。分配挂载失败或被取消时，该次已取得的挂载引用会回滚。
 
+### v1 文件中心原件
+
+`POST /v1/sandboxes/acquire` 可选携带 `inputs: [{path, bucket, key, sha256, size}]`。对象键必须属于 `file-center/{user_id}/`。Hub 验证内容后缓存到 `WORK_AREA_ROOT/inputs-cache`，为用户/角色建立硬链接视图，以 Docker 只读 bind 挂到 `/inputs`；工作盘 `/workspace` 继续可写。返回 `inputs_ready: true` 才表示原件可用。`/inputs/INDEX.json` 提供路径、大小和摘要，不含存储凭据；该名字为保留路径。
+
+每次携带清单会同步该角色的可见文件，空数组撤销旧清单；省略字段兼容旧客户端。首次缓存大文件需要下载和校验时间，须为 `WORK_AREA_ROOT` 准备足够磁盘空间。含原件的容器为租户专属，不进入预热池。旧容器若需要新增挂载，存在运行中任务或无法确认空闲时返回 409 `inputs_mount_pending`，结束任务后重试。无需更新容器 app 镜像。
+
 ---
 
 ## 快速开始

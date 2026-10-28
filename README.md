@@ -49,6 +49,12 @@ SandboxHub adds on top:
 
 ## Quick Start
 
+### v1 immutable file inputs
+
+`POST /v1/sandboxes/acquire` accepts an optional `inputs: [{path, bucket, key, sha256, size}]` manifest. Keys must belong to `file-center/{user_id}/`. The Hub validates downloaded bytes, caches them under `WORK_AREA_ROOT/inputs-cache`, builds a per-user/role hard-link view and mounts it read-only at `/inputs`. `/workspace` remains writable. The response reports `inputs_ready`; `/inputs/INDEX.json` lists paths, sizes and hashes without storage credentials, and is a reserved filename.
+
+An empty manifest revokes the previous view; omitting it preserves compatibility. Provision enough host disk for large inputs and allow time for the first download. Containers with inputs are dedicated and never returned to the warm pool. Upgrading an existing container requires confirmed idle terminal state, otherwise acquire returns 409 `inputs_mount_pending`. No image rebuild is needed.
+
 ### 1. Build the sandbox image
 
 Preferred: the build script (tags both `latest` and the version from `images/ubuntu/app/VERSION`):

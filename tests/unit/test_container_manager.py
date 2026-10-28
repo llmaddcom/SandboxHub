@@ -70,6 +70,15 @@ def test_build_container_name(mock_docker):
     assert "ubuntu" in name
 
 
+def test_file_center_inputs_bind_is_readonly_and_tenant_dedicated(mock_docker):
+    mock_docker.containers.run.return_value = make_mock_container()
+    manager = ContainerManager()
+    manager._run_container_sync("code", "cr-file-center-test", inputs_path="/host/user-role/inputs")
+    options = mock_docker.containers.run.call_args.kwargs
+    assert options["volumes"] == {"/host/user-role/inputs": {"bind": "/inputs", "mode": "ro"}}
+    assert options["labels"]["sandboxhub.env-injected"] == "true"
+
+
 # ── SANDBOX_KEEP_DNS 注入（entrypoint 据此跳过 resolv.conf 覆写）─────────────────
 
 
