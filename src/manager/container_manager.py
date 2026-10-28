@@ -189,6 +189,7 @@ class ContainerManager:
         workspace: Optional[WorkspaceMount] = None,
         extra_env: Optional[dict[str, str]] = None,
         network: Optional[str] = None,
+        inputs_path: Optional[str] = None,
     ) -> tuple[str, str]:
         """
         docker run，等待 IP，返回 (container_id, container_ip)。
@@ -214,7 +215,7 @@ class ContainerManager:
         }
         if workspace is not None:
             labels[_MOUNTED_LABEL] = "true"
-        if extra_env:
+        if extra_env or inputs_path:
             labels[_ENV_LABEL] = "true"
 
         network = network or settings.SANDBOX_NETWORK
@@ -245,6 +246,9 @@ class ContainerManager:
         if dns:
             run_kwargs["dns"] = dns
             run_kwargs["dns_opt"] = ["use-vc"]
+
+        if inputs_path:
+            run_kwargs["volumes"] = {inputs_path: {"bind": "/inputs", "mode": "ro"}}
 
         container = self._docker.containers.run(**run_kwargs)
 
@@ -331,6 +335,7 @@ class ContainerManager:
         workspace: Optional[WorkspaceMount] = None,
         extra_env: Optional[dict[str, str]] = None,
         network: Optional[str] = None,
+        inputs_path: Optional[str] = None,
     ) -> ContainerInfo:
         """
         启动新容器，等待健康检查，返回 ContainerInfo。
@@ -347,13 +352,14 @@ class ContainerManager:
         mounted = workspace is not None
         if mounted:
             name = self._build_mounted_name(sandbox_type)
-        elif extra_env:
+        elif extra_env or inputs_path:
             name = self._build_env_name(sandbox_type)
         else:
             name = self._build_warm_name(sandbox_type, slot)
         network = network or settings.SANDBOX_NETWORK
+        options = {"inputs_path": inputs_path} if inputs_path else {}
         container_id, ip = await asyncio.to_thread(
-            self._run_container_sync, sandbox_type, name, workspace, extra_env, network
+            self._run_container_sync, sandbox_type, name, workspace, extra_env, network, **options
         )
         # 等待 API 就绪
         if not await self.wait_healthy(ip):
@@ -381,7 +387,8 @@ class ContainerManager:
             sandbox_type=sandbox_type,
             mounted=mounted,
             mount_path=workspace.mount_path if mounted else "/workspace",
-            env_injected=bool(extra_env),
+            env_injected=bool(extra_env or inputs_path),
+            inputs_mounted=bool(inputs_path),
             network=network,
         )
 
