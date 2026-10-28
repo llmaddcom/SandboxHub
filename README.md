@@ -55,6 +55,8 @@ SandboxHub adds on top:
 
 An empty manifest revokes the previous view; omitting it preserves compatibility. Provision enough host disk for large inputs and allow time for the first download. Containers with inputs are dedicated and never returned to the warm pool. Upgrading an existing container requires confirmed idle terminal state, otherwise acquire returns 409 `inputs_mount_pending`. No image rebuild is needed.
 
+Periodic reconciliation prunes unmounted old views and evicts unreferenced blobs within the cache budget. Active mounts and views prepared within the last minute are preserved. A failed Docker inventory never triggers pruning.
+
 ### 1. Build the sandbox image
 
 Preferred: the build script (tags both `latest` and the version from `images/ubuntu/app/VERSION`):

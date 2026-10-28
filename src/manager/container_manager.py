@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
+from pathlib import Path
 
 import docker
 import docker.errors
@@ -102,6 +103,22 @@ class ContainerManager:
 
     def __init__(self) -> None:
         self._docker = docker.from_env()
+        self._inputs_cleanup_after = 0.0
+
+    async def prune_input_views(self) -> None:
+        if time.monotonic() < self._inputs_cleanup_after:
+            return
+        from src.manager.inputs_cache import InputsCache
+        root = Path(settings.WORK_AREA_ROOT)
+        if not (root / "v1-inputs").is_dir():
+            return
+        # A failed inventory must never be interpreted as an empty inventory.
+        containers = await asyncio.to_thread(self._docker.containers.list, all=True,
+            filters={"label": f"{settings.CONTAINER_LABEL}=true"})
+        mounted = {mount["Source"] for container in containers for mount in container.attrs.get("Mounts", [])
+                   if mount.get("Destination") == "/inputs" and mount.get("Source")}
+        await InputsCache(root).prune_v1_views(mounted)
+        self._inputs_cleanup_after = time.monotonic() + 60
 
     @property
     def docker(self) -> docker.DockerClient:

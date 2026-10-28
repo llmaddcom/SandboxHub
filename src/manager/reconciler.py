@@ -125,6 +125,10 @@ class SandboxReconciler:
                 await self._manager.ensure_gateway()
             except Exception as e:
                 logger.warning(f"网关容器保活失败，下一轮重试 | err={e}")
+            try:
+                await self._manager.prune_input_views()
+            except Exception as e:
+                logger.warning(f"原件缓存视图清理失败，下一轮重试 | err={e}")
             if self._work_areas is not None:
                 try:
                     await self._work_areas.reconcile_once()

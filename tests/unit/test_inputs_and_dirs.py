@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from src.manager.inputs_cache import InputsCache, InputsError
 from src.manager.work_areas import InstanceDirs
 from src.models import InputFileSpec
+from src.config import settings
 
 
 class _Response:
@@ -51,6 +53,25 @@ def cache_and_client(tmp_path):
     client = FakeMinio({})
     cache = InputsCache(tmp_path, client_factory=lambda: client)
     return cache, client, tmp_path
+
+
+async def test_v1_cache_releases_unmounted_views_and_preserves_live_or_new_views(cache_and_client, monkeypatch):
+    cache, client, root = cache_and_client
+    views = root / "v1-inputs"
+    specs = {}
+    for name, data in (("live", b"live-data"), ("old", b"old-data"), ("preparing", b"new-data")):
+        spec = _spec("report.txt", data, key=name)
+        specs[name] = spec
+        client.objects[(spec.bucket, spec.key)] = data
+        await cache.materialize(views / name, "u1", [spec])
+        if name != "preparing":
+            os.utime(views / name, (time.time() - 120, time.time() - 120))
+    monkeypatch.setattr(settings, "INPUTS_CACHE_MAX_BYTES", 1)
+    assert await cache.prune_v1_views({str((views / "live" / "inputs").resolve())}) == 1
+    assert not (views / "old").exists()
+    assert not cache.blob_path("u1", specs["old"].sha256).exists()
+    assert (views / "live/inputs/report.txt").read_bytes() == b"live-data"
+    assert (views / "preparing/inputs/report.txt").read_bytes() == b"new-data"
 
 
 async def test_materialize_links_blobs_and_writes_manifest(cache_and_client):
