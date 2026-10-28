@@ -4,6 +4,8 @@
 不就绪时记 warning 回退为普通 warm-pool 路径。
 """
 from datetime import datetime, timezone
+import hashlib
+import json
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -13,6 +15,7 @@ from fastapi import FastAPI
 from src.config import settings
 from src.routers import sandboxes as sandboxes_router
 from src.models import ContainerInfo, SandboxRecord
+from src.manager.inputs_cache import InputsCache
 
 
 def _container(mounted: bool = False) -> ContainerInfo:
@@ -118,4 +121,91 @@ async def test_acquire_without_workspace_uses_pool(app_mocks, monkeypatch):
 
     assert resp.status_code == 200
     warm_pool.acquire.assert_awaited_once()
+    cm.run_container.assert_not_called()
+
+
+def _input():
+    return {"path": "version-a/report.txt", "bucket": "files", "key": "file-center/u1/version-a/report.txt",
+            "sha256": hashlib.sha256(b"hello").hexdigest(), "size": 5}
+
+
+@pytest.mark.asyncio
+async def test_file_center_manifest_is_readonly_scoped_and_revocable(tmp_path, monkeypatch):
+    class Response:
+        def stream(self, _size):
+            yield b"hello"
+        def close(self):
+            pass
+        def release_conn(self):
+            pass
+    client = MagicMock()
+    client.get_object.return_value = Response()
+    cache = InputsCache(tmp_path, client_factory=lambda: client)
+    monkeypatch.setattr(settings, "WORK_AREA_ROOT", str(tmp_path))
+    monkeypatch.setattr(sandboxes_router, "_inputs_cache", lambda _root: cache)
+    request = sandboxes_router.AcquireRequest(user_id="u1", role_id="r1", inputs=[_input()])
+    from pathlib import Path
+    view = Path(await sandboxes_router._prepare_inputs(request))
+    assert (view / "version-a/report.txt").read_bytes() == b"hello"
+    assert (view / "version-a/report.txt").stat().st_mode & 0o777 == 0o444
+    index = json.loads((view / "INDEX.json").read_text())
+    assert index == [{"path": "version-a/report.txt", "size_bytes": 5, "sha256": _input()["sha256"]}]
+    assert not any(key in index[0] for key in ("bucket", "key"))
+    request.inputs = []
+    assert await sandboxes_router._prepare_inputs(request) == str(view)
+    assert not (view / "version-a/report.txt").exists()
+    assert json.loads((view / "INDEX.json").read_text()) == []
+    request.inputs = [{**_input(), "key": "file-center/other/version-a/report.txt"}]
+    with pytest.raises(ValueError, match="不属于"):
+        await sandboxes_router._prepare_inputs(request)
+
+
+@pytest.mark.asyncio
+async def test_acquire_file_inputs_cold_starts_with_readonly_mount(app_mocks, monkeypatch):
+    app, registry, warm_pool, cm = app_mocks
+    container = _container()
+    container.inputs_mounted = True
+    container.env_injected = True
+    cm.run_container.return_value = container
+    prepare = AsyncMock(return_value="/host/u1/r1/inputs")
+    monkeypatch.setattr(sandboxes_router, "_prepare_inputs", prepare)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        response = await client.post("/v1/sandboxes/acquire", json={"user_id": "u1", "role_id": "r1", "inputs": [_input()]})
+    assert response.status_code == 200 and response.json()["inputs_ready"]
+    assert cm.run_container.call_args.kwargs["inputs_path"] == "/host/u1/r1/inputs"
+    warm_pool.acquire.assert_not_called()
+    assert not sandboxes_router._input_locks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idle", [False, None])
+async def test_inputs_upgrade_preserves_busy_existing_jobs(app_mocks, monkeypatch, idle):
+    app, registry, warm_pool, cm = app_mocks
+    registry.find_active.return_value = _record()
+    reconciler = sandboxes_router._reconciler
+    reconciler._probe_terminal_idle = AsyncMock(return_value=idle)
+    prepare = AsyncMock()
+    monkeypatch.setattr(sandboxes_router, "_prepare_inputs", prepare)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        response = await client.post("/v1/sandboxes/acquire", json={"user_id": "u1", "role_id": "r1", "inputs": [_input()]})
+    assert response.status_code == 409
+    assert response.json()["detail"]["reason"] == "inputs_mount_pending"
+    reconciler.destroy_sandbox.assert_not_called()
+    prepare.assert_not_called()
+    cm.run_container.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_inputs_manifest_refresh_reuses_mounted_container(app_mocks, monkeypatch):
+    app, registry, warm_pool, cm = app_mocks
+    record = _record()
+    record.container_info.inputs_mounted = True
+    registry.find_active.return_value = record
+    prepare = AsyncMock(return_value="/host/u1/r1/inputs")
+    monkeypatch.setattr(sandboxes_router, "_prepare_inputs", prepare)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        response = await client.post("/v1/sandboxes/acquire", json={"user_id": "u1", "role_id": "r1", "inputs": []})
+    assert response.status_code == 200 and response.json()["inputs_ready"]
+    prepare.assert_awaited_once()
+    sandboxes_router._reconciler.destroy_sandbox.assert_not_called()
     cm.run_container.assert_not_called()
