@@ -15,6 +15,8 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
+import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -231,4 +233,24 @@ class InputsCache:
         removed = await asyncio.to_thread(self._evict_sync, limit)
         if removed:
             logger.info(f"inputs blob 缓存淘汰 | removed={removed}")
+        return removed
+
+    async def prune_v1_views(self, mounted: set[str], grace_seconds: float = 60) -> int:
+        """Release hard links of views no longer mounted by any live container."""
+        def run():
+            views = self._root.parent / "v1-inputs"
+            if not views.is_dir():
+                return 0
+            protected = {str(Path(path).resolve()) for path in mounted}
+            removed = 0
+            for view in views.iterdir():
+                if not view.is_dir() or view.is_symlink():
+                    continue
+                if str((view / "inputs").resolve()) in protected or time.time() - view.stat().st_mtime < grace_seconds:
+                    continue
+                shutil.rmtree(view)
+                removed += 1
+            return removed
+        removed = await asyncio.to_thread(run)
+        await self.evict()
         return removed
