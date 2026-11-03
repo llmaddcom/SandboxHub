@@ -11,7 +11,8 @@
   - `skills` — `server/infrastructure/sandbox_cli/skills.py`（见 issue #15/#18/#24；原 `skillhub`，
     #24 改名且**不留别名**，为第三方 skillhub.cn 的同名 CLI 让出命名空间）；
   - `todo` — `server/infrastructure/sandbox_cli/todo.py`（见 issue #19，llmaddcom/createrole#362）；
-  - `memory` — `server/infrastructure/sandbox_cli/memory.py`（只读，见 issue #20，llmaddcom/createrole#366）。
+  - `memory` — `server/infrastructure/sandbox_cli/memory.py`（只读，见 issue #20，llmaddcom/createrole#366）；
+  - `tools` — createrole_com_api 仓 `server/tools/interfaces/cli/tools.py`（挂载的外部工具 / MCP 经平台网关调用，凭据不进沙盒，见 issue #63，llmaddcom/createrole_com_api#316）。
 - 更新脚本后须 bump `images/ubuntu/app/VERSION` 并重建镜像。
 
 `.md` 文件会被构建脚本跳过。
