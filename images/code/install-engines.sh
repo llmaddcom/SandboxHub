@@ -103,6 +103,36 @@ term.onData((d) => { out += d; });
 term.onExit((e) => { if (e.exitCode !== 0 || !out.includes('pty-ok')) { console.error('node-pty 不可用', e, out); process.exit(1); } });
 " || fail "node-pty 不可用"
 
+# Codex 管控配置（后端 createrole_com_api#383 实测）：codex-acp 把 cwd 强制标为受信项目，
+# /workspace/work/.codex/config.toml 会以 Project 层加载——用户数据能改 features、加
+# [mcp_servers.x] command=…（启动即执行）。系统级 managed_config 优先级最高，把工作目录标为
+# untrusted 即停用 Project 层；full-access 与审批 never 由后端经启动参数给出，不受影响。
+mkdir -p /etc/codex
+cat > /etc/codex/managed_config.toml <<'TOML'
+[projects."/workspace/work"]
+trust_level = "untrusted"
+TOML
+chmod 0444 /etc/codex/managed_config.toml
+grep -q 'trust_level = "untrusted"' /etc/codex/managed_config.toml || fail "Codex 管控配置未写入"
+echo "Codex 管控配置：/etc/codex/managed_config.toml"
+# Claude Code 管控设置（后端 createrole_com_api#388 实测）：managed 层优先级最高，进程起来即为
+# bypass，不依赖驱动随后的 set_mode，也压住 work/.claude/settings.json 的 defaultMode；关掉 auto
+# 模式（每个动作多一次分类器模型请求）。项目层的 disableBypassPermissionsMode 无法由此撤销，
+# 届时权限请求由后端驱动一律拒绝（工具失败，不越权）。
+mkdir -p /etc/claude-code
+cat > /etc/claude-code/managed-settings.json <<'JSON'
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "disableAutoMode": "disable"
+  }
+}
+JSON
+chmod 0644 /etc/claude-code/managed-settings.json
+"$NODE" -e "const s=require('/etc/claude-code/managed-settings.json'); if (s.permissions.defaultMode !== 'bypassPermissions') process.exit(1)" \
+    || fail "Claude Code 管控设置无效"
+echo "Claude Code 管控设置：/etc/claude-code/managed-settings.json"
+
 # 管道末端 head 读到首行即退出，引擎随之收到 SIGPIPE / EOF：只看回复内容，不看管道退出码
 reply="$({ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}'; sleep 5; } \
     | DSH_HOME="$scratch/dsh" timeout 60 "$ROOT/bin/dsh" --profile acp 2>"$scratch/dsh.err" | head -n 1)" || true
