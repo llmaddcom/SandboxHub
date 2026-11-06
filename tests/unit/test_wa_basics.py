@@ -282,9 +282,9 @@ def test_image_features_from_labels():
     assert ImageFeatures.from_labels(None) == ImageFeatures()   # 镜像不存在
     assert ImageFeatures.from_labels({"sandboxhub.api_auth": "1"}) == ImageFeatures()   # 旧镜像缺标签
     features = ImageFeatures.from_labels(
-        {"sandboxhub.procs": "1", "sandboxhub.engines": '{"pi":"1.4.0","dsh":"0.2.1-rc.3","codex":"2.5.0"}'}
+        {"sandboxhub.procs": "1", "sandboxhub.engines": '{"pi":"1.4.0","dsh":"0.2.1-rc.3","codex":"2.5.0","claude-code":"0.101.0"}'}
     )
-    assert features.procs is True and features.engines == {"pi": "1.4.0", "dsh": "0.2.1-rc.3", "codex": "2.5.0"}
+    assert features.procs is True and features.engines == {"pi": "1.4.0", "dsh": "0.2.1-rc.3", "codex": "2.5.0", "claude-code": "0.101.0"}
     assert ImageFeatures.from_labels({"sandboxhub.procs": "0"}).procs is False
     for bad in ("not json", "[]", '{"pi": 1}', '{"": "1.0"}', '{"pi": ""}'):
         assert ImageFeatures.from_labels({"sandboxhub.procs": "1", "sandboxhub.engines": bad}).engines == {}
@@ -304,7 +304,7 @@ async def test_selftest_reads_image_features_from_configured_images():
         settings.image_v2_for_type("code"): {
             "sandboxhub.api_auth": "1",
             "sandboxhub.procs": "1",
-            "sandboxhub.engines": json.dumps({"pi": "1.4.0", "dsh": "0.2.1-rc.3", "codex": "2.5.0"}),
+            "sandboxhub.engines": json.dumps({"pi": "1.4.0", "dsh": "0.2.1-rc.3", "codex": "2.5.0", "claude-code": "0.101.0"}),
         },
         settings.image_v2_for_type("ubuntu"): {"sandboxhub.api_auth": "1"},
     }
@@ -316,7 +316,7 @@ async def test_selftest_reads_image_features_from_configured_images():
     result = await SelfTest(sidecar, MagicMock(), manager).run()
     data = result.to_dict()
     assert data["procs"] == {"ubuntu": False, "code": True}
-    assert data["engines"] == {"ubuntu": {}, "code": {"pi": "1.4.0", "dsh": "0.2.1-rc.3", "codex": "2.5.0"}}
+    assert data["engines"] == {"ubuntu": {}, "code": {"pi": "1.4.0", "dsh": "0.2.1-rc.3", "codex": "2.5.0", "claude-code": "0.101.0"}}
     assert data["items"]["image_code"]["ok"] and data["items"]["image_ubuntu"]["ok"]
 
 
