@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # 执行引擎运行时（SandboxHub#52 / createrole_com_api#160），由 images/code/Dockerfile 第 5d 步调用。
 #
-# 输入（Dockerfile 构建参数）：ENGINE_NODE_VERSION PI_VERSION DSH_VERSION NPM_REGISTRY ENGINE_ALLOW_SCRIPTS
+# 输入（Dockerfile 构建参数）：ENGINE_NODE_VERSION PI_VERSION DSH_VERSION CODEX_ACP_VERSION CODEX_VERSION
+#                             NPM_REGISTRY ENGINE_ALLOW_SCRIPTS
 # 布局：
 #   /opt/cr-engines/node                 Node 24 LTS（与系统 Node 20 /usr/local/bin/node 分开）
 #   /opt/cr-engines/lib/node_modules     npm install -g --prefix /opt/cr-engines
-#   /opt/cr-engines/bin/{pi,dsh}         包装脚本：固定用 /opt/cr-engines/node 执行，与 PATH 无关
-# 两个 CLI 不进 PATH，由平台经 /api/procs 按绝对路径启动；系统 node / npm 与其全局包不受影响。
-# 构建期核对：版本与构建参数一致、node-pty 可用、DSH 的 ACP 与 pi 的 RPC 各走通一个来回。
+#   /opt/cr-engines/bin/{pi,dsh,codex-acp}  包装脚本：固定用 /opt/cr-engines/node 执行，与 PATH 无关
+# CLI 不进 PATH，由平台经 /api/procs 按绝对路径启动；系统 node / npm 与其全局包不受影响。
+# codex-acp 用启动它的 Node（process.execPath）执行其依赖 @openai/codex 的 bin/codex.js，codex.js 再按
+# optionalDependencies 装好的平台包（@openai/codex-linux-<arch>，原生二进制）启动 app-server：不单独
+# 全局安装 @openai/codex（否则同一个约 450MB 的二进制装两份），只核对 codex-acp 依赖树里的版本。
+# 构建期核对：版本与构建参数一致、node-pty 可用、DSH 与 codex-acp 的 ACP、pi 的 RPC 各走通一个来回。
 set -euo pipefail
 
 ROOT=/opt/cr-engines
@@ -19,7 +23,7 @@ check() { [ "$2" = "$3" ] || fail "$1 得到 '$2'，期望 '$3'"; }
 # npm 与引擎运行时会在 TMPDIR 下留编译缓存、原生模块解包等临时文件：整个安装与核对期间指向
 # 临时目录，最后删除，不把构建期的临时产物带进镜像的 /tmp
 scratch="$(mktemp -d)"
-mkdir -p "$scratch/tmp" "$scratch/dsh" "$scratch/home"
+mkdir -p "$scratch/tmp" "$scratch/dsh" "$scratch/home" "$scratch/codex"
 export TMPDIR="$scratch/tmp"
 
 # fd：pi 的文件检索用 rg / fd（ripgrep 已在系统依赖层）
@@ -47,7 +51,8 @@ PATH="$ROOT/node/bin:$PATH" npm install -g --prefix "$ROOT" \
     --registry "$NPM_REGISTRY" --cache "$scratch/npm-cache" \
     --no-fund --no-audit --no-update-notifier \
     --allow-scripts="$ENGINE_ALLOW_SCRIPTS" \
-    "@earendil-works/pi-coding-agent@${PI_VERSION}" "@deepseek-ai/dsh@${DSH_VERSION}"
+    "@earendil-works/pi-coding-agent@${PI_VERSION}" "@deepseek-ai/dsh@${DSH_VERSION}" \
+    "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}"
 rm -rf "$scratch/npm-cache"
 
 # 包装脚本替换 npm 生成的软链（入口的 #!/usr/bin/env node 会在 PATH 里先撞上系统 Node 20）
@@ -61,11 +66,19 @@ wrap() {   # wrap <命令名> <包名>
 }
 wrap pi @earendil-works/pi-coding-agent
 wrap dsh @deepseek-ai/dsh
+wrap codex-acp @agentclientprotocol/codex-acp
 
 # ── 构建期核对（沿用镜像默认 PATH：系统 Node 20 在前，证明包装脚本不依赖 PATH）──
 check "系统 node --version" "$(node --version)" "v${NODE_VERSION}"
 check "pi --version" "$("$ROOT/bin/pi" --version)" "$PI_VERSION"
 check "dsh --version" "$("$ROOT/bin/dsh" --version)" "$DSH_VERSION"
+check "codex-acp --version" "$("$ROOT/bin/codex-acp" --version)" "@agentclientprotocol/codex-acp $CODEX_ACP_VERSION"
+CODEX_PKG="$ROOT/lib/node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex"
+check "codex-acp 依赖的 @openai/codex" "$("$NODE" -p "require('$CODEX_PKG/package.json').version")" "$CODEX_VERSION"
+case "$("$NODE" "$CODEX_PKG/bin/codex.js" --version)" in
+    *" $CODEX_VERSION") echo "codex 原生二进制：$CODEX_VERSION" ;;
+    *) fail "codex --version 得到 '$("$NODE" "$CODEX_PKG/bin/codex.js" --version)'，期望以 $CODEX_VERSION 结尾" ;;
+esac
 
 "$NODE" -e "
 const pty = require('$ROOT/lib/node_modules/@deepseek-ai/dsh/node_modules/node-pty');
@@ -82,6 +95,12 @@ case "$reply" in
     *'"id":1'*'"result"'*) echo "DSH ACP initialize：ok" ;;
     *) fail "DSH ACP initialize 无回复：$reply $(head -c 2000 "$scratch/dsh.err")" ;;
 esac
+reply="$({ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}'; sleep 5; } \
+    | HOME="$scratch/home" CODEX_HOME="$scratch/codex" timeout 60 "$ROOT/bin/codex-acp" 2>"$scratch/codex.err" | grep -m 1 '"id":1')" || true
+case "$reply" in
+    *'"id":1'*'"result"'*) echo "codex-acp ACP initialize：ok" ;;
+    *) fail "codex-acp ACP initialize 无回复：$reply $(head -c 2000 "$scratch/codex.err")" ;;
+esac
 reply="$({ printf '%s\n' '{"type":"get_state","id":"1"}'; sleep 5; } \
     | HOME="$scratch/home" timeout 60 "$ROOT/bin/pi" --mode rpc --no-session 2>"$scratch/pi.err" | head -n 1)" || true
 case "$reply" in
@@ -91,4 +110,4 @@ esac
 unset TMPDIR
 rm -rf "$scratch"
 
-echo "执行引擎运行时：node $("$NODE" --version)，pi $PI_VERSION，dsh $DSH_VERSION，$(du -sh "$ROOT" | cut -f1)"
+echo "执行引擎运行时：node $("$NODE" --version)，pi $PI_VERSION，dsh $DSH_VERSION，codex-acp $CODEX_ACP_VERSION（codex $CODEX_VERSION），$(du -sh "$ROOT" | cut -f1)"
