@@ -127,14 +127,22 @@ RUN python /tmp/verify-office.py && rm -f /tmp/verify-office.py
 
 # ===== 5d. 执行引擎运行时（SandboxHub#52，createrole_com_api#160）=====
 # 平台托管的执行引擎（pi = @earendil-works/pi-coding-agent，要求 Node ≥ 22.19；DeepSeek Harness =
-# @deepseek-ai/dsh，要求 Node ≥ 24.9）单独装在 /opt/cr-engines：自带 Node 24 LTS，系统 Node 20 与全局
-# npm 包不动。/opt/cr-engines/bin/{pi,dsh} 是包装脚本，固定用这套 Node 执行、与 PATH 无关；两个 CLI
-# 不进 PATH，由平台经 /api/procs 按绝对路径启动。版本由构建参数固定（DSH 的 npm latest 落后于 rc.3，
-# 须写精确版本）。构建期核对 --version 与参数一致、原生模块可用、两种 stdio 协议各走通一个来回，否则
-# 构建失败（见 code/install-engines.sh）。另装 fd（pi 用 rg / fd 检索文件）。
+# @deepseek-ai/dsh，要求 Node ≥ 24.9；Codex = @agentclientprotocol/codex-acp，ACP 适配器拉起其依赖
+# @openai/codex 的 `codex app-server`；Claude Code = @agentclientprotocol/claude-agent-acp，经其锁定的
+# @anthropic-ai/claude-agent-sdk 启动平台包里的 Claude Code CLI，SandboxHub#67）单独装在 /opt/cr-engines：
+# 自带 Node 24 LTS，系统 Node 20 与全局 npm 包不动。/opt/cr-engines/bin/{pi,dsh,codex-acp,claude-agent-acp}
+# 是包装脚本，固定用这套 Node 执行、与 PATH 无关；CLI 不进 PATH，由平台经 /api/procs 按绝对路径启动。
+# 版本由构建参数固定（DSH 的 npm latest 落后于 rc.3，须写精确版本；codex 与 Claude Code 的原生二进制按
+# optionalDependencies 选平台包，版本须与适配器依赖的一致）。Claude Code 按 Anthropic 条款原样安装、
+# 不修改二进制，平台只用于终端用户自带凭据的会话（createrole_com_api#388）。构建期核对 --version 与参数一致、原生模块可用、各引擎的 stdio 协议各走通一个来回，否则构建
+# 失败（见 code/install-engines.sh）。另装 fd（pi 用 rg / fd 检索文件）。
 ARG ENGINE_NODE_VERSION=24.22.1
 ARG PI_VERSION=1.4.0
 ARG DSH_VERSION=0.2.1-rc.3
+ARG CODEX_ACP_VERSION=2.5.0
+ARG CODEX_VERSION=0.165.0
+ARG CLAUDE_AGENT_ACP_VERSION=0.101.0
+ARG CLAUDE_AGENT_SDK_VERSION=0.3.318
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 # npm 11 默认不执行依赖的安装脚本；这几个包的脚本负责原生模块（node-pty / koffi 等）就位，须放行
 ARG ENGINE_ALLOW_SCRIPTS=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,protobufjs,@google/genai
@@ -175,7 +183,7 @@ RUN mkdir -p /etc/sandbox && { \
       echo "- 系统：$(. /etc/os-release && echo "$PRETTY_NAME")，root，时区 $TZ，locale $LANG"; \
       echo "- Python：$(python --version 2>&1)，pip $(pip --version | awk '{print $2}')，源 $(pip config get global.index-url)"; \
       echo "- Node：$(node --version)，npm $(npm --version)，yarn $(yarn --version)，pnpm $(pnpm --version)，源 $NPM_CONFIG_REGISTRY"; \
-      echo "- 执行引擎运行时（平台托管，不在 PATH）：/opt/cr-engines，Node $(/opt/cr-engines/node/bin/node --version)，pi $(/opt/cr-engines/node/bin/node -p "require('/opt/cr-engines/lib/node_modules/@earendil-works/pi-coding-agent/package.json').version")，dsh $(/opt/cr-engines/node/bin/node -p "require('/opt/cr-engines/lib/node_modules/@deepseek-ai/dsh/package.json').version")"; \
+      echo "- 执行引擎运行时（平台托管，不在 PATH）：/opt/cr-engines，Node $(/opt/cr-engines/node/bin/node --version)，pi $(/opt/cr-engines/node/bin/node -p "require('/opt/cr-engines/lib/node_modules/@earendil-works/pi-coding-agent/package.json').version")，dsh $(/opt/cr-engines/node/bin/node -p "require('/opt/cr-engines/lib/node_modules/@deepseek-ai/dsh/package.json').version")，codex-acp $(/opt/cr-engines/node/bin/node -p "require('/opt/cr-engines/lib/node_modules/@agentclientprotocol/codex-acp/package.json').version")（codex $(/opt/cr-engines/node/bin/node -p "require('/opt/cr-engines/lib/node_modules/@agentclientprotocol/codex-acp/node_modules/@openai/codex/package.json').version")），claude-agent-acp $(/opt/cr-engines/node/bin/node -p "require('/opt/cr-engines/lib/node_modules/@agentclientprotocol/claude-agent-acp/package.json').version")（claude-agent-sdk $(/opt/cr-engines/node/bin/node -p "require('/opt/cr-engines/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version")）"; \
       echo "- playwright 浏览器：$(ls /opt/ms-playwright | tr '\n' ' ')（headless chromium，\`playwright screenshot\` 可直接用）"; \
       echo "- 中文字体：$(fc-list :lang=zh family | sort -u | tr '\n' ';' )"; \
       echo; echo "## 命令行工具"; echo; \
@@ -207,7 +215,7 @@ RUN mkdir -p /etc/sandbox && { \
     grep -q "^- tools：已装" /etc/sandbox/MANIFEST.md && \
     grep -q "^- antiword：已装" /etc/sandbox/MANIFEST.md && \
     grep -q "^- fd：已装" /etc/sandbox/MANIFEST.md && \
-    grep -q "^- 执行引擎运行时.*pi ${PI_VERSION}，dsh ${DSH_VERSION}$" /etc/sandbox/MANIFEST.md && \
+    grep -q "^- 执行引擎运行时.*pi ${PI_VERSION}，dsh ${DSH_VERSION}，codex-acp ${CODEX_ACP_VERSION}（codex ${CODEX_VERSION}），claude-agent-acp ${CLAUDE_AGENT_ACP_VERSION}（claude-agent-sdk ${CLAUDE_AGENT_SDK_VERSION}）$" /etc/sandbox/MANIFEST.md && \
     grep -q "^olefile==" /etc/sandbox/MANIFEST.md && \
     grep -q "^| .doc" /etc/sandbox/MANIFEST.md && \
     echo "MANIFEST.md: $(wc -l < /etc/sandbox/MANIFEST.md) 行"
@@ -218,7 +226,7 @@ RUN mkdir -p /etc/sandbox && { \
 # /v2/capabilities 的 procs / engines 上报，平台据此判断能否在这类实例里托管引擎。
 LABEL sandboxhub.api_auth="1" \
       sandboxhub.procs="1" \
-      sandboxhub.engines="{\"pi\":\"${PI_VERSION}\",\"dsh\":\"${DSH_VERSION}\"}"
+      sandboxhub.engines="{\"pi\":\"${PI_VERSION}\",\"dsh\":\"${DSH_VERSION}\",\"codex\":\"${CODEX_ACP_VERSION}\",\"claude-code\":\"${CLAUDE_AGENT_ACP_VERSION}\"}"
 
 WORKDIR /app
 EXPOSE 8000
