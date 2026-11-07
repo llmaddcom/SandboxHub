@@ -452,6 +452,8 @@ async def test_work_area_layout_v2_end_to_end(live):
         "roles/r1/skills/hello/SKILL.md": b"---\nname: hello\n---\nsay hello\n",
         "roles/r1/diary/2026-11-07.md": b"diary entry\n",
         "roles/r1/.cr/versions/about.md/1": b"version bytes\n",
+        "roles/r1/avatar/a.png": b"avatar bytes\n",
+        "roles/r1/.staging/up.bin": b"staging bytes\n",
     }.items():
         mc.put_object(bucket, key, io.BytesIO(data), len(data))
     doc = b"archived deliverable\n"
@@ -462,7 +464,10 @@ async def test_work_area_layout_v2_end_to_end(live):
     manager = ContainerManager()
     service = WorkAreaService(manager, FsSidecar(manager.docker))
     services = [service]
-    self_mount = RoleMountSpec("self", bucket, "roles/r1", "rw", layout_version=2)
+    # 后端随 self 附带的排除规则（#73）：头像与上传暂存不进实例
+    self_mount = RoleMountSpec(
+        "self", bucket, "roles/r1", "rw", layout_version=2, extra_exclude=("avatar/**", ".staging/**")
+    )
     diary_mount = RoleMountSpec("diary", bucket, "roles/r1/diary", "ro", layout_version=2)
     agents = {"AGENTS.md": "# 盘说明 v1\n", "CLAUDE.md": "@AGENTS.md\n"}
 
@@ -508,6 +513,7 @@ async def test_work_area_layout_v2_end_to_end(live):
             assert text in out, (text, out)
         ls_self = lines[lines.index("LS_SELF") + 1 : lines.index("LS_WS")]
         assert ".cr" not in ls_self and {"about.md", "skills", "diary"} <= set(ls_self), ls_self
+        assert "avatar" not in ls_self and ".staging" not in ls_self, ls_self
         ls_ws = lines[lines.index("LS_WS") + 1 :]
         assert {"AGENTS.md", "CLAUDE.md", "deliverables", "keep.txt"} <= set(ls_ws), ls_ws
 
@@ -523,6 +529,8 @@ async def test_work_area_layout_v2_end_to_end(live):
         r = await _file_write(a, "/mnt/drive/new.txt", "x")
         assert r.status_code == 400 and "只读位置" in r.json()["detail"], r.text
         r = await _file_write(a, "/self/.cr/versions/about.md/1", "tampered")
+        assert r.status_code == 400 and "平台保留目录" in r.json()["detail"], r.text
+        r = await _file_write(a, "/self/avatar/a.png", "tampered")
         assert r.status_code == 400 and "平台保留目录" in r.json()["detail"], r.text
         code, out = await _sh(
             a,
@@ -541,6 +549,7 @@ async def test_work_area_layout_v2_end_to_end(live):
         assert "version bytes" not in out, out
         await asyncio.sleep(3)
         assert mc.get_object(bucket, "roles/r1/.cr/versions/about.md/1").read() == b"version bytes\n"
+        assert mc.get_object(bucket, "roles/r1/avatar/a.png").read() == b"avatar bytes\n"
         assert not [o for o in mc.list_objects(bucket, "roles/r1/.cr/", recursive=True) if o.object_name.endswith("/x")]
 
         # ── 5. 归档读取不变；平台文件就地更新后实例立刻看到 ─────────────────────
@@ -555,11 +564,15 @@ async def test_work_area_layout_v2_end_to_end(live):
         report = service.effective_report(a)
         assert report["layout_version"] == 2 and report["cwd"] == "/workspace"
         assert report["workspace_files"] == {"files": ["AGENTS.md"]}
+        targets = {m["target"]: m for m in report["mounts"]}
+        assert targets["/self"]["exclude"] == ["/.cr/**", "/avatar/**", "/.staging/**"], report
 
         # ── 6. 镜像：Codex 管控配置压住 v2 工作目录 ─────────────────────────────
         if os.environ.get("LIVE_EXPECT_V2_IMAGE") == "1":
             code, out = await _sh(a, "cat /etc/codex/managed_config.toml")
             assert '[projects."/workspace"]' in out, out
+            code, out = await _sh(a, "tools --help; grep -c CR_SKILLS_DIR /usr/local/bin/skills")
+            assert "/opt/cr/tools/INDEX.md" in out and "/workspace/context" not in out, out
 
         # ── 7. Hub 重启：按布局标签收养 ─────────────────────────────────────────
         manager2 = ContainerManager()
