@@ -649,6 +649,15 @@ A v2 acquire looks like:
  "workspace_files": {"AGENTS.md": "...", "CLAUDE.md": "@AGENTS.md\n"}}
 ```
 
+The `self` mount may carry `"exclude": ["avatar/**", ".staging/**"]` (≤ 16 entries; a
+literal directory relative to `/self`, optionally ending in `/**`, a leading `/` allowed; no
+`..` and no wildcards elsewhere; invalid lists → 400 `invalid_mount`, and `exclude` on any
+other mount is rejected the same way). The Hub always adds `.cr/**`, applies the list as
+rclone `--exclude` rules (so those directories are invisible under `/self`), adds each of them
+to `SANDBOX_HIDDEN_ROOTS` (the file API refuses writes there like under `/self/.cr`), and
+reports the full rule list as the `exclude` of `self` in the effective report. A different
+list means a different mount, so the instance is rebuilt like any other mount change.
+
 v2 accepts only the role mounts `self` (prefix exactly the role root) and `diary` (read-only);
 `cwd` may be omitted and must otherwise equal the layout's cwd. `workspace_files` accepts only
 `AGENTS.md` and `CLAUDE.md` (≤ 1 MiB each) and replaces the pair as a whole: a name left out
@@ -665,7 +674,8 @@ v2 instances get `SANDBOX_CWD=/workspace`, `SANDBOX_LAYOUT=work-area/v2`,
 `SANDBOX_HIDDEN_ROOTS`; v1 keeps its previous environment. With these, the file API reports a
 write into a read-only place as "在只读位置，不能写入（…要修改先复制到 /workspace 下再改）"
 (HTTP 400 for write/replace, 403 for upload) and refuses writes under `/self/.cr` outright
-(the rclone exclusion hides it, and terminal writes there never reach storage). The image's
+(the rclone exclusion hides it, and terminal writes there never reach storage); the same
+holds for every directory in the `self` mount's `exclude`. The image's
 Codex managed config marks both `/workspace/work` and `/workspace` untrusted.
 
 Independent role directories are prepared concurrently, with a shared limit of four

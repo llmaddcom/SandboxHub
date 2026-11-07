@@ -169,6 +169,12 @@ async def test_sidecar_mount_passes_exclusions_only_for_v2_self(monkeypatch) -> 
     sidecar.mount_status = AsyncMock(side_effect=lambda: {spec.key: True})
     for spec, expect in (
         (RoleMountSpec("self", "b", "roles/r1", "rw", layout_version=2), ["--exclude", "/.cr/**"]),
+        (
+            RoleMountSpec(
+                "self", "b", "roles/r1", "rw", layout_version=2, extra_exclude=("avatar/**",)
+            ),
+            ["--exclude", "/.cr/**", "--exclude", "/avatar/**"],
+        ),
         (RoleMountSpec("diary", "b", "roles/r1/diary", "ro", layout_version=2), []),
         (RoleMountSpec("notes", "b", "roles/r1/notes", "rw"), []),
     ):

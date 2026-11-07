@@ -1,3 +1,4 @@
+import re
 """
 SandboxHub 共享数据模型
 
@@ -30,6 +31,45 @@ LAYOUT_VERSION_LABEL = "sandboxhub.layout-version"
 # ``diary`` = 叠在其上的只读日记。v1 的角色目录一律在 ``/workspace/role/<name>``。
 V2_ROLE_TARGETS = {"self": "/self", "diary": "/self/diary"}
 V2_SELF_EXCLUDE = ("/.cr/**",)
+# 平台保留目录：v2 实例里 /self 下列不出、经文件端点写入会被拒绝。
+V2_SELF_HIDDEN = ("/self/.cr",)
+# 后端随 ``self`` 挂载附带的排除规则（#73）：相对角色空间根的目录子树，如 ``avatar/**``；
+# 开头的 ``/`` 可有可无（同样相对 /self 根）。只接受「字面路径」或「字面路径/**」，平台据此
+# 推出要隐藏的目录，保证列不出、也写不进。
+SELF_EXCLUDE_MAX = 16
+_EXCLUDE_SEGMENT = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def normalize_self_exclude(patterns) -> tuple[str, ...]:
+    """校验并规整 ``self`` 挂载的排除规则，返回相对路径形式（如 ``avatar/**``），去重保序。
+
+    非法时抛 ``ValueError``（调用方映射为 ``invalid_mount``）。
+    """
+    if patterns is None:
+        return ()
+    if isinstance(patterns, (str, bytes)) or not isinstance(patterns, (list, tuple)):
+        raise ValueError("exclude 须是字符串列表")
+    if len(patterns) > SELF_EXCLUDE_MAX:
+        raise ValueError(f"exclude 最多 {SELF_EXCLUDE_MAX} 条")
+    out: list[str] = []
+    for raw in patterns:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"exclude 条目非法：{raw!r}")
+        value = raw.strip()
+        if value.startswith("/"):
+            value = value[1:]
+        if value.startswith("/"):
+            raise ValueError(f"exclude 只能是相对 /self 的路径：{raw!r}")
+        body = value[:-3] if value.endswith("/**") else value
+        segments = body.split("/")
+        if not body or any(
+            seg in ("", ".", "..") or not _EXCLUDE_SEGMENT.match(seg) for seg in segments
+        ):
+            raise ValueError(f"exclude 条目非法（只接受相对目录或「目录/**」，不含 .. 与通配）：{raw!r}")
+        rule = f"{body}/**"
+        if rule not in out:
+            out.append(rule)
+    return tuple(out)
 
 
 @dataclass
@@ -118,11 +158,37 @@ class RoleMountSpec:
     prefix: str
     mode: RoleMountMode = "ro"
     layout_version: int = 1
+    # 后端附带的排除规则（相对形式，见 ``normalize_self_exclude``）；只对 v2 ``self`` 有效
+    extra_exclude: tuple[str, ...] = ()
+
+    @property
+    def is_v2_self(self) -> bool:
+        return self.layout_version >= 2 and self.name == "self"
 
     @property
     def exclude(self) -> tuple[str, ...]:
-        """rclone 过滤规则：v2 的 ``self`` 挂整个角色空间，平台保留区 ``.cr/`` 不进实例。"""
-        return V2_SELF_EXCLUDE if self.layout_version >= 2 and self.name == "self" else ()
+        """rclone 过滤规则：v2 的 ``self`` 挂整个角色空间，平台保留区 ``.cr/`` 与后端附带的
+        目录（``extra_exclude``）不进实例。"""
+        if not self.is_v2_self:
+            return ()
+        rules = list(V2_SELF_EXCLUDE)
+        for rule in self.extra_exclude:
+            anchored = f"/{rule}"
+            if anchored not in rules:
+                rules.append(anchored)
+        return tuple(rules)
+
+    @property
+    def hidden_dirs(self) -> tuple[str, ...]:
+        """实例里要按平台保留目录拒绝写入的路径（容器内绝对路径）。"""
+        if not self.is_v2_self:
+            return ()
+        dirs = list(V2_SELF_HIDDEN)
+        for rule in self.extra_exclude:
+            path = f"{self.target}/{rule.removesuffix('/**')}"
+            if path not in dirs:
+                dirs.append(path)
+        return tuple(dirs)
 
     @property
     def key(self) -> str:

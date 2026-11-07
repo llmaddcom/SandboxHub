@@ -7,14 +7,19 @@
 
     skills search 表格        # 商城搜索
     skills install excel-helper
-    skills list               # 本地全量技能索引（不访问网络，接替原 skills/INDEX.md）
+    skills list               # 本地技能索引（不访问网络，接替原 skills/INDEX.md）
+    skills list --all         # 连已停用的一起列出（标 [已停用]）
+
+``list`` 默认隐藏已停用技能：启停状态由后端按角色记录在 DB，并投影为技能目录根下的
+``.state.json``（``{"schema_version": 1, "disabled": [...]}``）；本 CLI 只读该投影，缺失或
+不可解析一律按全部启用处理。
 
 服务端半边是后端 agent 面路由 ``/agent/market/*``；凭据（后端基址 + 短时 scoped token）
 由后端在沙盒 acquire 时写进容器本地 ``~/.config/createrole/credentials.json``，也可用环境变量
 ``CR_API_BASE`` / ``CR_SANDBOX_TOKEN`` 覆盖（P1 镜像预装 + env 注入后走环境变量）。
 
-安装是服务端直写云盘（不经容器文件系统），rclone 挂载约 1 秒后在
-``/workspace/skills/<slug>/`` 可见。
+安装是服务端直写角色空间（不经容器文件系统），挂载约 1 秒后在
+``/self/skills/<slug>/`` 可见。
 """
 
 from __future__ import annotations
@@ -28,8 +33,8 @@ import urllib.parse
 import urllib.request
 
 DEFAULT_CREDENTIALS_FILE = os.path.expanduser("~/.config/createrole/credentials.json")
-# v2 实例（按工作区分配）里技能在 /workspace/role/skills，由 SandboxHub 注入 CR_SKILLS_DIR。
-DEFAULT_SKILLS_DIR = os.environ.get("CR_SKILLS_DIR") or "/workspace/skills"
+# 布局 v2 里技能在 /self/skills，由 SandboxHub 注入 CR_SKILLS_DIR；缺省也按 v2。
+DEFAULT_SKILLS_DIR = os.environ.get("CR_SKILLS_DIR") or "/self/skills"
 TIMEOUT_SECONDS = 20
 
 # 容器内直连宿主后端，不走任何代理（env 里的 http_proxy 等一律忽略）。
@@ -90,8 +95,7 @@ def _request(method: str, path: str, *, payload: dict | None = None) -> dict:
         raise CliError(f"商城请求失败 HTTP {exc.code}: {detail or exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise CliError(
-            f"连不上商城服务 {api_base}: {exc.reason}。"
-            "请确认沙盒到宿主后端网络可达。"
+            f"连不上商城服务 {api_base}: {exc.reason}。请确认沙盒到宿主后端网络可达。"
         ) from exc
 
 
@@ -102,7 +106,9 @@ def _print_entries(items: list[dict]) -> None:
     for item in items:
         official = "[官方] " if item.get("official") else ""
         tags = "".join(f"#{t} " for t in item.get("tags") or [])
-        print(f"{item['slug']}  v{item.get('version')}  {official}{item['name']}  {tags}".rstrip())
+        print(
+            f"{item['slug']}  v{item.get('version')}  {official}{item['name']}  {tags}".rstrip()
+        )
         desc = (item.get("description") or "").strip().replace("\n", " ")
         if desc:
             print(f"    {desc}")
@@ -131,7 +137,9 @@ def cmd_install(args: argparse.Namespace) -> None:
         f"/agent/market/skills/{urllib.parse.quote(args.ref, safe='')}/install",
         payload=payload or {},
     )
-    print(f"已安装 {result['name']} v{result['version']} → skills/{result['skill_id']}/")
+    print(
+        f"已安装 {result['name']} v{result['version']} → skills/{result['skill_id']}/"
+    )
     print(result.get("note", ""))
 
 
@@ -152,8 +160,24 @@ def _read_frontmatter_description(skill_md_path: str) -> str:
     return ""
 
 
-# 索引行内描述的截断长度（与 system 常驻清单回退口径一致）。
+# 索引行内描述的截断长度：CLI 在沙盒内运行、读不到后端旋钮，故为固定展示上限；
+# system 常驻清单的截断字数另由 skills.brief_max_chars 决定。
 _MAX_LIST_DESC_LEN = 240
+# 后端投影的启停状态文件（落在技能目录根下，不是技能）。
+_STATE_FILE_NAME = ".state.json"
+
+
+def _read_disabled_names(root: str) -> set[str]:
+    """读 ``<root>/.state.json`` 里的已停用技能名集合；文件缺失/不可解析/形态不对一律按空集。"""
+    try:
+        with open(os.path.join(root, _STATE_FILE_NAME), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    names = data.get("disabled") if isinstance(data, dict) else None
+    if not isinstance(names, list):
+        return set()
+    return {n for n in names if isinstance(n, str)}
 
 
 def _one_line(text: str) -> str:
@@ -164,32 +188,41 @@ def _one_line(text: str) -> str:
 
 
 def cmd_list(args: argparse.Namespace) -> None:
-    """本地全量技能索引：每行「名称 + 单行钩子句 + SKILL.md 路径」。
+    """本地技能索引：每行「名称 + 单行钩子句 + SKILL.md 路径」。
 
     这是「拉取才是权威」的全量兜底路径——system 常驻清单截断/召回零命中时模型跑一次
-    本命令即可看到全部技能；故只读本地文件，不依赖网络与凭据。
+    本命令即可看到全部技能；故只读本地文件，不依赖网络与凭据。已停用技能（见根下
+    ``.state.json`` 投影）默认隐藏、只在末尾提示数量，``--all`` 时连带列出并标 ``[已停用]``。
     """
     root = args.dir
     if not os.path.isdir(root):
         raise CliError(f"技能目录不存在: {root}")
     names = sorted(
-        n
-        for n in os.listdir(root)
-        if os.path.isfile(os.path.join(root, n, "SKILL.md"))
+        n for n in os.listdir(root) if os.path.isfile(os.path.join(root, n, "SKILL.md"))
     )
     if not names:
         print("本地还没有技能。用 skills search 逛逛商城。")
         return
-    for name in names:
+    disabled = _read_disabled_names(root)
+    shown = names if args.all else [n for n in names if n not in disabled]
+    hidden = len(names) - len(shown)
+    for name in shown:
         path = os.path.join(root, name, "SKILL.md")
         desc = _one_line(_read_frontmatter_description(path))
-        print(f"- {name}: {desc} (file: {path})" if desc else f"- {name} (file: {path})")
-    print(f"\n共 {len(names)} 个（本地 {root}）。使用某技能前先读其 SKILL.md 全文。")
+        label = f"{name} [已停用]" if name in disabled else name
+        print(
+            f"- {label}: {desc} (file: {path})" if desc else f"- {label} (file: {path})"
+        )
+    if shown:
+        print(f"\n共 {len(shown)} 个（本地 {root}）。使用某技能前先读其 SKILL.md 全文。")
+    if hidden:
+        print(f"另有 {hidden} 个已停用（skills list --all 查看）")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="skills", description="技能面 CLI：搜索/安装商城技能，list 看本地全量技能索引"
+        prog="skills",
+        description="技能面 CLI：搜索/安装商城技能，list 看本地全量技能索引",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -206,8 +239,14 @@ def main(argv: list[str] | None = None) -> int:
     install.add_argument("--version", type=int, default=None, help="指定版本号")
     install.set_defaults(func=cmd_install)
 
-    list_cmd = sub.add_parser("list", help="本地全量技能索引：名称 + 用途 + SKILL.md 路径（不访问网络）")
+    list_cmd = sub.add_parser(
+        "list",
+        help="本地技能索引：名称 + 用途 + SKILL.md 路径（不访问网络；默认隐藏已停用）",
+    )
     list_cmd.add_argument("--dir", default=DEFAULT_SKILLS_DIR, help="技能目录")
+    list_cmd.add_argument(
+        "--all", action="store_true", help="连已停用的技能一起列出（标 [已停用]）"
+    )
     list_cmd.set_defaults(func=cmd_list)
 
     args = parser.parse_args(argv)

@@ -33,7 +33,7 @@ from src.manager import layouts
 from src.manager.fs_sidecar import FsOpError
 from src.manager.wa_instances import LAYOUT_VERSION, AcquireSpec, WorkAreaError, WorkAreaService
 from src.manager.wa_jobs import TERMINAL_START_PATHS, iso_utc
-from src.models import InputFileSpec, RoleMountSpec
+from src.models import InputFileSpec, RoleMountSpec, normalize_self_exclude
 from src.proxy.forwarder import forward
 from src.routers import sandboxes as v1
 
@@ -104,6 +104,8 @@ class RoleMountModel(BaseModel):
     bucket: str
     prefix: str
     mode: Literal["ro", "rw"] = "ro"
+    # 只对布局 v2 的 self 有效：相对 /self 根的目录子树，如 ``avatar/**``（#73）
+    exclude: Optional[list[str]] = None
 
 
 class InputFileModel(BaseModel):
@@ -188,6 +190,20 @@ async def acquire(work_area_id: str, req: AcquireV2Request):
             detail={"reason": "cwd_unsupported", "message": f"布局 v{layout.version} 的 cwd 只能是 {layout.cwd}"},
         )
     mode, effective_policy = v1._resolve_policy(req.policy)
+    try:
+        mounts = [
+            RoleMountSpec(
+                name=m.name,
+                bucket=m.bucket,
+                prefix=m.prefix,
+                mode=m.mode,
+                layout_version=layout.version,
+                extra_exclude=normalize_self_exclude(m.exclude),
+            )
+            for m in req.mounts
+        ]
+    except ValueError as exc:
+        return _error(WorkAreaError(400, "invalid_mount", str(exc)))
     spec = AcquireSpec(
         work_area_id=work_area_id,
         user_id=req.user_id,
@@ -195,10 +211,7 @@ async def acquire(work_area_id: str, req: AcquireV2Request):
         sandbox_type=req.sandbox_type,
         session_id=req.session_id,
         turn_id=req.turn_id,
-        mounts=[
-            RoleMountSpec(name=m.name, bucket=m.bucket, prefix=m.prefix, mode=m.mode, layout_version=layout.version)
-            for m in req.mounts
-        ],
+        mounts=mounts,
         inputs=_input_specs(req.inputs),
         context=req.context,
         layout_version=layout.version,

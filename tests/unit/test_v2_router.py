@@ -428,3 +428,32 @@ def test_v2_gateway_and_cutover_filter_manual_minio_forwards(monkeypatch, tmp_pa
     assert (9000, 'minio.internal:9000') in settings.gateway_forwards()
     (tmp_path/'.files-cutover.json').write_text('{"schema_version":1}')
     assert settings.gateway_forwards() == [(8080, 'api.internal:8011')]
+
+
+
+async def test_acquire_v2_self_exclude_is_normalized(client, service, with_key):
+    body = {
+        "user_id": "u1", "role_id": "r1", "layout_version": 2,
+        "mounts": [
+            {"name": "self", "bucket": "b", "prefix": "roles/r1", "mode": "rw",
+             "exclude": ["/.cr/**", "/avatar/**", ".staging/**"]},
+            {"name": "diary", "bucket": "b", "prefix": "roles/r1/diary", "mode": "ro"},
+        ],
+    }
+    async with client:
+        r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    spec = service.acquire.await_args.args[0]
+    assert spec.mounts[0].extra_exclude == (".cr/**", "avatar/**", ".staging/**")
+    assert spec.mounts[0].exclude == ("/.cr/**", "/avatar/**", "/.staging/**")
+
+
+async def test_acquire_v2_invalid_self_exclude_is_invalid_mount(client, service, with_key):
+    body = {
+        "user_id": "u1", "role_id": "r1", "layout_version": 2,
+        "mounts": [{"name": "self", "bucket": "b", "prefix": "roles/r1", "mode": "rw", "exclude": ["../x/**"]}],
+    }
+    async with client:
+        r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
+    assert r.status_code == 400 and r.json()["detail"]["reason"] == "invalid_mount"
+    service.acquire.assert_not_called()

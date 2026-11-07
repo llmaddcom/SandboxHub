@@ -84,8 +84,7 @@ def _request(method: str, path: str, *, payload: dict | None = None) -> dict:
         raise CliError(f"待办请求失败 HTTP {exc.code}: {detail or exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise CliError(
-            f"连不上后端服务 {api_base}: {exc.reason}。"
-            "请确认沙盒到宿主后端网络可达。"
+            f"连不上后端服务 {api_base}: {exc.reason}。请确认沙盒到宿主后端网络可达。"
         ) from exc
 
 
@@ -147,13 +146,18 @@ def main(argv: list[str] | None = None) -> int:
     add = sub.add_parser("add", help="记一条（时间参数全不给=纯待办）")
     add.add_argument("content", help="一条一事、单行内容")
     add.add_argument(
-        "--repeat", choices=("once", "daily", "weekly"), default=None,
+        "--repeat",
+        choices=("once", "daily", "weekly"),
+        default=None,
         help="提醒频次；缺省按 --date/--time/--weekdays 推断",
     )
     add.add_argument("--date", default=None, help="YYYY-MM-DD（北京时间）")
     add.add_argument("--time", default=None, help="HH:MM（北京时间）")
     add.add_argument(
-        "--weekdays", type=int, nargs="+", default=None,
+        "--weekdays",
+        type=int,
+        nargs="+",
+        default=None,
         help="每周提醒的星期（0=周一 … 6=周日，可多个）",
     )
     add.set_defaults(func=cmd_add)
