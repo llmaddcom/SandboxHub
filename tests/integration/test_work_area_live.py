@@ -517,6 +517,22 @@ async def test_work_area_layout_v2_end_to_end(live):
         ls_ws = lines[lines.index("LS_WS") + 1 :]
         assert {"AGENTS.md", "CLAUDE.md", "deliverables", "keep.txt"} <= set(ls_ws), ls_ws
 
+        # #75：/self 上的扩展属性读取返回「不支持」而不是 EIO，`ls -l 文件` 与 `sed -i` 不报 I/O 错误
+        code, out = await _sh(
+            a,
+            "ls -la /self /self/about.md /self/skills 2>&1; "
+            "python3 -c 'import os,errno\n"
+            "for p in (\"/self/about.md\", \"/self/skills\"):\n"
+            "  try: os.listxattr(p); print(\"XATTR_OK\", p)\n"
+            "  except OSError as e: print(\"XATTR\", p, errno.errorcode[e.errno])'; "
+            "cp /self/about.md /self/sed-75.md && sed -i s/r1/R1/ /self/sed-75.md 2>&1; "
+            "cat /self/sed-75.md; rm -f /self/sed-75.md",
+        )
+        assert code == 0, out
+        assert "Input/output error" not in out, out
+        assert "EIO" not in out and out.count("XATTR") == 2, out
+        assert "I am R1" in out, out
+
         # ── 3. 只读位置写不进（终端与文件接口都一样），读写位置可写 ─────────────
         for path in (
             "/mnt/drive/deliverables/r.md", "/mnt/drive/new.txt", "/opt/cr/env/INDEX.md", "/opt/cr/new.txt",

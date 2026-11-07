@@ -54,6 +54,10 @@ proxy:
 workspace:
   # 工作区挂载总开关（云盘 MinIO ↔ 容器互通；连接信息 MINIO_* 在 .env）
   mount_enabled: true
+  # 角色目录（cr-fs sidecar）挂载用的 rclone 子命令。mount2（go-fuse）对扩展属性的读取返回
+  # 「不支持」；mount（bazil）对文件的 getxattr/listxattr 返回 EIO，`ls -l 文件`、`cp -a`、`sed -i`
+  # 都会报 Input/output error，模型会误判文件坏了（#75）。只接受 mount2 / mount。
+  rclone_mount_command: "mount2"
   # rclone VFS 缓存模式：full 对 rename / 并发读写支持最完整；writes 模式下写回窗口内的
   # rename-over（sed -i / mv 覆盖）会报 EIO（issue #9），勿改回 writes
   rclone_vfs_cache_mode: "full"
