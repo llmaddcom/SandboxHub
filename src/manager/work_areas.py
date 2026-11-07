@@ -6,7 +6,9 @@
 - ``work-areas/<work_area_id>/{work,deliverables}``：工作区，实例以读写 bind 进入；
   实例回收后保留，删除工作区须显式调用。读取、统计、导入、删除经 cr-fs（root、不跟随软链接）。
 - ``instances/<sandbox_id>/{inputs,context}``：每实例的只读视图，由 Hub 写入；实例释放即删。
-  ``inputs.json`` 是 inputs 清单（不在 bind 范围内，租户看不到）。
+  ``inputs.json`` 是 inputs 清单（不在 bind 范围内，租户看不到）。布局 v2 另有
+  ``workspace-files/{AGENTS.md,CLAUDE.md}``：以单文件只读 bind 进 ``/workspace``，更新须就地改写
+  （单文件 bind 指向 inode，rename 替换对实例不可见）。
 
 工作区的 ``work`` / ``deliverables`` 由 Hub 直接创建（属主是 Hub 用户、0755）；租户在容器内是
 root，照样可写。
@@ -17,14 +19,18 @@ import asyncio
 import json
 import os
 import shutil
+import stat
 import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
+from loguru import logger
+
 from src.config import settings
 from src.manager.fs_sidecar import FsSidecar, ReadResult
+from src.manager.layouts import WORKSPACE_FILE_MAX_BYTES, WORKSPACE_FILES
 from src.manager.paths import require_id, split_relative
 
 WORK_AREA_ROOTS = ("work", "deliverables")
@@ -57,6 +63,34 @@ class WorkAreas:
 
     async def ensure(self, work_area_id: str) -> None:
         await asyncio.to_thread(self._ensure_sync, work_area_id)
+
+    def _clear_v2_mountpoints_sync(self, work_area_id: str) -> list[str]:
+        """布局 v2 把 deliverables 与平台文件叠挂在宿主 ``work/`` 里：``work/deliverables`` 须是目录、
+        ``work/AGENTS.md`` 等须是普通文件或不存在。租户留下的软链接或其他类型会让挂载落到别处或
+        直接失败，挪到一旁（``<名字>.moved-<时间>``），内容不删。返回被挪走的名字。"""
+        work = self.bind_sources(work_area_id)["work"]
+        expected = {"deliverables": stat.S_ISDIR, **{name: stat.S_ISREG for name in WORKSPACE_FILES}}
+        moved: list[str] = []
+        for name, ok in expected.items():
+            path = work / name
+            try:
+                mode = os.lstat(path).st_mode
+            except FileNotFoundError:
+                continue
+            if ok(mode):
+                continue
+            aside = work / f"{name}.moved-{int(time.time())}"
+            try:
+                os.rename(path, aside)
+                moved.append(name)
+                logger.warning(f"v2 挂载点被占用，已挪开 | work_area={work_area_id} | {name} -> {aside.name}")
+            except OSError as exc:
+                # 挪不动（租户改了属主或权限）：交给容器创建报错，原因随 instance_start_failed 返回
+                logger.warning(f"v2 挂载点被占用且无法挪开 | work_area={work_area_id} | {name} | err={exc}")
+        return moved
+
+    async def clear_v2_mountpoints(self, work_area_id: str) -> list[str]:
+        return await asyncio.to_thread(self._clear_v2_mountpoints_sync, work_area_id)
 
     def exists(self, work_area_id: str) -> bool:
         return self.host_dir(work_area_id).is_dir()
@@ -166,10 +200,27 @@ class InstanceDirs:
     def root_dir(self, sandbox_id: str) -> Path:
         return self.path(sandbox_id) / "root"
 
-    def create(self, sandbox_id: str) -> Path:
+    def workspace_files_dir(self, sandbox_id: str) -> Path:
+        return self.path(sandbox_id) / "workspace-files"
+
+    def workspace_file(self, sandbox_id: str, name: str) -> Path:
+        if name not in WORKSPACE_FILES:
+            raise ValueError(f"非法 workspace 文件：{name!r}")
+        return self.workspace_files_dir(sandbox_id) / name
+
+    def create(self, sandbox_id: str, layout_version: int = 1) -> Path:
         base = self.path(sandbox_id)
         for sub in ("inputs", "context"):
             (base / sub).mkdir(parents=True, exist_ok=True, mode=0o755)
+        if layout_version >= 2:
+            # v2 没有只读骨架（/workspace 就是工作区）；平台文件先建成空文件，bind 才有源
+            files = self.workspace_files_dir(sandbox_id)
+            files.mkdir(parents=True, exist_ok=True, mode=0o755)
+            for name in WORKSPACE_FILES:
+                target = files / name
+                target.touch(exist_ok=True)
+                target.chmod(0o644)
+            return base
         root = self.root_dir(sandbox_id)
         for sub in ("inputs", "context", "work", "deliverables", "role/notes", "role/skills", "role/knowledge", "role/diary"):
             (root / sub).mkdir(parents=True, exist_ok=True)
@@ -193,6 +244,37 @@ class InstanceDirs:
         if not base.is_dir():
             return []
         return [p.name for p in base.iterdir() if p.is_dir()]
+
+    def write_workspace_files(self, sandbox_id: str, files: dict[str, str]) -> list[str]:
+        """整组替换 ``/workspace`` 根的平台文件：给出的写入，白名单里没给的清空。
+
+        单文件只读 bind 绑定的是 inode：只能就地截断重写，不能 rename 替换。
+        """
+        encoded = validate_workspace_files(files)
+        written: list[str] = []
+        for name in WORKSPACE_FILES:
+            target = self.workspace_file(sandbox_id, name)
+            data = encoded.get(name, b"")
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "wb") as fh:
+                fh.truncate(0)
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if name in encoded:
+                written.append(name)
+        return written
+
+    def workspace_file_names(self, sandbox_id: str) -> list[str]:
+        """内容非空的平台文件名（effective 报告用）。"""
+        names = []
+        for name in WORKSPACE_FILES:
+            try:
+                if self.workspace_file(sandbox_id, name).stat().st_size > 0:
+                    names.append(name)
+            except FileNotFoundError:
+                continue
+        return names
 
     def write_context(self, sandbox_id: str, files: dict[str, str]) -> list[str]:
         """就地替换 context 目录内容：写入 ``files``（相对路径 → 文本），删除其余文件。
@@ -229,3 +311,18 @@ class InstanceDirs:
             elif path.is_dir() and not any(path.iterdir()):
                 path.rmdir()
         return sorted(encoded)
+
+
+def validate_workspace_files(files: dict[str, str]) -> dict[str, bytes]:
+    """``workspace_files`` 只收白名单名字的文本，单个不超过 ``WORKSPACE_FILE_MAX_BYTES``。"""
+    encoded: dict[str, bytes] = {}
+    for name, text in files.items():
+        if name not in WORKSPACE_FILES:
+            raise ValueError(f"workspace_files 只允许 {', '.join(WORKSPACE_FILES)}：{name!r}")
+        if not isinstance(text, str):
+            raise ValueError(f"workspace_files 的值须是文本：{name}")
+        data = text.encode("utf-8")
+        if len(data) > WORKSPACE_FILE_MAX_BYTES:
+            raise ValueError(f"workspace 文件过大：{name}")
+        encoded[name] = data
+    return encoded

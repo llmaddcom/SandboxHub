@@ -568,7 +568,7 @@ docker run -d --name sandbox --shm-size=2g \
 - 开发中只跑覆盖本次改动的测试，如 `python -m pytest -q tests/unit/test_warm_pool.py` 或 `PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests/test_procs.py`；开 PR 前跑上面那行全量。
 - 两个测试集分两次调用：两个目录都是名为 `tests` 的包，一次 pytest 收不到一起。
 - `pyproject.toml` 的 `addopts` 设了 `--dist worksteal --maxprocesses 32`，只在加 `-n` 时生效；封顶 32 进程，免得多核机上带计时的用例被饿到超时。
-- `tests/conftest.py` 让编排层单个用例超过 30 秒即判失败，不再挂住整轮；`tests/integration` 里的 live 验收不设 `SANDBOXHUB_LIVE=1` 就跳过（见英文 README 的 Work-area v2 一节）。
+- `tests/conftest.py` 让编排层单个用例超过 30 秒即判失败，不再挂住整轮；`tests/integration/test_work_area_live.py` 里的 live 验收（v1 与布局 v2）不设 `SANDBOXHUB_LIVE=1` 就跳过，也不受 30 秒上限约束（见英文 README 的 Work-area v2 一节，目录布局 v1/v2 对照在其中的 Directory layouts）。
 
 ---
 

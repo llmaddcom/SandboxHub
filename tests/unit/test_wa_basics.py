@@ -361,3 +361,86 @@ def test_gateway_forwards_minio_toggle(monkeypatch):
     without = settings.gateway_forwards(include_minio=False)
     assert any(port == 9000 for port, _ in with_minio)
     assert all(port != 9000 for port, _ in without)
+
+
+# ── 布局 v2（#71）────────────────────────────────────────────────────────────
+
+
+def _v2(name, prefix, mode="rw"):
+    return RoleMountSpec(name, "b", prefix, mode, layout_version=2)
+
+
+def test_v2_role_mount_targets_and_self_exclusion():
+    self_ = _v2("self", "roles/r1")
+    diary = _v2("diary", "roles/r1/diary", "ro")
+    assert self_.target == "/self" and diary.target == "/self/diary"
+    assert self_.exclude == ("/.cr/**",) and diary.exclude == ()
+    # 带排除规则的挂载与同前缀不带规则的不是同一个 rclone 进程；v2 diary 与 v1 同前缀共用
+    assert self_.key != RoleMountSpec("self", "b", "roles/r1", "rw").key
+    assert diary.key == RoleMountSpec("diary", "b", "roles/r1/diary", "ro").key
+
+
+def test_validate_spec_v2_ok():
+    validate_spec(
+        _spec(
+            layout_version=2,
+            mounts=[_v2("self", "roles/r1/"), _v2("diary", "roles/r1/diary", "ro")],
+            workspace_files={"AGENTS.md": "x", "CLAUDE.md": "@AGENTS.md"},
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "mounts",
+    [
+        [_v2("notes", "roles/r1/notes")],  # v2 只有 self / diary
+        [_v2("self", "roles/r1/notes")],  # self 必须是角色空间根
+        [_v2("self", "roles/r2")],  # 别的数字人
+        [_v2("diary", "roles/r1/diary", "rw")],  # 日记只读
+        [_v2("diary", "roles/r1")],  # diary 须在根之下
+        [RoleMountSpec("self", "b", "roles/r1", "rw")],  # 挂载声明的布局与请求不一致
+    ],
+)
+def test_validate_spec_v2_rejects_mounts(mounts):
+    with pytest.raises(WorkAreaError) as ei:
+        validate_spec(_spec(layout_version=2, mounts=mounts))
+    assert ei.value.reason == "invalid_mount"
+
+
+def test_validate_spec_v1_rejects_v2_only_fields():
+    with pytest.raises(WorkAreaError) as ei:
+        validate_spec(_spec(workspace_files={"AGENTS.md": "x"}))
+    assert ei.value.reason == "workspace_files_unsupported"
+    with pytest.raises(WorkAreaError) as ei:
+        validate_spec(_spec(mounts=[_v2("self", "roles/r1")]))
+    assert ei.value.reason == "invalid_mount"
+    with pytest.raises(WorkAreaError) as ei:
+        validate_spec(_spec(layout_version=3))
+    assert ei.value.reason == "layout_version_unsupported"
+
+
+@pytest.mark.parametrize(
+    "files", [{"README.md": "x"}, {"AGENTS.md": "x" * (1024 * 1024 + 1)}, {"../AGENTS.md": "x"}]
+)
+def test_validate_spec_v2_rejects_workspace_files(files):
+    with pytest.raises(WorkAreaError) as ei:
+        validate_spec(_spec(layout_version=2, workspace_files=files))
+    assert ei.value.reason == "invalid_workspace_files"
+
+
+def test_layout_env_keeps_v1_and_describes_v2():
+    from src.manager import layouts
+
+    assert layouts.V1.env() == {
+        "SANDBOX_CWD": "/workspace/work",
+        "SANDBOX_WORKSPACE": "/workspace/work",
+        "SANDBOX_LAYOUT": "work-area/v1",
+        "CR_SKILLS_DIR": "/workspace/role/skills",
+    }
+    env = layouts.V2.env()
+    assert env["SANDBOX_CWD"] == env["SANDBOX_WORKSPACE"] == "/workspace"
+    assert env["SANDBOX_LAYOUT"] == "work-area/v2" and env["CR_SKILLS_DIR"] == "/self/skills"
+    assert env["CR_TOOLS_DIR"] == "/opt/cr/tools" and env["SANDBOX_HIDDEN_ROOTS"] == "/self/.cr"
+    assert env["SANDBOX_READONLY_ROOTS"].split(":") == [
+        "/mnt/drive", "/opt/cr", "/self/diary", "/workspace/AGENTS.md", "/workspace/CLAUDE.md"
+    ]

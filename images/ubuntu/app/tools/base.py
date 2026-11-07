@@ -13,8 +13,38 @@ import errno
 import os
 
 
+def _env_roots(name: str) -> list[str]:
+    """Hub 按目录布局注入的路径清单（冒号分隔）；未注入时为空。"""
+    return [root for root in os.getenv(name, "").split(":") if root.startswith("/")]
+
+
+def _under(path, roots: list[str]) -> str | None:
+    value = os.path.normpath(os.fspath(path))
+    for root in roots:
+        if value == root or value.startswith(root.rstrip("/") + "/"):
+            return root
+    return None
+
+
+def hidden_root_error(path) -> str | None:
+    """写入平台保留目录（如布局 v2 的 /self/.cr）时的拒绝原因；不在其中返回 None。
+
+    这些目录在实例里列不出、写入也不会进存储，静默成功只会让写入方以为数据已保存。
+    """
+    root = _under(path, _env_roots("SANDBOX_HIDDEN_ROOTS"))
+    if root is None:
+        return None
+    return f"{path} 在平台保留目录 {root} 下，不能写入；请写到工作目录或自己的目录里。"
+
+
 def filesystem_error_detail(path, exc: OSError) -> str:
-    """区分物理磁盘/配额耗尽与应用层文件大小限制。"""
+    """区分只读位置、物理磁盘/配额耗尽与应用层文件大小限制。"""
+    if exc.errno == errno.EROFS:
+        roots = _env_roots("SANDBOX_READONLY_ROOTS")
+        listed = f"只读位置：{'、'.join(roots)}；" if roots else ""
+        cwd = os.getenv("SANDBOX_CWD", "")
+        copy = f"要修改先复制到 {cwd} 下再改" if cwd else "要修改先复制到可写目录再改"
+        return f"{path} 在只读位置，不能写入（{listed}{copy}）。"
     if exc.errno not in (errno.ENOSPC, errno.EDQUOT):
         return f"{path}: {exc}"
     parent = os.path.dirname(str(path)) or "/"

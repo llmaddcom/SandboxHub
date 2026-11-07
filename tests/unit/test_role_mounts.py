@@ -151,3 +151,31 @@ async def test_failure_releases_other_acquired_references() -> None:
     with pytest.raises(RuntimeError, match="mount failed"):
         await mounts.acquire([done, failing])
     assert mounts.refs() == {}
+
+
+async def test_sidecar_mount_passes_exclusions_only_for_v2_self(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from src.manager.fs_sidecar import FsSidecar
+
+    sidecar = FsSidecar.__new__(FsSidecar)
+    calls: list[list[str]] = []
+
+    async def exec_(cmd, env=None):
+        calls.append(cmd)
+        return 0, b"", b""
+
+    sidecar.exec = exec_
+    sidecar.mount_status = AsyncMock(side_effect=lambda: {spec.key: True})
+    for spec, expect in (
+        (RoleMountSpec("self", "b", "roles/r1", "rw", layout_version=2), ["--exclude", "/.cr/**"]),
+        (RoleMountSpec("diary", "b", "roles/r1/diary", "ro", layout_version=2), []),
+        (RoleMountSpec("notes", "b", "roles/r1/notes", "rw"), []),
+    ):
+        calls.clear()
+        await sidecar.mount(spec)
+        rclone = next(c for c in calls if c[:2] == ["rclone", "mount"])
+        assert rclone[2] == f"minio:b/{spec.prefix}"
+        tail = [a for i, a in enumerate(rclone) if a == "--exclude" or (i and rclone[i - 1] == "--exclude")]
+        assert tail == expect
+        assert ("--read-only" in rclone) == (spec.mode == "ro")

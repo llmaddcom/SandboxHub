@@ -591,7 +591,7 @@ docker run -d --name sandbox --shm-size=2g \
 - While developing, run only the tests that cover your change, e.g. `python -m pytest -q tests/unit/test_warm_pool.py` or `PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests/test_procs.py`. Run the full line before opening a PR.
 - The two suites stay separate invocations: both directories are packages named `tests`, so one pytest run cannot collect them together.
 - `addopts` in `pyproject.toml` sets `--dist worksteal --maxprocesses 32`. It only applies with `-n`; the cap keeps timing-sensitive tests from starving on many-core hosts.
-- `tests/conftest.py` fails any Hub test that runs longer than 30 s instead of letting it hang the run. The live acceptance test in `tests/integration` stays skipped unless `SANDBOXHUB_LIVE=1` (see Work-area v2).
+- `tests/conftest.py` fails any Hub test that runs longer than 30 s instead of letting it hang the run. The live acceptance tests in `tests/integration/test_work_area_live.py` (v1 and layout v2) stay skipped unless `SANDBOXHUB_LIVE=1` and are exempt from the 30 s limit (see Work-area v2).
 
 ---
 
@@ -613,11 +613,60 @@ examples above describe the legacy protocol, available until the file-space cuto
 
 The host owns privileged rclone mounts through the `cr-fs` sidecar. Tenant
 containers receive no storage credentials, FUSE device or mount capability. The
-`/workspace` root is a read-only skeleton mounted before its children; cwd is
-`/workspace/work`. `inputs/` and `context/` are read-only views, work and deliverables
+directory layout depends on `layout_version` (below). In v1 the `/workspace` root is a
+read-only skeleton mounted before its children and cwd is `/workspace/work`; in v2 the work
+area itself is `/workspace`. Input and context views are read-only, work and deliverables
 are writable, and each role directory has the requested access mode. Every acquire
 returns the effective layout, mounts, policy and isolation report. A failed self-test
 rejects allocation without falling back to v1.
+
+### Directory layouts (`layout_version`, SandboxHub#71)
+
+Each acquire names a layout; both are served side by side and an instance is never reused
+across layouts (a layout change rebuilds the instance when idle, `409 instance_busy` otherwise).
+Omitting `layout_version` means 1. `GET /v2/capabilities` lists `layout_versions: [1, 2]`;
+its legacy `layout_version` field stays `1` so backends that only know v1 keep working.
+
+| Path (v1) | Path (v2) | Mode | Source |
+| --- | --- | --- | --- |
+| `/workspace` (read-only skeleton) | `/workspace` | v1 ro / v2 rw | v2: the work area's `work/` |
+| `/workspace/work` (cwd) | `/workspace` (cwd) | rw | work area `work/` (same data, so a v1 work area opens unchanged under v2) |
+| `/workspace/deliverables` | `/workspace/deliverables` | rw | work area `deliverables/`, read at archive points |
+| — | `/workspace/AGENTS.md`, `/workspace/CLAUDE.md` | ro | `workspace_files` (single-file binds) |
+| `/workspace/inputs` | `/mnt/drive` | ro | granted user files (hard-link view) |
+| `/workspace/context` | `/opt/cr` | ro | generated platform files, nested paths allowed |
+| `/workspace/role/<name>` | `/self` | as requested | v2 mount `self` = role-space root `roles/{role_id}`, `.cr/**` excluded by rclone |
+| — | `/self/diary` | ro | v2 mount `diary` = `roles/{role_id}/diary`, layered over `/self` |
+| `/tmp` | `/tmp` | rw | container layer, gone when the instance is recycled |
+
+A v2 acquire looks like:
+
+```json
+{"user_id": "u1", "role_id": "r1", "layout_version": 2, "cwd": "/workspace",
+ "mounts": [{"name": "self",  "bucket": "b", "prefix": "roles/r1",       "mode": "rw"},
+            {"name": "diary", "bucket": "b", "prefix": "roles/r1/diary", "mode": "ro"}],
+ "inputs": [...], "context": {"env/INDEX.md": "..."},
+ "workspace_files": {"AGENTS.md": "...", "CLAUDE.md": "@AGENTS.md\n"}}
+```
+
+v2 accepts only the role mounts `self` (prefix exactly the role root) and `diary` (read-only);
+`cwd` may be omitted and must otherwise equal the layout's cwd. `workspace_files` accepts only
+`AGENTS.md` and `CLAUDE.md` (≤ 1 MiB each) and replaces the pair as a whole: a name left out
+becomes empty. The files are bound before the instance starts (empty when not given) and are
+rewritten in place, so `PUT /v2/sandboxes/{id}/context` with `{"workspace_files": {...}}`
+(alone or next to `files`) is visible immediately. A tenant entry that would block one of
+these mount points inside `work/` (a symlink, a directory named `AGENTS.md`, a file named
+`deliverables`) is renamed to `<name>.moved-<epoch>` before the instance starts; a regular
+`work/AGENTS.md` is only hidden while v2 instances run. The effective report lists the v2
+mounts, the `exclude` of `self`, and `workspace_files.files` (the names with content).
+
+v2 instances get `SANDBOX_CWD=/workspace`, `SANDBOX_LAYOUT=work-area/v2`,
+`CR_SKILLS_DIR=/self/skills`, `CR_TOOLS_DIR=/opt/cr/tools`, plus `SANDBOX_READONLY_ROOTS` and
+`SANDBOX_HIDDEN_ROOTS`; v1 keeps its previous environment. With these, the file API reports a
+write into a read-only place as "在只读位置，不能写入（…要修改先复制到 /workspace 下再改）"
+(HTTP 400 for write/replace, 403 for upload) and refuses writes under `/self/.cr` outright
+(the rclone exclusion hides it, and terminal writes there never reach storage). The image's
+Codex managed config marks both `/workspace/work` and `/workspace` untrusted.
 
 Independent role directories are prepared concurrently, with a shared limit of four
 mount operations. Concurrent requests for the same directory share one mount; if an
@@ -629,7 +678,7 @@ acquire fails or is cancelled, references acquired by that operation are release
 | `POST /v2/work-areas/{id}/acquire` | Allocate/reuse an instance; optional inputs and context replace views |
 | `GET /v2/sandboxes` | Registered instances with owner/work/session/turn metadata |
 | `PUT /v2/sandboxes/{id}/inputs` | Update live inputs in place; removed grants disappear immediately |
-| `PUT /v2/sandboxes/{id}/context` | Update generated instructions |
+| `PUT /v2/sandboxes/{id}/context` | Update generated instructions (`files`) and, on v2, the read-only `/workspace` files (`workspace_files`) |
 | `GET /v2/sandboxes/{id}/activity` | Known activity and running jobs (`running_jobs` includes running procs; `running_procs` separately, `null` for images without procs) |
 | `POST /v2/sandboxes/{id}/quiesce` | Stop all tenant processes, preserving mounts for archive reads |
 | `POST /v2/sandboxes/{id}/release` | Remove a running or quiesced instance, preserving the work area |

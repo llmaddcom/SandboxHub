@@ -22,7 +22,9 @@ import httpx
 from loguru import logger
 
 from src.config import settings
+from src.manager import layouts
 from src.models import (
+    LAYOUT_VERSION_LABEL,
     MOUNT_LAYOUT_LABEL,
     ROLE_LABEL,
     SANDBOX_ID_LABEL,
@@ -793,16 +795,17 @@ class ContainerManager:
         return await asyncio.to_thread(self._image_labels_sync, image)
 
     def _build_wa_env(
-        self, sandbox_type: SandboxType, api_token: str, extra_env: Optional[dict[str, str]]
+        self,
+        sandbox_type: SandboxType,
+        api_token: str,
+        extra_env: Optional[dict[str, str]],
+        layout_version: int = 1,
     ) -> dict[str, str]:
         env = self._build_container_env(sandbox_type, extra_env)
         env.update(
             {
                 "SANDBOX_API_TOKEN": api_token,
-                "SANDBOX_CWD": "/workspace/work",
-                "SANDBOX_WORKSPACE": "/workspace/work",
-                "SANDBOX_LAYOUT": "work-area/v1",
-                "CR_SKILLS_DIR": "/workspace/role/skills",
+                **layouts.get(layout_version).env(),
                 "SANDBOX_JOB_MAX_LIFETIME": str(max(0, settings.WORK_AREA_JOB_MAX_LIFETIME)),
             }
         )
@@ -823,6 +826,7 @@ class ContainerManager:
         extra_env: Optional[dict[str, str]],
         network: str,
         limits: dict,
+        layout_version: int = 1,
     ) -> tuple[str, str, str]:
         image = settings.image_v2_for_type(sandbox_type)
         name = f"cr-wa-{sandbox_type}-{sandbox_id.removeprefix('sb_')}"
@@ -836,6 +840,7 @@ class ContainerManager:
             ROLE_LABEL: role_id,
             SESSION_LABEL: session_id,
             MOUNT_LAYOUT_LABEL: json.dumps(mount_layout, ensure_ascii=False, separators=(",", ":")),
+            LAYOUT_VERSION_LABEL: str(layout_version),
         }
         if extra_env:
             labels[_ENV_LABEL] = "true"
@@ -859,7 +864,7 @@ class ContainerManager:
             network=network,
             shm_size="2g",
             extra_hosts={"host.docker.internal": "host-gateway"},
-            environment=self._build_wa_env(sandbox_type, api_token, extra_env),
+            environment=self._build_wa_env(sandbox_type, api_token, extra_env, layout_version),
             labels=labels,
             mounts=mounts,
             cap_drop=_V2_CAP_DROP,

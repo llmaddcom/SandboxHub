@@ -1,13 +1,8 @@
 """
 v2 执行实例编排（ADR 0025）
 
-一个工作区（work_area_id）最多一个实例。实例 = 无特权容器 + bind 列表：
-
-    /workspace/work           rw  工作区（宿主目录，实例回收后保留）
-    /workspace/deliverables   rw  工作区交付目录（平台在归档点读取）
-    /workspace/inputs         ro  授权给本工作区 / 数字人的用户文件（硬链接视图）
-    /workspace/context        ro  平台生成的说明文档
-    /workspace/role/<name>    ro|rw  角色空间目录（cr-fs rclone 挂载，rslave）
+一个工作区（work_area_id）最多一个实例。实例 = 无特权容器 + bind 列表，目录布局按请求的
+``layout_version`` 选 v1 或 v2（见 ``layouts.py``），两版并存；实例不跨布局复用。
 
 分配：自检不过 → 503；同工作区已有实例 → 体检后复用（形状不同且空闲则重建，忙则 409）；
 否则按每数字人 / 每用户上限占名额（超限 409 附占用者）后创建。释放即销毁容器，工作区保留。
@@ -35,13 +30,15 @@ from loguru import logger
 from src.config import settings
 from src.manager.container_manager import Bind, ContainerManager
 from src.manager.fs_sidecar import FsSidecar, RoleMounts
+from src.manager import layouts
 from src.manager.inputs_cache import InputsCache, InputsError, validate_inputs
 from src.manager.netguard import NetGuard, SelfTest
 from src.manager.paths import valid_id, valid_mount_name, valid_prefix
 from src.manager.wa_jobs import JOB_ORIGIN_HEADER, JobLedger, iso_utc, parse_report
 from src.manager.wa_registry import LimitExceeded, WorkAreaRegistry
-from src.manager.work_areas import InstanceDirs, WorkAreas
+from src.manager.work_areas import InstanceDirs, WorkAreas, validate_workspace_files
 from src.models import (
+    LAYOUT_VERSION_LABEL,
     MOUNT_LAYOUT_LABEL,
     ROLE_LABEL,
     SANDBOX_ID_LABEL,
@@ -58,8 +55,10 @@ from src.models import (
 )
 from src.proxy.forwarder import SANDBOX_TOKEN_HEADER, close_client
 
-LAYOUT_VERSION = 1
-CWD = "/workspace/work"
+# 未声明 layout_version 的请求按 v1 处理（引入 v2 之前的调用方）；能力里的 ``layout_version`` 也报 1，
+# 新调用方看 ``layout_versions``（#71：报最高版会让只认 1 的已发布后端拒绝整个 Hub）。
+LAYOUT_VERSION = layouts.V1.version
+CWD = layouts.V1.cwd
 # 这些原因下实例 API 已不可达，销毁前不再做最后一次任务观测（徒增超时）
 _UNREACHABLE_REASONS = frozenset({"container_gone", "unhealthy", "create_failed"})
 
@@ -92,6 +91,9 @@ class AcquireSpec:
     env: Optional[dict[str, str]] = None
     network_mode: NetworkMode = "allow"
     limits: dict = field(default_factory=dict)
+    layout_version: int = LAYOUT_VERSION
+    # 布局 v2：/workspace 根的只读平台文件（AGENTS.md、CLAUDE.md）；None = 不变
+    workspace_files: Optional[dict[str, str]] = None
 
 
 def validate_spec(spec: AcquireSpec) -> None:
@@ -102,22 +104,54 @@ def validate_spec(spec: AcquireSpec) -> None:
     ):
         if not valid_id(value):
             raise WorkAreaError(400, "invalid_request", f"{what} 非法：{value!r}")
+    try:
+        layout = layouts.get(spec.layout_version)
+    except ValueError as exc:
+        raise WorkAreaError(400, "layout_version_unsupported", str(exc)) from exc
+    allowed = layout.role_names
     names: set[str] = set()
     for mount in spec.mounts:
         if not valid_mount_name(mount.name) or mount.name in names:
             raise WorkAreaError(
                 400, "invalid_mount", f"角色目录名非法或重复：{mount.name!r}"
             )
+        if allowed is not None and mount.name not in allowed:
+            raise WorkAreaError(
+                400,
+                "invalid_mount",
+                f"布局 v{layout.version} 的角色目录只能是 {sorted(allowed)}：{mount.name!r}",
+            )
+        if mount.layout_version != layout.version:
+            raise WorkAreaError(
+                400, "invalid_mount", f"角色目录与请求的布局版本不一致：{mount.name!r}"
+            )
         if not mount.bucket or not valid_prefix(mount.prefix):
             raise WorkAreaError(
                 400, "invalid_mount", f"角色目录前缀非法：{mount.bucket}/{mount.prefix}"
             )
-        expected = f"roles/{spec.role_id}/"
-        if not mount.prefix.strip("/").startswith(expected):
+        stripped = mount.prefix.strip("/")
+        root = f"roles/{spec.role_id}"
+        if layout.version >= 2 and mount.name == "self":
+            if stripped != root:
+                raise WorkAreaError(
+                    400, "invalid_mount", f"self 须是角色空间根 {root}：{mount.prefix}"
+                )
+        elif not stripped.startswith(root + "/"):
             raise WorkAreaError(
-                400, "invalid_mount", f"角色目录须位于 {expected} 之下：{mount.prefix}"
+                400, "invalid_mount", f"角色目录须位于 {root}/ 之下：{mount.prefix}"
             )
+        if layout.version >= 2 and mount.name == "diary" and mount.mode != "ro":
+            raise WorkAreaError(400, "invalid_mount", "日记目录只能只读挂载（mode=ro）")
         names.add(mount.name)
+    if spec.workspace_files is not None:
+        if layout.version < 2:
+            raise WorkAreaError(
+                400, "workspace_files_unsupported", "workspace_files 只在布局 v2 可用"
+            )
+        try:
+            validate_workspace_files(spec.workspace_files)
+        except ValueError as exc:
+            raise WorkAreaError(400, "invalid_workspace_files", str(exc)) from exc
     if spec.inputs is not None:
         try:
             validate_inputs(spec.inputs)
@@ -176,6 +210,8 @@ class WorkAreaService:
     def _instance_from_labels(c: ManagedContainer) -> Optional[WorkAreaInstance]:
         labels = c.labels
         try:
+            version = int(labels.get(LAYOUT_VERSION_LABEL) or LAYOUT_VERSION)
+            layouts.get(version)
             layout = json.loads(labels.get(MOUNT_LAYOUT_LABEL) or "[]")
             mounts = tuple(
                 RoleMountSpec(
@@ -183,6 +219,7 @@ class WorkAreaService:
                     bucket=m["bucket"],
                     prefix=m["prefix"],
                     mode=m["mode"],
+                    layout_version=version,
                 )
                 for m in layout
             )
@@ -219,6 +256,7 @@ class WorkAreaService:
             mounts=mounts,
             session_id=labels.get(SESSION_LABEL, ""),
             network_mode=network_mode,
+            layout_version=version,
         )
 
     async def _adopt(
@@ -270,6 +308,7 @@ class WorkAreaService:
         data.update(
             {
                 "layout_version": LAYOUT_VERSION,
+                "layout_versions": list(layouts.SUPPORTED_LAYOUTS),
                 "cwd": CWD,
                 "limits": {
                     "max_per_role": settings.WORK_AREA_MAX_PER_ROLE,
@@ -307,19 +346,31 @@ class WorkAreaService:
             if context_dir.is_dir()
             else []
         )
-        return {
-            "layout_version": LAYOUT_VERSION,
-            "cwd": CWD,
-            "mounts": [
+        layout = layouts.get(instance.layout_version)
+        if layout.version >= 2:
+            base_mounts = [
+                {"target": "/workspace", "mode": "rw", "source": "work_area"},
+                {"target": "/workspace/deliverables", "mode": "rw", "source": "work_area"},
+                *[
+                    {"target": f"/workspace/{name}", "mode": "ro", "source": "workspace_files"}
+                    for name in layouts.WORKSPACE_FILES
+                ],
+                {"target": layout.inputs_target, "mode": "ro", "source": "inputs"},
+                {"target": layout.context_target, "mode": "ro", "source": "context"},
+            ]
+        else:
+            base_mounts = [
                 {"target": "/workspace", "mode": "ro", "source": "platform"},
                 {"target": "/workspace/work", "mode": "rw", "source": "work_area"},
-                {
-                    "target": "/workspace/deliverables",
-                    "mode": "rw",
-                    "source": "work_area",
-                },
-                {"target": "/workspace/inputs", "mode": "ro", "source": "inputs"},
-                {"target": "/workspace/context", "mode": "ro", "source": "context"},
+                {"target": "/workspace/deliverables", "mode": "rw", "source": "work_area"},
+                {"target": layout.inputs_target, "mode": "ro", "source": "inputs"},
+                {"target": layout.context_target, "mode": "ro", "source": "context"},
+            ]
+        report = {
+            "layout_version": layout.version,
+            "cwd": layout.cwd,
+            "mounts": [
+                *base_mounts,
                 *[
                     {
                         "target": m.target,
@@ -327,6 +378,7 @@ class WorkAreaService:
                         "source": f"role:{m.name}",
                         "bucket": m.bucket,
                         "prefix": m.prefix,
+                        **({"exclude": list(m.exclude)} if m.exclude else {}),
                     }
                     for m in instance.mounts
                 ],
@@ -348,6 +400,11 @@ class WorkAreaService:
                 else None,
             },
         }
+        if layout.version >= 2:
+            report["workspace_files"] = {
+                "files": self.dirs.workspace_file_names(instance.sandbox_id)
+            }
+        return report
 
     def _require_safe(self, sandbox_type: str) -> None:
         failing = self.selftest.result.failing(sandbox_type)
@@ -387,6 +444,7 @@ class WorkAreaService:
                 session_id=spec.session_id,
                 turn_id=spec.turn_id,
                 network_mode=spec.network_mode,
+                layout_version=spec.layout_version,
             )
             try:
                 await self.registry.reserve(
@@ -435,7 +493,8 @@ class WorkAreaService:
             and await self._manager.is_healthy(info.container_ip)
         )
         same_shape = (
-            existing.sandbox_type == spec.sandbox_type
+            existing.layout_version == spec.layout_version
+            and existing.sandbox_type == spec.sandbox_type
             and existing.mount_keys == tuple(sorted(m.key for m in spec.mounts))
             and {m.target for m in existing.mounts} == {m.target for m in spec.mounts}
         )
@@ -456,7 +515,9 @@ class WorkAreaService:
                 raise WorkAreaError(
                     503, "network_switch_failed", f"网络策略切换失败：{exc}"
                 ) from exc
-            await self._apply_views(existing, spec.inputs, spec.context)
+            await self._apply_views(
+                existing, spec.inputs, spec.context, spec.workspace_files
+            )
             await asyncio.to_thread(
                 self._save_origin,
                 existing,
@@ -473,7 +534,7 @@ class WorkAreaService:
                 raise WorkAreaError(
                     409,
                     "instance_busy",
-                    "工作区实例正在运行任务，且本次请求的镜像或角色目录与之不同",
+                    "工作区实例正在运行任务，且本次请求的镜像、目录布局或角色目录与之不同",
                     holders=[dict(existing.holder(), activity=activity)],
                 )
             reason = "shape_changed"
@@ -492,8 +553,11 @@ class WorkAreaService:
             raise RuntimeError(f"角色目录挂载已失效：{dead}")
 
     async def _create(self, instance: WorkAreaInstance, spec: AcquireSpec) -> None:
+        layout = layouts.get(instance.layout_version)
         await self.work_areas.ensure(instance.work_area_id)
-        self.dirs.create(instance.sandbox_id)
+        if layout.version >= 2:
+            await self.work_areas.clear_v2_mountpoints(instance.work_area_id)
+        self.dirs.create(instance.sandbox_id, layout.version)
         await asyncio.to_thread(
             self._save_origin, instance, spec.session_id, spec.turn_id
         )
@@ -504,20 +568,43 @@ class WorkAreaService:
             await self._discard(instance, "mount_cancelled")
             raise
         instance.mounts_held = True
-        await self._apply_views(instance, spec.inputs or [], spec.context or {})
+        await self._apply_views(
+            instance,
+            spec.inputs or [],
+            spec.context or {},
+            spec.workspace_files if layout.version >= 2 else None,
+        )
         sources = self.work_areas.bind_sources(instance.work_area_id)
+        if layout.version >= 2:
+            # 父目录先于子挂载（Docker 按目标路径深度排序，这里也按顺序列出）
+            base_binds = [
+                Bind(str(sources["work"]), "/workspace", False),
+                Bind(str(sources["deliverables"]), "/workspace/deliverables", False),
+                *[
+                    Bind(
+                        str(self.dirs.workspace_file(instance.sandbox_id, name)),
+                        f"/workspace/{name}",
+                        True,
+                    )
+                    for name in layouts.WORKSPACE_FILES
+                ],
+            ]
+        else:
+            base_binds = [
+                Bind(str(self.dirs.root_dir(instance.sandbox_id)), "/workspace", True),
+                Bind(str(sources["work"]), "/workspace/work", False),
+                Bind(str(sources["deliverables"]), "/workspace/deliverables", False),
+            ]
         binds = [
-            Bind(str(self.dirs.root_dir(instance.sandbox_id)), "/workspace", True),
-            Bind(str(sources["work"]), "/workspace/work", False),
-            Bind(str(sources["deliverables"]), "/workspace/deliverables", False),
+            *base_binds,
             Bind(
                 str(self.dirs.inputs_dir(instance.sandbox_id)),
-                "/workspace/inputs",
+                layout.inputs_target,
                 True,
             ),
             Bind(
                 str(self.dirs.context_dir(instance.sandbox_id)),
-                "/workspace/context",
+                layout.context_target,
                 True,
             ),
             *[
@@ -527,10 +614,11 @@ class WorkAreaService:
                     m.mode == "ro",
                     "rslave",
                 )
-                for m in instance.mounts
+                # self 先于叠在其上的 diary
+                for m in sorted(instance.mounts, key=lambda m: m.target.count("/"))
             ],
         ]
-        layout = [
+        mount_layout = [
             {"name": m.name, "bucket": m.bucket, "prefix": m.prefix, "mode": m.mode}
             for m in instance.mounts
         ]
@@ -543,17 +631,19 @@ class WorkAreaService:
             sandbox_type=instance.sandbox_type,
             api_token=instance.api_token,
             binds=binds,
-            mount_layout=layout,
+            mount_layout=mount_layout,
             extra_env=spec.env or None,
             network=settings.wa_network_for_mode(spec.network_mode),
             limits=spec.limits or {},
+            layout_version=layout.version,
         )
         instance.container_info = info
         instance.status = "ready"
         self.registry.touch(instance.sandbox_id)
         logger.info(
             f"v2 实例已分配 | id={instance.sandbox_id} | work_area={instance.work_area_id} "
-            f"| user={instance.user_id} | role={instance.role_id} | mounts={[m.name for m in instance.mounts]}"
+            f"| user={instance.user_id} | role={instance.role_id} | layout=v{layout.version} "
+            f"| mounts={[m.name for m in instance.mounts]}"
         )
 
     def _save_origin(
@@ -662,12 +752,15 @@ class WorkAreaService:
         instance: WorkAreaInstance,
         inputs: Optional[list[InputFileSpec]],
         context: Optional[dict[str, str]],
+        workspace_files: Optional[dict[str, str]] = None,
     ) -> None:
         """None = 不变；空列表 / 空字典 = 清空。"""
         if inputs is not None:
             await self._materialize(instance, inputs)
         if context is not None:
             await self._write_context(instance, context)
+        if workspace_files is not None:
+            await self._write_workspace_files(instance, workspace_files)
 
     async def _materialize(
         self, instance: WorkAreaInstance, files: list[InputFileSpec]
@@ -690,6 +783,20 @@ class WorkAreaService:
             )
         except ValueError as exc:
             raise WorkAreaError(400, "invalid_context", str(exc)) from exc
+
+    async def _write_workspace_files(
+        self, instance: WorkAreaInstance, files: dict[str, str]
+    ) -> list[str]:
+        if instance.layout_version < 2:
+            raise WorkAreaError(
+                400, "workspace_files_unsupported", "workspace_files 只在布局 v2 的实例上可用"
+            )
+        try:
+            return await asyncio.to_thread(
+                self.dirs.write_workspace_files, instance.sandbox_id, files
+            )
+        except ValueError as exc:
+            raise WorkAreaError(400, "invalid_workspace_files", str(exc)) from exc
 
     # ── 释放 / 更新 ─────────────────────────────────────────────────────────
 
@@ -759,12 +866,35 @@ class WorkAreaService:
         self.registry.touch(sandbox_id)
         return result
 
-    async def update_context(self, sandbox_id: str, files: dict[str, str]) -> list[str]:
+    async def update_context(
+        self,
+        sandbox_id: str,
+        files: Optional[dict[str, str]],
+        workspace_files: Optional[dict[str, str]] = None,
+    ) -> tuple[list[str], list[str]]:
+        """``files`` / ``workspace_files`` 各自 None = 不变；返回 (context 文件, workspace 文件)。"""
         instance = self.get(sandbox_id)
         async with self._locks[instance.work_area_id]:
-            written = await self._write_context(self.get(sandbox_id), files)
+            current = self.get(sandbox_id)
+            if workspace_files is not None and current.layout_version < 2:
+                raise WorkAreaError(
+                    400, "workspace_files_unsupported", "workspace_files 只在布局 v2 的实例上可用"
+                )
+            if workspace_files is not None:
+                try:
+                    validate_workspace_files(workspace_files)
+                except ValueError as exc:
+                    raise WorkAreaError(400, "invalid_workspace_files", str(exc)) from exc
+            written = (
+                await self._write_context(current, files) if files is not None else []
+            )
+            extra = (
+                await self._write_workspace_files(current, workspace_files)
+                if workspace_files is not None
+                else []
+            )
         self.registry.touch(sandbox_id)
-        return written
+        return written, extra
 
     async def _probe_terminal(self, instance: WorkAreaInstance) -> dict:
         info = instance.container_info
