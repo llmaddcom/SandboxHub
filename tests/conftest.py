@@ -10,7 +10,9 @@ TEST_TIMEOUT = 30
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    if threading.current_thread() is not threading.main_thread():
+    # 真实环境验收（SANDBOXHUB_LIVE=1 才跑）要起容器、等挂载与后台任务，不受单例上限约束
+    live = item.path.name == "test_work_area_live.py"
+    if live or threading.current_thread() is not threading.main_thread():
         yield
         return
 

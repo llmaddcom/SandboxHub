@@ -23,6 +23,13 @@ USER_LABEL = "sandboxhub.user"
 ROLE_LABEL = "sandboxhub.role"
 SESSION_LABEL = "sandboxhub.session"
 MOUNT_LAYOUT_LABEL = "sandboxhub.mount-layout"
+# 实例的目录布局版本（#71）：缺省视为 1（引入本标签之前创建的实例都是 v1）。
+LAYOUT_VERSION_LABEL = "sandboxhub.layout-version"
+
+# 布局 v2（#71，file-up）的角色目录：``self`` = 角色空间根（排除平台保留区 ``.cr/``），
+# ``diary`` = 叠在其上的只读日记。v1 的角色目录一律在 ``/workspace/role/<name>``。
+V2_ROLE_TARGETS = {"self": "/self", "diary": "/self/diary"}
+V2_SELF_EXCLUDE = ("/.cr/**",)
 
 
 @dataclass
@@ -103,26 +110,38 @@ RoleMountMode = Literal["ro", "rw"]
 
 @dataclass(frozen=True)
 class RoleMountSpec:
-    """一个角色空间目录：MinIO ``bucket/prefix`` 经 cr-fs rclone 挂载，再 bind 到
-    实例 ``/workspace/role/<name>``。同一 (bucket, prefix, mode) 的多个实例共用一个挂载。"""
+    """一个角色空间目录：MinIO ``bucket/prefix`` 经 cr-fs rclone 挂载，再 bind 到实例里的
+    ``target``（v1：``/workspace/role/<name>``；v2：见 ``V2_ROLE_TARGETS``）。
+    同一 (bucket, prefix, mode, exclude) 的多个实例共用一个挂载。"""
     name: str
     bucket: str
     prefix: str
     mode: RoleMountMode = "ro"
+    layout_version: int = 1
+
+    @property
+    def exclude(self) -> tuple[str, ...]:
+        """rclone 过滤规则：v2 的 ``self`` 挂整个角色空间，平台保留区 ``.cr/`` 不进实例。"""
+        return V2_SELF_EXCLUDE if self.layout_version >= 2 and self.name == "self" else ()
 
     @property
     def key(self) -> str:
-        raw = f"{self.bucket}\0{self.prefix.strip('/')}\0{self.mode}".encode()
-        return hashlib.sha256(raw).hexdigest()[:20]
+        raw = f"{self.bucket}\0{self.prefix.strip('/')}\0{self.mode}"
+        if self.exclude:
+            # 只有带过滤规则的挂载才加这一段：v1 与 v2 diary 的 key 不变，可共用同一挂载。
+            raw += "\0exclude=" + ",".join(self.exclude)
+        return hashlib.sha256(raw.encode()).hexdigest()[:20]
 
     @property
     def target(self) -> str:
+        if self.layout_version >= 2:
+            return V2_ROLE_TARGETS.get(self.name, f"/self/{self.name}")
         return f"/workspace/role/{self.name}"
 
 
 @dataclass(frozen=True)
 class InputFileSpec:
-    """inputs 里的一个文件：用户空间 blob（按 sha256 寻址），以 ``path`` 出现在 /workspace/inputs。"""
+    """inputs 里的一个文件：用户空间 blob（按 sha256 寻址），以 ``path`` 出现在 inputs 视图（v1 /workspace/inputs，v2 /mnt/drive）。"""
     path: str
     bucket: str
     key: str
@@ -149,6 +168,8 @@ class WorkAreaInstance:
     session_id: str = ""
     turn_id: str = ""
     network_mode: NetworkMode = "allow"
+    # 目录布局版本（#71）：1 = /workspace/{work,inputs,context,role}；2 = /self /workspace /mnt/drive /opt/cr
+    layout_version: int = 1
     # 是否持有角色目录挂载引用（创建中途失败时尚未取得，释放时不得多减）
     mounts_held: bool = False
     acquired_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))

@@ -13,7 +13,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from .base import CLIResult, ToolError, ToolResult, filesystem_error_detail
+from .base import CLIResult, ToolError, ToolResult, filesystem_error_detail, hidden_root_error
 from .matcher import STRATEGY_LABELS, MatchError, apply_spans, find_replacement_spans
 from .run import maybe_truncate, run
 
@@ -86,8 +86,13 @@ class EditTool:
             raise ToolError(f"路径 {path} 不是绝对路径，应以 '/' 开头。")
         if file_text is None:
             raise ToolError("写入文件时必须提供 file_text 参数")
-        # 自动创建父目录
-        _path.parent.mkdir(parents=True, exist_ok=True)
+        if (hidden := hidden_root_error(_path)) is not None:
+            raise ToolError(hidden)
+        # 自动创建父目录（只读位置在这里就会失败，给出与写入相同的原因）
+        try:
+            _path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ToolError(filesystem_error_detail(_path, exc)) from exc
         self._write_file(_path, file_text)
         self._file_history[_path].append(file_text)
         return ToolResult(output=f"文件已写入: {_path}")
@@ -426,6 +431,8 @@ class EditTool:
         抛出:
             ToolError: 如果写入失败
         """
+        if (hidden := hidden_root_error(path)) is not None:
+            raise ToolError(hidden)
         try:
             path.write_text(file)
         except OSError as exc:
