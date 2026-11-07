@@ -6,13 +6,11 @@
 要求：
 
 - 单文件、零第三方依赖（仅 Python 标准库），自带 shebang（`#!/usr/bin/env python3`）；
-- 本体由上游仓维护并随版本同步到这里（上游统一在 createrole 仓（dev）
-  `server/infrastructure/sandbox_cli/<name>.py`，技能目录已瘦身为纯 SKILL.md，见 issue #20）：
-  - `skills` — `server/infrastructure/sandbox_cli/skills.py`（见 issue #15/#18/#24；原 `skillhub`，
-    #24 改名且**不留别名**，为第三方 skillhub.cn 的同名 CLI 让出命名空间）；
-  - `todo` — `server/infrastructure/sandbox_cli/todo.py`（见 issue #19，llmaddcom/createrole#362）；
-  - `memory` — `server/infrastructure/sandbox_cli/memory.py`（只读，见 issue #20，llmaddcom/createrole#366）；
-  - `tools` — createrole_com_api 仓 `server/tools/interfaces/cli/tools.py`（挂载的外部工具 / MCP 经平台网关调用，凭据不进沙盒，见 issue #63，llmaddcom/createrole_com_api#316）。
+- 本体由上游仓维护并随版本同步到这里（createrole_com_api 仓，各板块的 `interfaces/cli/`）：
+  - `skills` — `server/skills/interfaces/cli/skills.py`（技能根读 `CR_SKILLS_DIR`，布局 v2 为 `/self/skills`）；
+  - `todo` — `server/todo/interfaces/cli/todo.py`；
+  - `tools` — `server/tools/interfaces/cli/tools.py`（挂载的外部工具 / MCP 经平台网关调用，凭据不进沙盒；说明在 `/opt/cr/tools/INDEX.md`）；
+  - `memory` — `server/infrastructure/sandbox_cli/memory.py`（只读，见 issue #20，llmaddcom/createrole#366）。
 - 更新脚本后须 bump `images/ubuntu/app/VERSION` 并重建镜像。
 
 `.md` 文件会被构建脚本跳过。

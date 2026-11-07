@@ -3,7 +3,7 @@
 
 数字人调用挂载给自己的外部工具（MCP）的唯一入口（镜像预装为 ``tools`` 命令）：
 
-    tools list                                   # 挂载的工具索引（同 context/tools/INDEX.md）
+    tools list                                   # 挂载的工具索引（同 /opt/cr/tools/INDEX.md）
     tools show notion                            # 某个工具的说明与函数签名（同 README.md）
     tools call notion search '{"query": "周报"}'  # 调用；结果打到 stdout，失败退出码 1
     echo '{"query": "周报"}' | tools call notion search -
@@ -154,7 +154,7 @@ def cmd_call(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tools",
-        description="调用挂载给你的外部工具（MCP）。说明见 /workspace/context/tools/INDEX.md。",
+        description="调用挂载给你的外部工具（MCP）。说明见 /opt/cr/tools/INDEX.md。",
     )
     sub = parser.add_subparsers(dest="command")
     p_list = sub.add_parser("list", help="挂载的工具索引")

@@ -4,7 +4,7 @@ v2 接口：按工作区分配执行实例（ADR 0025）
 - ``GET  /v2/capabilities``                       隔离能力逐项报告（?refresh=true 立即重测）
 - ``POST /v2/work-areas/{id}/acquire``            分配 / 复用实例（409 忙碌或超限，503 隔离前提不满足）
 - ``POST /v2/sandboxes/{id}/release``             释放实例（销毁容器，工作区保留）
-- ``PUT  /v2/sandboxes/{id}/inputs|context``      就地更新只读视图
+- ``PUT  /v2/sandboxes/{id}/inputs|context``      就地更新只读视图（context 同时可带 v2 的 workspace_files）
 - ``GET  /v2/sandboxes/{id}/activity``            终端活性（不刷新活跃时间）
 - ``*    /v2/sandboxes/{id}/proxy/{path}``         透传到实例 API（注入每实例 token；终端任务注入来源）
 - ``GET  /v2/work-areas/{id}/usage|files|files/content``  经 cr-fs 读取，不依赖实例存活
@@ -29,10 +29,11 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from src.config import settings
+from src.manager import layouts
 from src.manager.fs_sidecar import FsOpError
-from src.manager.wa_instances import CWD, LAYOUT_VERSION, AcquireSpec, WorkAreaError, WorkAreaService
+from src.manager.wa_instances import LAYOUT_VERSION, AcquireSpec, WorkAreaError, WorkAreaService
 from src.manager.wa_jobs import TERMINAL_START_PATHS, iso_utc
-from src.models import InputFileSpec, RoleMountSpec
+from src.models import InputFileSpec, RoleMountSpec, normalize_self_exclude
 from src.proxy.forwarder import forward
 from src.routers import sandboxes as v1
 
@@ -103,6 +104,8 @@ class RoleMountModel(BaseModel):
     bucket: str
     prefix: str
     mode: Literal["ro", "rw"] = "ro"
+    # 只对布局 v2 的 self 有效：相对 /self 根的目录子树，如 ``avatar/**``（#73）
+    exclude: Optional[list[str]] = None
 
 
 class InputFileModel(BaseModel):
@@ -126,11 +129,14 @@ class AcquireV2Request(BaseModel):
     session_id: str = ""
     turn_id: str = ""
     layout_version: int = LAYOUT_VERSION
-    cwd: str = CWD
+    # None = 按布局的默认 cwd（v1 /workspace/work，v2 /workspace）；给出时必须与之相同
+    cwd: Optional[str] = None
     mounts: list[RoleMountModel] = []
     # None = 不改（复用时保留现状）；[] / {} = 清空
     inputs: Optional[list[InputFileModel]] = None
     context: Optional[dict[str, str]] = None
+    # 布局 v2：/workspace 根的只读平台文件（白名单 AGENTS.md、CLAUDE.md）；None = 不改
+    workspace_files: Optional[dict[str, str]] = None
     env: Optional[dict[str, str]] = None
     policy: Optional[v1.PolicySpec] = None
     limits: LimitsModel = LimitsModel()
@@ -141,7 +147,9 @@ class InputsRequest(BaseModel):
 
 
 class ContextRequest(BaseModel):
-    files: dict[str, str]
+    # 各自 None = 不改；两者至少给一个
+    files: Optional[dict[str, str]] = None
+    workspace_files: Optional[dict[str, str]] = None
 
 
 class DrainRequest(BaseModel):
@@ -172,11 +180,30 @@ async def capabilities(refresh: bool = False) -> dict:
 @router.post("/work-areas/{work_area_id}/acquire", dependencies=_auth)
 async def acquire(work_area_id: str, req: AcquireV2Request):
     service = _svc()
-    if req.layout_version != LAYOUT_VERSION:
-        raise HTTPException(400, detail={"reason": "layout_version_unsupported", "message": f"仅支持 {LAYOUT_VERSION}"})
-    if req.cwd != CWD:
-        raise HTTPException(400, detail={"reason": "cwd_unsupported", "message": f"cwd 只能是 {CWD}"})
+    if req.layout_version not in layouts.LAYOUTS:
+        supported = "、".join(str(v) for v in layouts.SUPPORTED_LAYOUTS)
+        raise HTTPException(400, detail={"reason": "layout_version_unsupported", "message": f"仅支持 {supported}"})
+    layout = layouts.get(req.layout_version)
+    if req.cwd is not None and req.cwd != layout.cwd:
+        raise HTTPException(
+            400,
+            detail={"reason": "cwd_unsupported", "message": f"布局 v{layout.version} 的 cwd 只能是 {layout.cwd}"},
+        )
     mode, effective_policy = v1._resolve_policy(req.policy)
+    try:
+        mounts = [
+            RoleMountSpec(
+                name=m.name,
+                bucket=m.bucket,
+                prefix=m.prefix,
+                mode=m.mode,
+                layout_version=layout.version,
+                extra_exclude=normalize_self_exclude(m.exclude),
+            )
+            for m in req.mounts
+        ]
+    except ValueError as exc:
+        return _error(WorkAreaError(400, "invalid_mount", str(exc)))
     spec = AcquireSpec(
         work_area_id=work_area_id,
         user_id=req.user_id,
@@ -184,9 +211,11 @@ async def acquire(work_area_id: str, req: AcquireV2Request):
         sandbox_type=req.sandbox_type,
         session_id=req.session_id,
         turn_id=req.turn_id,
-        mounts=[RoleMountSpec(name=m.name, bucket=m.bucket, prefix=m.prefix, mode=m.mode) for m in req.mounts],
+        mounts=mounts,
         inputs=_input_specs(req.inputs),
         context=req.context,
+        layout_version=layout.version,
+        workspace_files=req.workspace_files,
         env=req.env,
         network_mode=mode,
         limits=req.limits.model_dump(),
@@ -262,11 +291,16 @@ async def put_inputs(sandbox_id: str, req: InputsRequest):
 
 @router.put("/sandboxes/{sandbox_id}/context", dependencies=_auth)
 async def put_context(sandbox_id: str, req: ContextRequest):
+    if req.files is None and req.workspace_files is None:
+        raise HTTPException(400, detail={"reason": "invalid_context", "message": "files 与 workspace_files 至少给一个"})
     try:
-        files = await _svc().update_context(sandbox_id, req.files)
+        files, workspace_files = await _svc().update_context(sandbox_id, req.files, req.workspace_files)
     except WorkAreaError as exc:
         return _error(exc)
-    return {"ok": True, "files": files}
+    body: dict = {"ok": True, "files": files}
+    if req.workspace_files is not None:
+        body["workspace_files"] = workspace_files
+    return body
 
 
 @router.get("/sandboxes/{sandbox_id}/activity", dependencies=_auth)

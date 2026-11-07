@@ -4,10 +4,12 @@ cr-fs 特权 sidecar（ADR 0025）
 租户实例不再拿任何存储能力（无 SYS_ADMIN、无 /dev/fuse、无 MinIO 凭据）；需要特权的事
 全部收到这个常驻容器里：
 
-- 角色目录挂载：每个 (bucket, prefix, mode) 一个 ``rclone mount --daemon`` 进程，挂在
+- 角色目录挂载：每个 (bucket, prefix, mode) 一个 ``rclone mount2 --daemon`` 进程（子命令见
+  ``workspace.rclone_mount_command``），挂在
   ``/srv/mnt/<key>``。cr-fs 以 rshared 方式绑定 ``WORK_AREA_ROOT`` 到 ``/srv``，挂载传播到宿主
   ``WORK_AREA_ROOT/mnt/<key>`` 后再 bind 给实例。同一挂载被多个实例共用，引用计数，归零后
-  延迟卸载。``ro`` 由 rclone ``--read-only`` 与实例 bind ``ro`` 两层保证。
+  延迟卸载。``ro`` 由 rclone ``--read-only`` 与实例 bind ``ro`` 两层保证；布局 v2 的 ``self``
+  挂整个角色空间，平台保留区 ``.cr/`` 由 rclone ``--exclude`` 挡在实例之外。
 - 工作区文件操作：``docker exec`` 调用镜像内 fsops.py（root 身份、逐级 O_NOFOLLOW），
   因为工作区里的文件由租户以 root 写入，Hub 进程未必能读能删，也不能跟随租户软链接。
 - netguard：host 网络 + 特权，代 Hub 下发宿主 iptables 规则。
@@ -41,6 +43,19 @@ FSOPS = ("python3", "/opt/crfs/fsops.py")
 ROOT_SUBDIRS = ("work-areas", "instances", "inputs-cache", "mnt", "cache", "staging", "run")
 # 多个实例同时启动时共享此上限，避免对 cr-fs / Docker 发起无界并发。
 _ROLE_MOUNT_CONCURRENCY = 4
+
+# 角色目录挂载可用的 rclone 子命令。默认 mount2（go-fuse）：扩展属性读取返回「不支持」；
+# mount（bazil）对文件的 getxattr/listxattr 返回 EIO，`ls -l 文件`、`cp -a`、`sed -i` 都报
+# Input/output error（#75）。保留 mount 作为回退。
+MOUNT_COMMANDS = ("mount2", "mount")
+
+
+def _mount_command() -> str:
+    command = settings.RCLONE_MOUNT_COMMAND
+    if command not in MOUNT_COMMANDS:
+        raise RuntimeError(f"workspace.rclone_mount_command 只接受 {MOUNT_COMMANDS}：{command!r}")
+    return command
+
 
 EXIT_INVALID = 2
 EXIT_NOT_FOUND = 3
@@ -257,7 +272,7 @@ class FsSidecar:
         if code != 0:
             raise RuntimeError(f"建挂载点失败 | key={key} | err={err.decode(errors='replace')}")
         cmd = [
-            "rclone", "mount", remote, point,
+            "rclone", _mount_command(), remote, point,
             "--daemon", "--allow-other",
             "--vfs-cache-mode", settings.RCLONE_VFS_CACHE_MODE,
             "--vfs-cache-max-size", settings.RCLONE_VFS_CACHE_MAX_SIZE,
@@ -268,6 +283,9 @@ class FsSidecar:
         ]
         if spec.mode == "ro":
             cmd.append("--read-only")
+        for rule in spec.exclude:
+            # 被排除的路径列不出、读不到，写入也不会上传到存储（只留在本地 VFS 缓存）
+            cmd += ["--exclude", rule]
         code, _, err = await self.exec(cmd, env=settings.minio_rclone_env(from_host=True))
         if code != 0:
             raise RuntimeError(

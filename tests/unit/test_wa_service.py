@@ -19,6 +19,7 @@ from src.manager.inputs_cache import InputsCache
 from src.manager.netguard import Capabilities, Capability, ImageFeatures
 from src.manager.wa_instances import AcquireSpec, WorkAreaError, WorkAreaService
 from src.models import (
+    LAYOUT_VERSION_LABEL,
     MOUNT_LAYOUT_LABEL,
     ROLE_LABEL,
     SANDBOX_ID_LABEL,
@@ -388,7 +389,7 @@ async def test_update_inputs_and_context(env):
     instance, _ = await service.acquire(_spec())
     result = await service.update_inputs(instance.sandbox_id, [_input(minio, "n.txt", b"N")])
     assert result["files"] == 1
-    assert await service.update_context(instance.sandbox_id, {"a.md": "x"}) == ["a.md"]
+    assert await service.update_context(instance.sandbox_id, {"a.md": "x"}) == (["a.md"], [])
     with pytest.raises(WorkAreaError) as ei:
         await service.update_context(instance.sandbox_id, {"../x": "y"})
     assert ei.value.reason == "invalid_context"
@@ -430,7 +431,13 @@ async def test_usage_reports_soft_cap(env, monkeypatch):
 
 
 def _managed(sid: str, wa: str, *, mounts=(SKILLS,), status="running", token="tok", age=3600) -> ManagedContainer:
-    layout = [{"name": m.name, "bucket": m.bucket, "prefix": m.prefix, "mode": m.mode} for m in mounts]
+    layout = [
+        {
+            "name": m.name, "bucket": m.bucket, "prefix": m.prefix, "mode": m.mode,
+            **({"exclude": list(m.extra_exclude)} if m.extra_exclude else {}),
+        }
+        for m in mounts
+    ]
     return ManagedContainer(
         container_id=f"c-{sid}",
         container_name=f"cr-wa-code-{sid}",
@@ -573,3 +580,201 @@ async def test_unknown_execution_origin_does_not_guess_from_old_labels(env, fail
         path.write_text(json.dumps(value))
     service._restore_origin(instance)
     assert instance.session_id == instance.turn_id == ''
+
+
+# ── 布局 v2（#71）────────────────────────────────────────────────────────────
+
+SELF = RoleMountSpec("self", "bkt", "roles/r1", "rw", layout_version=2)
+DIARY = RoleMountSpec("diary", "bkt", "roles/r1/diary", "ro", layout_version=2)
+AGENTS = {"AGENTS.md": "# 盘说明\n", "CLAUDE.md": "@AGENTS.md\n"}
+
+
+def _v2spec(wa="wa1", **kw) -> AcquireSpec:
+    kw.setdefault("mounts", [SELF, DIARY])
+    return _spec(wa, layout_version=2, **kw)
+
+
+async def test_acquire_v2_binds_five_roots(env):
+    service, manager, sidecar, minio = env
+    spec = _v2spec(
+        inputs=[_input(minio, "deliverables/r.md", b"R")],
+        context={"env/INDEX.md": "env", "tools/INDEX.md": "tools"},
+        workspace_files=AGENTS,
+    )
+    instance, reused = await service.acquire(spec)
+    assert reused is False and instance.layout_version == 2
+    kwargs = manager.run_wa_container.await_args.kwargs
+    assert kwargs["layout_version"] == 2
+    binds = {b.target: b for b in kwargs["binds"]}
+    assert list(binds) == [
+        "/workspace", "/workspace/deliverables", "/workspace/AGENTS.md", "/workspace/CLAUDE.md",
+        "/mnt/drive", "/opt/cr", "/self", "/self/diary",
+    ]
+    work = sidecar.root / "work-areas" / "wa1"
+    assert binds["/workspace"].source == str(work / "work") and not binds["/workspace"].read_only
+    assert binds["/workspace/deliverables"].source == str(work / "deliverables")
+    assert not binds["/workspace/deliverables"].read_only
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        assert binds[f"/workspace/{name}"].read_only
+    assert binds["/mnt/drive"].read_only and binds["/opt/cr"].read_only
+    assert not binds["/self"].read_only and binds["/self"].propagation == "rslave"
+    assert binds["/self/diary"].read_only and binds["/self/diary"].propagation == "rslave"
+    inst_dir = sidecar.root / "instances" / instance.sandbox_id
+    assert not (inst_dir / "root").exists()  # v2 没有只读骨架
+    assert (inst_dir / "workspace-files" / "AGENTS.md").read_text() == "# 盘说明\n"
+    assert (inst_dir / "inputs" / "deliverables" / "r.md").read_bytes() == b"R"
+    assert (inst_dir / "context" / "env" / "INDEX.md").read_text() == "env"
+    report = service.effective_report(instance)
+    assert report["layout_version"] == 2 and report["cwd"] == "/workspace"
+    targets = {m["target"]: m for m in report["mounts"]}
+    assert targets["/self"]["exclude"] == ["/.cr/**"] and targets["/self/diary"]["mode"] == "ro"
+    assert targets["/workspace"]["mode"] == "rw" and targets["/opt/cr"]["source"] == "context"
+    assert report["workspace_files"] == {"files": ["AGENTS.md", "CLAUDE.md"]}
+    assert report["context"] == {"files": ["env/INDEX.md", "tools/INDEX.md"]}
+
+
+async def test_acquire_v2_without_workspace_files_binds_empty_files(env):
+    service, manager, sidecar, _ = env
+    instance, _ = await service.acquire(_v2spec(mounts=[]))
+    files = sidecar.root / "instances" / instance.sandbox_id / "workspace-files"
+    assert (files / "AGENTS.md").read_bytes() == b"" and (files / "CLAUDE.md").read_bytes() == b""
+    assert service.effective_report(instance)["workspace_files"] == {"files": []}
+
+
+async def test_workspace_files_update_in_place_keeps_inode(env):
+    service, _, sidecar, _ = env
+    instance, _ = await service.acquire(_v2spec(workspace_files=AGENTS))
+    agents = sidecar.root / "instances" / instance.sandbox_id / "workspace-files" / "AGENTS.md"
+    inode = agents.stat().st_ino
+    files, extra = await service.update_context(instance.sandbox_id, None, {"AGENTS.md": "v2"})
+    assert files == [] and extra == ["AGENTS.md"]
+    assert agents.read_text() == "v2" and agents.stat().st_ino == inode
+    # 整组替换：没给的 CLAUDE.md 清空
+    assert (agents.parent / "CLAUDE.md").read_bytes() == b""
+    # 复用时同样就地更新
+    again, reused = await service.acquire(_v2spec(workspace_files={"AGENTS.md": "v3"}))
+    assert reused and again is instance and agents.read_text() == "v3" and agents.stat().st_ino == inode
+    with pytest.raises(WorkAreaError) as ei:
+        await service.update_context(instance.sandbox_id, None, {"README.md": "x"})
+    assert ei.value.reason == "invalid_workspace_files"
+    assert agents.read_text() == "v3"
+
+
+async def test_v1_instance_rejects_workspace_files(env):
+    service, _, _, _ = env
+    instance, _ = await service.acquire(_spec())
+    with pytest.raises(WorkAreaError) as ei:
+        await service.update_context(instance.sandbox_id, {"a.md": "x"}, {"AGENTS.md": "x"})
+    assert ei.value.reason == "workspace_files_unsupported"
+
+
+async def test_layouts_never_share_an_instance(env):
+    service, manager, _, _ = env
+    v1, _ = await service.acquire(_spec(mounts=[]))
+    v2, reused = await service.acquire(_v2spec(mounts=[]))
+    assert reused is False and v2.sandbox_id != v1.sandbox_id and v2.layout_version == 2
+    manager.remove_container.assert_awaited_with(v1.container_info.container_id)
+    back, reused = await service.acquire(_spec(mounts=[]))
+    assert reused is False and back.layout_version == 1
+
+
+async def test_layout_change_busy_returns_409(env):
+    service, _, _, _ = env
+    await service.acquire(_spec(mounts=[]))
+    service.activity.return_value = {"known": True, "idle": False}
+    with pytest.raises(WorkAreaError) as ei:
+        await service.acquire(_v2spec(mounts=[]))
+    assert ei.value.status == 409 and ei.value.reason == "instance_busy"
+
+
+async def test_v2_moves_aside_tenant_entries_that_block_mountpoints(env):
+    service, manager, sidecar, _ = env
+    work = sidecar.root / "work-areas" / "wa1" / "work"
+    work.mkdir(parents=True)
+    (work / "AGENTS.md").mkdir()  # 目录挡住单文件挂载
+    (work / "CLAUDE.md").symlink_to("/etc/passwd")  # 软链接会把挂载引到别处
+    (work / "deliverables").write_text("not a dir")
+    (work / "keep.md").write_text("keep")
+    await service.acquire(_v2spec(mounts=[]))
+    names = sorted(p.name for p in work.iterdir())
+    assert "AGENTS.md" not in names and "CLAUDE.md" not in names and "deliverables" not in names
+    assert {n.split(".moved-")[0] for n in names if ".moved-" in n} == {"AGENTS.md", "CLAUDE.md", "deliverables"}
+    assert (work / "keep.md").read_text() == "keep"
+
+
+async def test_v2_keeps_regular_tenant_agents_file(env):
+    service, _, sidecar, _ = env
+    work = sidecar.root / "work-areas" / "wa1" / "work"
+    work.mkdir(parents=True)
+    (work / "AGENTS.md").write_text("mine")
+    (work / "deliverables").mkdir()
+    await service.acquire(_v2spec(mounts=[]))
+    assert (work / "AGENTS.md").read_text() == "mine"  # 只读覆盖期间被遮住，内容不动
+
+
+async def test_startup_adopts_v2_instance_from_layout_label(env):
+    service, manager, sidecar, _ = env
+    sidecar.mounted[SELF.key] = True
+    sidecar.mounted[DIARY.key] = True
+    v2 = _managed("sb_v2", "wa1", mounts=(SELF, DIARY))
+    v2.labels[LAYOUT_VERSION_LABEL] = "2"
+    legacy = _managed("sb_v1", "wa2")  # 没有布局标签：v1
+    sidecar.mounted[SKILLS.key] = True
+    bad = _managed("sb_bad", "wa3")
+    bad.labels[LAYOUT_VERSION_LABEL] = "9"
+    manager.list_managed.return_value = [v2, legacy, bad]
+    await service.startup()
+    adopted = service.registry.get("sb_v2")
+    assert adopted.layout_version == 2 and adopted.mounts == (SELF, DIARY)
+    assert [m.target for m in adopted.mounts] == ["/self", "/self/diary"]
+    assert service.registry.get("sb_v1").layout_version == 1
+    assert service.registry.get("sb_bad") is None
+    assert service.mounts.refs() == {SELF.key: 1, DIARY.key: 1, SKILLS.key: 1}
+
+
+def test_capabilities_list_layout_versions_without_bumping_legacy_field(env):
+    service, _, _, _ = env
+    caps = service.capabilities()
+    assert caps["layout_versions"] == [1, 2]
+    assert caps["layout_version"] == 1 and caps["cwd"] == "/workspace/work"
+
+
+# ── 布局 v2：后端附带的 /self 排除规则（#73）────────────────────────────────────
+
+SELF_EX = RoleMountSpec(
+    "self", "bkt", "roles/r1", "rw", layout_version=2, extra_exclude=("avatar/**", ".staging/**")
+)
+
+
+async def test_acquire_v2_self_exclude_reaches_env_label_and_report(env):
+    service, manager, _, _ = env
+    instance, _ = await service.acquire(_v2spec(mounts=[SELF_EX, DIARY], workspace_files=AGENTS))
+    kwargs = manager.run_wa_container.await_args.kwargs
+    assert kwargs["hidden_roots"] == ("/self/.cr", "/self/avatar", "/self/.staging")
+    label = {m["name"]: m for m in kwargs["mount_layout"]}
+    assert label["self"]["exclude"] == ["avatar/**", ".staging/**"] and "exclude" not in label["diary"]
+    targets = {m["target"]: m for m in service.effective_report(instance)["mounts"]}
+    assert targets["/self"]["exclude"] == ["/.cr/**", "/avatar/**", "/.staging/**"]
+
+
+async def test_acquire_v2_rejects_exclude_outside_self(env):
+    service, _, _, _ = env
+    diary = RoleMountSpec(
+        "diary", "bkt", "roles/r1/diary", "ro", layout_version=2, extra_exclude=("x/**",)
+    )
+    with pytest.raises(WorkAreaError) as err:
+        await service.acquire(_v2spec(mounts=[SELF, diary]))
+    assert err.value.reason == "invalid_mount"
+
+
+async def test_startup_adopts_v2_instance_with_self_exclude(env):
+    service, manager, sidecar, _ = env
+    sidecar.mounted[SELF_EX.key] = True
+    sidecar.mounted[DIARY.key] = True
+    v2 = _managed("sb_ex", "wa1", mounts=(SELF_EX, DIARY))
+    v2.labels[LAYOUT_VERSION_LABEL] = "2"
+    manager.list_managed.return_value = [v2]
+    await service.startup()
+    adopted = service.registry.get("sb_ex")
+    assert adopted is not None and adopted.mounts == (SELF_EX, DIARY)
+    assert service.mounts.refs() == {SELF_EX.key: 1, DIARY.key: 1}

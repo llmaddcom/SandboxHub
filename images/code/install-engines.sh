@@ -104,16 +104,21 @@ term.onExit((e) => { if (e.exitCode !== 0 || !out.includes('pty-ok')) { console.
 " || fail "node-pty 不可用"
 
 # Codex 管控配置（后端 createrole_com_api#383 实测）：codex-acp 把 cwd 强制标为受信项目，
-# /workspace/work/.codex/config.toml 会以 Project 层加载——用户数据能改 features、加
+# <cwd>/.codex/config.toml 会以 Project 层加载——用户数据能改 features、加
 # [mcp_servers.x] command=…（启动即执行）。系统级 managed_config 优先级最高，把工作目录标为
 # untrusted 即停用 Project 层；full-access 与审批 never 由后端经启动参数给出，不受影响。
+# 两个工作目录都要压住：布局 v1 的 /workspace/work 与布局 v2 的 /workspace（SandboxHub#71）。
 mkdir -p /etc/codex
 cat > /etc/codex/managed_config.toml <<'TOML'
 [projects."/workspace/work"]
 trust_level = "untrusted"
+
+[projects."/workspace"]
+trust_level = "untrusted"
 TOML
 chmod 0444 /etc/codex/managed_config.toml
-grep -q 'trust_level = "untrusted"' /etc/codex/managed_config.toml || fail "Codex 管控配置未写入"
+[ "$(grep -c 'trust_level = "untrusted"' /etc/codex/managed_config.toml)" = 2 ] || fail "Codex 管控配置未写入"
+grep -q '^\[projects."/workspace"\]$' /etc/codex/managed_config.toml || fail "Codex 管控配置缺少 v2 工作目录"
 echo "Codex 管控配置：/etc/codex/managed_config.toml"
 # Claude Code 管控设置（后端 createrole_com_api#388 实测）：managed 层优先级最高，进程起来即为
 # bypass，不依赖驱动随后的 set_mode，也压住 work/.claude/settings.json 的 defaultMode；关掉 auto

@@ -109,7 +109,12 @@ async def test_acquire_without_inputs_means_unchanged(client, service, with_key)
 
 @pytest.mark.parametrize(
     "extra,reason",
-    [({"layout_version": 2}, "layout_version_unsupported"), ({"cwd": "/workspace"}, "cwd_unsupported")],
+    [
+        ({"layout_version": 3}, "layout_version_unsupported"),
+        ({"layout_version": 0}, "layout_version_unsupported"),
+        ({"cwd": "/workspace"}, "cwd_unsupported"),  # v1 的 cwd 只能是 /workspace/work
+        ({"layout_version": 2, "cwd": "/workspace/work"}, "cwd_unsupported"),
+    ],
 )
 async def test_acquire_rejects_unsupported_layout(client, service, with_key, extra, reason):
     async with client:
@@ -117,6 +122,50 @@ async def test_acquire_rejects_unsupported_layout(client, service, with_key, ext
             "/v2/work-areas/wa1/acquire", json={"user_id": "u1", "role_id": "r1", **extra}, headers=HEADERS
         )
     assert r.status_code == 400 and r.json()["detail"]["reason"] == reason
+
+
+async def test_acquire_v2_maps_layout_mounts_and_workspace_files(client, service, with_key):
+    body = {
+        "user_id": "u1", "role_id": "r1", "layout_version": 2, "cwd": "/workspace",
+        "mounts": [
+            {"name": "self", "bucket": "b", "prefix": "roles/r1", "mode": "rw"},
+            {"name": "diary", "bucket": "b", "prefix": "roles/r1/diary", "mode": "ro"},
+        ],
+        "context": {"env/INDEX.md": "x"},
+        "workspace_files": {"AGENTS.md": "# 盘说明", "CLAUDE.md": "@AGENTS.md"},
+    }
+    async with client:
+        r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    spec = service.acquire.await_args.args[0]
+    assert spec.layout_version == 2 and spec.workspace_files == body["workspace_files"]
+    assert [m.target for m in spec.mounts] == ["/self", "/self/diary"]
+    assert all(m.layout_version == 2 for m in spec.mounts)
+    assert spec.mounts[0].exclude == ("/.cr/**",) and spec.mounts[1].exclude == ()
+
+
+async def test_acquire_v2_cwd_defaults_to_layout(client, service, with_key):
+    async with client:
+        r = await client.post(
+            "/v2/work-areas/wa1/acquire", json={"user_id": "u1", "role_id": "r1", "layout_version": 2}, headers=HEADERS
+        )
+    assert r.status_code == 200
+    assert service.acquire.await_args.args[0].layout_version == 2
+
+
+async def test_put_context_accepts_workspace_files(client, service, with_key):
+    service.update_context = AsyncMock(return_value=([], ["AGENTS.md"]))
+    async with client:
+        r = await client.put(
+            "/v2/sandboxes/sb_1/context", json={"workspace_files": {"AGENTS.md": "x"}}, headers=HEADERS
+        )
+        assert r.status_code == 200, r.text
+        assert r.json() == {"ok": True, "files": [], "workspace_files": ["AGENTS.md"]}
+        service.update_context.assert_awaited_once_with("sb_1", None, {"AGENTS.md": "x"})
+        r = await client.put("/v2/sandboxes/sb_1/context", json={"files": {"a.md": "x"}}, headers=HEADERS)
+        assert r.json() == {"ok": True, "files": []}  # 没给 workspace_files 就不回这一项
+        r = await client.put("/v2/sandboxes/sb_1/context", json={}, headers=HEADERS)
+        assert r.status_code == 400 and r.json()["detail"]["reason"] == "invalid_context"
 
 
 async def test_acquire_busy_maps_to_409_with_holders(client, service, with_key):
@@ -379,3 +428,32 @@ def test_v2_gateway_and_cutover_filter_manual_minio_forwards(monkeypatch, tmp_pa
     assert (9000, 'minio.internal:9000') in settings.gateway_forwards()
     (tmp_path/'.files-cutover.json').write_text('{"schema_version":1}')
     assert settings.gateway_forwards() == [(8080, 'api.internal:8011')]
+
+
+
+async def test_acquire_v2_self_exclude_is_normalized(client, service, with_key):
+    body = {
+        "user_id": "u1", "role_id": "r1", "layout_version": 2,
+        "mounts": [
+            {"name": "self", "bucket": "b", "prefix": "roles/r1", "mode": "rw",
+             "exclude": ["/.cr/**", "/avatar/**", ".staging/**"]},
+            {"name": "diary", "bucket": "b", "prefix": "roles/r1/diary", "mode": "ro"},
+        ],
+    }
+    async with client:
+        r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    spec = service.acquire.await_args.args[0]
+    assert spec.mounts[0].extra_exclude == (".cr/**", "avatar/**", ".staging/**")
+    assert spec.mounts[0].exclude == ("/.cr/**", "/avatar/**", "/.staging/**")
+
+
+async def test_acquire_v2_invalid_self_exclude_is_invalid_mount(client, service, with_key):
+    body = {
+        "user_id": "u1", "role_id": "r1", "layout_version": 2,
+        "mounts": [{"name": "self", "bucket": "b", "prefix": "roles/r1", "mode": "rw", "exclude": ["../x/**"]}],
+    }
+    async with client:
+        r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
+    assert r.status_code == 400 and r.json()["detail"]["reason"] == "invalid_mount"
+    service.acquire.assert_not_called()

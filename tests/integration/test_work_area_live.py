@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 RAND = uuid.uuid4().hex[:6]
-IMAGE_CODE = os.environ.get("LIVE_IMAGE_CODE", "sandbox-code:2026.11.06-1")
+IMAGE_CODE = os.environ.get("LIVE_IMAGE_CODE", "sandbox-code:2026.11.07-2")
 IMAGE_FS = os.environ.get("LIVE_IMAGE_FS", "sandbox-fs:2026.10.06-1")
 GW_PORT = 18555
 # 测试里所有命令都受这个上限约束（平台对每个 job 生效），单条命令须远短于它
@@ -390,6 +390,215 @@ async def test_work_area_isolation_end_to_end(live):
         assert service2.registry.get(a2.sandbox_id).api_token == a2.api_token
         assert service2.registry.get(a2.sandbox_id).session_id == "s-later"
         assert service2.registry.get(a2.sandbox_id).turn_id == "t-later"
+    finally:
+        for svc in reversed(services):
+            for instance in svc.registry.list_all():
+                try:
+                    await svc._discard(instance, "test_cleanup")
+                except Exception:
+                    pass
+            try:
+                await svc.mounts.sweep(0)
+            except Exception:
+                pass
+        try:
+            await service.netguard.teardown()
+        except Exception:
+            pass
+        _cleanup_docker(root)
+        try:
+            for obj in mc.list_objects(bucket, recursive=True):
+                mc.remove_object(bucket, obj.object_name)
+            mc.remove_bucket(bucket)
+        except Exception:
+            pass
+
+
+async def _file_write(instance, path: str, text: str) -> httpx.Response:
+    info = instance.container_info
+    async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
+        return await client.post(
+            f"http://{info.container_ip}:8000/api/file/write",
+            json={"path": path, "file_text": text},
+            headers={"X-Sandbox-Token": instance.api_token},
+        )
+
+
+async def _wait_object(mc, bucket: str, key: str, data: bytes) -> None:
+    for _ in range(30):
+        try:
+            if mc.get_object(bucket, key).read() == data:
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+    pytest.fail(f"{key} 没有回写到 MinIO")
+
+
+async def test_work_area_layout_v2_end_to_end(live):
+    """布局 v2（SandboxHub#71）：五个根、读写模式、只读 AGENTS.md、叠挂的只读日记、.cr 不可见、
+    v1 工作区换 v2 后内容仍在、Hub 重启按布局标签收养。"""
+    from src.manager.container_manager import ContainerManager
+    from src.manager.fs_sidecar import FsSidecar
+    from src.manager.wa_instances import AcquireSpec, WorkAreaService
+    from src.models import InputFileSpec, RoleMountSpec
+
+    root = live
+    bucket = f"sbit-{RAND}"
+    mc = _minio()
+    mc.make_bucket(bucket)
+    for key, data in {
+        "roles/r1/about.md": b"I am r1\n",
+        "roles/r1/skills/hello/SKILL.md": b"---\nname: hello\n---\nsay hello\n",
+        "roles/r1/diary/2026-11-07.md": b"diary entry\n",
+        "roles/r1/.cr/versions/about.md/1": b"version bytes\n",
+        "roles/r1/avatar/a.png": b"avatar bytes\n",
+        "roles/r1/.staging/up.bin": b"staging bytes\n",
+    }.items():
+        mc.put_object(bucket, key, io.BytesIO(data), len(data))
+    doc = b"archived deliverable\n"
+    sha = hashlib.sha256(doc).hexdigest()
+    blob_key = f"userspace/u1/blobs/{sha[:2]}/{sha}"
+    mc.put_object(bucket, blob_key, io.BytesIO(doc), len(doc))
+
+    manager = ContainerManager()
+    service = WorkAreaService(manager, FsSidecar(manager.docker))
+    services = [service]
+    # 后端随 self 附带的排除规则（#73）：头像与上传暂存不进实例
+    self_mount = RoleMountSpec(
+        "self", bucket, "roles/r1", "rw", layout_version=2, extra_exclude=("avatar/**", ".staging/**")
+    )
+    diary_mount = RoleMountSpec("diary", bucket, "roles/r1/diary", "ro", layout_version=2)
+    agents = {"AGENTS.md": "# 盘说明 v1\n", "CLAUDE.md": "@AGENTS.md\n"}
+
+    def v2(wa: str, **kw) -> AcquireSpec:
+        return AcquireSpec(
+            work_area_id=wa, user_id="u1", role_id="r1", sandbox_type="code", layout_version=2,
+            mounts=[self_mount, diary_mount],
+            inputs=[InputFileSpec("deliverables/r.md", bucket, blob_key, sha, len(doc))],
+            context={"env/INDEX.md": "环境索引\n", "tools/INDEX.md": "工具索引\n"},
+            workspace_files=agents, **kw,
+        )
+
+    try:
+        await service.startup()
+        assert service.started
+        caps = await service.run_selftest()
+        assert caps["ok"] and caps["layout_versions"] == [1, 2], caps
+
+        # ── 1. v1 工作区先写一份文件，换成 v2 后在 /workspace 下仍能看到 ─────────
+        old, _ = await service.acquire(
+            AcquireSpec(work_area_id="wa-v2", user_id="u1", role_id="r1", sandbox_type="code")
+        )
+        code, out = await _sh(old, "echo from-v1 > /workspace/work/keep.txt && pwd")
+        assert code == 0 and out.strip() == "/workspace/work", out
+        a, reused = await service.acquire(v2("wa-v2"))
+        assert not reused and a.sandbox_id != old.sandbox_id and a.layout_version == 2
+
+        # ── 2. 五个根与内容 ──────────────────────────────────────────────────
+        code, out = await _sh(
+            a,
+            "pwd; echo CWD=$SANDBOX_CWD SKILLS=$CR_SKILLS_DIR LAYOUT=$SANDBOX_LAYOUT; "
+            "cat /workspace/keep.txt /workspace/AGENTS.md /workspace/CLAUDE.md; "
+            "cat /self/about.md /self/skills/hello/SKILL.md /self/diary/2026-11-07.md; "
+            "cat /mnt/drive/deliverables/r.md /opt/cr/env/INDEX.md /opt/cr/tools/INDEX.md; "
+            "echo LS_SELF; ls -1a /self; echo LS_WS; ls -1a /workspace",
+        )
+        assert code == 0, out
+        lines = out.splitlines()
+        assert lines[0] == "/workspace", out
+        assert "CWD=/workspace SKILLS=/self/skills LAYOUT=work-area/v2" in out
+        for text in ("from-v1", "盘说明 v1", "@AGENTS.md", "I am r1", "say hello", "diary entry",
+                     "archived deliverable", "环境索引", "工具索引"):
+            assert text in out, (text, out)
+        ls_self = lines[lines.index("LS_SELF") + 1 : lines.index("LS_WS")]
+        assert ".cr" not in ls_self and {"about.md", "skills", "diary"} <= set(ls_self), ls_self
+        assert "avatar" not in ls_self and ".staging" not in ls_self, ls_self
+        ls_ws = lines[lines.index("LS_WS") + 1 :]
+        assert {"AGENTS.md", "CLAUDE.md", "deliverables", "keep.txt"} <= set(ls_ws), ls_ws
+
+        # #75：/self 上的扩展属性读取返回「不支持」而不是 EIO，`ls -l 文件` 与 `sed -i` 不报 I/O 错误
+        code, out = await _sh(
+            a,
+            "ls -la /self /self/about.md /self/skills 2>&1; "
+            "python3 -c 'import os,errno\n"
+            "for p in (\"/self/about.md\", \"/self/skills\"):\n"
+            "  try: os.listxattr(p); print(\"XATTR_OK\", p)\n"
+            "  except OSError as e: print(\"XATTR\", p, errno.errorcode[e.errno])'; "
+            "cp /self/about.md /self/sed-75.md && sed -i s/r1/R1/ /self/sed-75.md 2>&1; "
+            "cat /self/sed-75.md; rm -f /self/sed-75.md",
+        )
+        assert code == 0, out
+        assert "Input/output error" not in out, out
+        assert "EIO" not in out and out.count("XATTR") == 2, out
+        assert "I am R1" in out, out
+
+        # ── 3. 只读位置写不进（终端与文件接口都一样），读写位置可写 ─────────────
+        for path in (
+            "/mnt/drive/deliverables/r.md", "/mnt/drive/new.txt", "/opt/cr/env/INDEX.md", "/opt/cr/new.txt",
+            "/self/diary/2026-11-07.md", "/self/diary/new.md", "/workspace/AGENTS.md", "/workspace/CLAUDE.md",
+        ):
+            code, out = await _sh(a, f"echo pwned > {path}")
+            assert code != 0, f"{path} 竟然可写：{out}"
+        code, out = await _sh(a, "rm -f /workspace/AGENTS.md; mv /workspace/CLAUDE.md /workspace/x; cat /workspace/AGENTS.md")
+        assert "盘说明 v1" in out, out
+        r = await _file_write(a, "/mnt/drive/new.txt", "x")
+        assert r.status_code == 400 and "只读位置" in r.json()["detail"], r.text
+        r = await _file_write(a, "/self/.cr/versions/about.md/1", "tampered")
+        assert r.status_code == 400 and "平台保留目录" in r.json()["detail"], r.text
+        r = await _file_write(a, "/self/avatar/a.png", "tampered")
+        assert r.status_code == 400 and "平台保留目录" in r.json()["detail"], r.text
+        code, out = await _sh(
+            a,
+            "echo lesson > /self/lessons.md && echo w > /workspace/w.txt && "
+            "echo report > /workspace/deliverables/report.md && mkdir -p /tmp/outputs && "
+            "echo spill > /tmp/outputs/a.txt && cat /tmp/outputs/a.txt && sync",
+        )
+        assert code == 0 and "spill" in out, out
+        await _wait_object(mc, bucket, "roles/r1/lessons.md", b"lesson\n")
+        r = await _file_write(a, "/self/notes/a.md", "note")
+        assert r.status_code == 200, r.text
+        await _wait_object(mc, bucket, "roles/r1/notes/a.md", b"note")
+
+        # ── 4. .cr 不可见，终端里硬写也到不了存储 ───────────────────────────────
+        code, out = await _sh(a, "cat /self/.cr/versions/about.md/1; echo hack > /self/.cr/x 2>&1; sync; true")
+        assert "version bytes" not in out, out
+        await asyncio.sleep(3)
+        assert mc.get_object(bucket, "roles/r1/.cr/versions/about.md/1").read() == b"version bytes\n"
+        assert mc.get_object(bucket, "roles/r1/avatar/a.png").read() == b"avatar bytes\n"
+        assert not [o for o in mc.list_objects(bucket, "roles/r1/.cr/", recursive=True) if o.object_name.endswith("/x")]
+
+        # ── 5. 归档读取不变；平台文件就地更新后实例立刻看到 ─────────────────────
+        got = await service.work_areas.read("wa-v2", "deliverables", "report.md")
+        try:
+            assert got.path.read_bytes() == b"report\n" and got.stable
+        finally:
+            got.path.unlink(missing_ok=True)
+        await service.update_context(a.sandbox_id, {"env/INDEX.md": "环境 v2\n"}, {"AGENTS.md": "# 盘说明 v2\n"})
+        code, out = await _sh(a, "cat /workspace/AGENTS.md /opt/cr/env/INDEX.md; wc -c < /workspace/CLAUDE.md")
+        assert "盘说明 v2" in out and "环境 v2" in out and out.strip().endswith("0"), out
+        report = service.effective_report(a)
+        assert report["layout_version"] == 2 and report["cwd"] == "/workspace"
+        assert report["workspace_files"] == {"files": ["AGENTS.md"]}
+        targets = {m["target"]: m for m in report["mounts"]}
+        assert targets["/self"]["exclude"] == ["/.cr/**", "/avatar/**", "/.staging/**"], report
+
+        # ── 6. 镜像：Codex 管控配置压住 v2 工作目录 ─────────────────────────────
+        if os.environ.get("LIVE_EXPECT_V2_IMAGE") == "1":
+            code, out = await _sh(a, "cat /etc/codex/managed_config.toml")
+            assert '[projects."/workspace"]' in out, out
+            code, out = await _sh(a, "tools --help; grep -c CR_SKILLS_DIR /usr/local/bin/skills")
+            assert "/opt/cr/tools/INDEX.md" in out and "/workspace/context" not in out, out
+
+        # ── 7. Hub 重启：按布局标签收养 ─────────────────────────────────────────
+        manager2 = ContainerManager()
+        service2 = WorkAreaService(manager2, FsSidecar(manager2.docker))
+        services.append(service2)
+        await service2.startup()
+        adopted = service2.registry.get(a.sandbox_id)
+        assert adopted is not None and adopted.layout_version == 2
+        assert [m.target for m in adopted.mounts] == ["/self", "/self/diary"]
+        assert service2.mounts.refs() == {self_mount.key: 1, diary_mount.key: 1}
     finally:
         for svc in reversed(services):
             for instance in svc.registry.list_all():

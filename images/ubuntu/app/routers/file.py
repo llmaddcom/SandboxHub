@@ -24,7 +24,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..tools import EditTool, MatchError, ToolError
-from ..tools.base import filesystem_error_detail
+from ..tools.base import filesystem_error_detail, hidden_root_error
 
 # Hub 从 system.yaml 注入；直接运行容器同样默认不限业务文件大小。
 MAX_UPLOAD_SIZE = max(0, int(os.environ.get("SANDBOX_FILE_UPLOAD_MAX_BYTES", "0")))
@@ -370,6 +370,8 @@ async def upload_file(
     """
     try:
         target = _validate_path(dest_path)
+        if (hidden := hidden_root_error(target)) is not None:
+            raise HTTPException(status_code=400, detail=hidden)
 
         if target.is_dir() or dest_path.endswith("/"):
             target.mkdir(parents=True, exist_ok=True)
@@ -390,7 +392,7 @@ async def upload_file(
     except HTTPException:
         raise
     except OSError as exc:
-        code = 507 if exc.errno in (errno.ENOSPC, errno.EDQUOT) else 500
+        code = 507 if exc.errno in (errno.ENOSPC, errno.EDQUOT) else 403 if exc.errno == errno.EROFS else 500
         raise HTTPException(status_code=code, detail=filesystem_error_detail(dest_path, exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"上传文件失败: {str(e)}")

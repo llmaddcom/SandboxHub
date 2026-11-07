@@ -53,6 +53,7 @@ SYSTEM_KNOBS: tuple[SystemKnob, ...] = (
     SystemKnob("proxy.read_timeout", "PROXY_READ_TIMEOUT", "代理读超时（秒）"),
     SystemKnob("proxy.connect_timeout", "PROXY_CONNECT_TIMEOUT", "代理连接超时（秒）"),
     SystemKnob("workspace.mount_enabled", "WORKSPACE_MOUNT_ENABLED", "工作区挂载总开关"),
+    SystemKnob("workspace.rclone_mount_command", "RCLONE_MOUNT_COMMAND", "角色目录挂载用的 rclone 子命令（mount2 / mount）"),
     SystemKnob("workspace.rclone_vfs_cache_mode", "RCLONE_VFS_CACHE_MODE", "rclone VFS 缓存模式"),
     SystemKnob("workspace.rclone_vfs_cache_max_size", "RCLONE_VFS_CACHE_MAX_SIZE", "VFS 缓存体积上限"),
     SystemKnob("workspace.rclone_vfs_write_back", "RCLONE_VFS_WRITE_BACK", "文件关闭后回写延迟"),
@@ -259,6 +260,7 @@ class Settings(BaseSettings):
     PROXY_READ_TIMEOUT: float = 330.0
     PROXY_CONNECT_TIMEOUT: float = 10.0
     WORKSPACE_MOUNT_ENABLED: bool = True
+    RCLONE_MOUNT_COMMAND: str = "mount2"
     RCLONE_VFS_CACHE_MODE: str = "full"
     RCLONE_VFS_WRITE_BACK: str = "1s"
     RCLONE_VFS_CACHE_MAX_SIZE: str = "2G"
@@ -267,8 +269,8 @@ class Settings(BaseSettings):
     MOUNT_READY_INTERVAL: float = 0.5
     GATEWAY_MINIO_FORWARD: bool = True
     WORK_AREA_ENABLED: bool = True
-    DOCKER_IMAGE_CODE_V2: str = "sandbox-code:2026.11.06-1"
-    DOCKER_IMAGE_UBUNTU_V2: str = "sandbox-ubuntu:2026.11.06-1"
+    DOCKER_IMAGE_CODE_V2: str = "sandbox-code:2026.11.07-2"
+    DOCKER_IMAGE_UBUNTU_V2: str = "sandbox-ubuntu:2026.11.07-2"
     DOCKER_IMAGE_FS: str = "sandbox-fs:2026.10.06-1"
     WORK_AREA_MAX_PER_ROLE: int = 2
     WORK_AREA_MAX_PER_USER: int = 4

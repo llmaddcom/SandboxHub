@@ -151,3 +151,65 @@ async def test_failure_releases_other_acquired_references() -> None:
     with pytest.raises(RuntimeError, match="mount failed"):
         await mounts.acquire([done, failing])
     assert mounts.refs() == {}
+
+
+async def test_sidecar_mount_passes_exclusions_only_for_v2_self(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from src.manager.fs_sidecar import FsSidecar
+
+    sidecar = FsSidecar.__new__(FsSidecar)
+    calls: list[list[str]] = []
+
+    async def exec_(cmd, env=None):
+        calls.append(cmd)
+        return 0, b"", b""
+
+    sidecar.exec = exec_
+    sidecar.mount_status = AsyncMock(side_effect=lambda: {spec.key: True})
+    for spec, expect in (
+        (RoleMountSpec("self", "b", "roles/r1", "rw", layout_version=2), ["--exclude", "/.cr/**"]),
+        (
+            RoleMountSpec(
+                "self", "b", "roles/r1", "rw", layout_version=2, extra_exclude=("avatar/**",)
+            ),
+            ["--exclude", "/.cr/**", "--exclude", "/avatar/**"],
+        ),
+        (RoleMountSpec("diary", "b", "roles/r1/diary", "ro", layout_version=2), []),
+        (RoleMountSpec("notes", "b", "roles/r1/notes", "rw"), []),
+    ):
+        calls.clear()
+        await sidecar.mount(spec)
+        rclone = next(c for c in calls if c[:2] == ["rclone", "mount2"])
+        assert rclone[2] == f"minio:b/{spec.prefix}"
+        tail = [a for i, a in enumerate(rclone) if a == "--exclude" or (i and rclone[i - 1] == "--exclude")]
+        assert tail == expect
+        assert ("--read-only" in rclone) == (spec.mode == "ro")
+
+
+async def test_sidecar_mount_command_is_configurable(monkeypatch) -> None:
+    """#75：默认 mount2（扩展属性读取返回不支持，而不是 EIO）；mount 可作回退；其他值拒绝。"""
+    from unittest.mock import AsyncMock
+
+    from src.config import settings
+    from src.manager.fs_sidecar import FsSidecar
+
+    sidecar = FsSidecar.__new__(FsSidecar)
+    calls: list[list[str]] = []
+
+    async def exec_(cmd, env=None):
+        calls.append(cmd)
+        return 0, b"", b""
+
+    spec = RoleMountSpec("self", "b", "roles/r1", "rw", layout_version=2)
+    sidecar.exec = exec_
+    sidecar.mount_status = AsyncMock(return_value={spec.key: True})
+    assert settings.RCLONE_MOUNT_COMMAND == "mount2"
+    for command in ("mount2", "mount"):
+        monkeypatch.setattr(settings, "RCLONE_MOUNT_COMMAND", command)
+        calls.clear()
+        await sidecar.mount(spec)
+        assert [c for c in calls if c[0] == "rclone"][0][:2] == ["rclone", command]
+    monkeypatch.setattr(settings, "RCLONE_MOUNT_COMMAND", "cmount")
+    with pytest.raises(RuntimeError, match="rclone_mount_command"):
+        await sidecar.mount(spec)
