@@ -52,6 +52,7 @@ from src.models import (
     RoleMountSpec,
     SandboxType,
     WorkAreaInstance,
+    normalize_self_exclude,
 )
 from src.proxy.forwarder import SANDBOX_TOKEN_HEADER, close_client
 
@@ -142,6 +143,16 @@ def validate_spec(spec: AcquireSpec) -> None:
             )
         if layout.version >= 2 and mount.name == "diary" and mount.mode != "ro":
             raise WorkAreaError(400, "invalid_mount", "日记目录只能只读挂载（mode=ro）")
+        if mount.extra_exclude and not mount.is_v2_self:
+            raise WorkAreaError(
+                400, "invalid_mount", f"exclude 只在布局 v2 的 self 挂载上可用：{mount.name!r}"
+            )
+        try:
+            normalized = normalize_self_exclude(list(mount.extra_exclude))
+        except ValueError as exc:
+            raise WorkAreaError(400, "invalid_mount", str(exc)) from exc
+        if normalized != tuple(mount.extra_exclude):
+            raise WorkAreaError(400, "invalid_mount", "exclude 须是规整后的相对路径（内部错误）")
         names.add(mount.name)
     if spec.workspace_files is not None:
         if layout.version < 2:
@@ -220,6 +231,7 @@ class WorkAreaService:
                     prefix=m["prefix"],
                     mode=m["mode"],
                     layout_version=version,
+                    extra_exclude=normalize_self_exclude(m.get("exclude") or []),
                 )
                 for m in layout
             )
@@ -619,9 +631,18 @@ class WorkAreaService:
             ],
         ]
         mount_layout = [
-            {"name": m.name, "bucket": m.bucket, "prefix": m.prefix, "mode": m.mode}
+            {
+                "name": m.name,
+                "bucket": m.bucket,
+                "prefix": m.prefix,
+                "mode": m.mode,
+                **({"exclude": list(m.extra_exclude)} if m.extra_exclude else {}),
+            }
             for m in instance.mounts
         ]
+        hidden_roots = tuple(
+            dict.fromkeys(d for m in instance.mounts for d in m.hidden_dirs)
+        )
         info = await self._manager.run_wa_container(
             sandbox_id=instance.sandbox_id,
             work_area_id=instance.work_area_id,
@@ -636,6 +657,7 @@ class WorkAreaService:
             network=settings.wa_network_for_mode(spec.network_mode),
             limits=spec.limits or {},
             layout_version=layout.version,
+            hidden_roots=hidden_roots,
         )
         instance.container_info = info
         instance.status = "ready"

@@ -431,7 +431,13 @@ async def test_usage_reports_soft_cap(env, monkeypatch):
 
 
 def _managed(sid: str, wa: str, *, mounts=(SKILLS,), status="running", token="tok", age=3600) -> ManagedContainer:
-    layout = [{"name": m.name, "bucket": m.bucket, "prefix": m.prefix, "mode": m.mode} for m in mounts]
+    layout = [
+        {
+            "name": m.name, "bucket": m.bucket, "prefix": m.prefix, "mode": m.mode,
+            **({"exclude": list(m.extra_exclude)} if m.extra_exclude else {}),
+        }
+        for m in mounts
+    ]
     return ManagedContainer(
         container_id=f"c-{sid}",
         container_name=f"cr-wa-code-{sid}",
@@ -731,3 +737,44 @@ def test_capabilities_list_layout_versions_without_bumping_legacy_field(env):
     caps = service.capabilities()
     assert caps["layout_versions"] == [1, 2]
     assert caps["layout_version"] == 1 and caps["cwd"] == "/workspace/work"
+
+
+# ── 布局 v2：后端附带的 /self 排除规则（#73）────────────────────────────────────
+
+SELF_EX = RoleMountSpec(
+    "self", "bkt", "roles/r1", "rw", layout_version=2, extra_exclude=("avatar/**", ".staging/**")
+)
+
+
+async def test_acquire_v2_self_exclude_reaches_env_label_and_report(env):
+    service, manager, _, _ = env
+    instance, _ = await service.acquire(_v2spec(mounts=[SELF_EX, DIARY], workspace_files=AGENTS))
+    kwargs = manager.run_wa_container.await_args.kwargs
+    assert kwargs["hidden_roots"] == ("/self/.cr", "/self/avatar", "/self/.staging")
+    label = {m["name"]: m for m in kwargs["mount_layout"]}
+    assert label["self"]["exclude"] == ["avatar/**", ".staging/**"] and "exclude" not in label["diary"]
+    targets = {m["target"]: m for m in service.effective_report(instance)["mounts"]}
+    assert targets["/self"]["exclude"] == ["/.cr/**", "/avatar/**", "/.staging/**"]
+
+
+async def test_acquire_v2_rejects_exclude_outside_self(env):
+    service, _, _, _ = env
+    diary = RoleMountSpec(
+        "diary", "bkt", "roles/r1/diary", "ro", layout_version=2, extra_exclude=("x/**",)
+    )
+    with pytest.raises(WorkAreaError) as err:
+        await service.acquire(_v2spec(mounts=[SELF, diary]))
+    assert err.value.reason == "invalid_mount"
+
+
+async def test_startup_adopts_v2_instance_with_self_exclude(env):
+    service, manager, sidecar, _ = env
+    sidecar.mounted[SELF_EX.key] = True
+    sidecar.mounted[DIARY.key] = True
+    v2 = _managed("sb_ex", "wa1", mounts=(SELF_EX, DIARY))
+    v2.labels[LAYOUT_VERSION_LABEL] = "2"
+    manager.list_managed.return_value = [v2]
+    await service.startup()
+    adopted = service.registry.get("sb_ex")
+    assert adopted is not None and adopted.mounts == (SELF_EX, DIARY)
+    assert service.mounts.refs() == {SELF_EX.key: 1, DIARY.key: 1}

@@ -444,3 +444,58 @@ def test_layout_env_keeps_v1_and_describes_v2():
     assert env["SANDBOX_READONLY_ROOTS"].split(":") == [
         "/mnt/drive", "/opt/cr", "/self/diary", "/workspace/AGENTS.md", "/workspace/CLAUDE.md"
     ]
+
+
+# ── 布局 v2：后端附带的 /self 排除规则（#73）────────────────────────────────────
+
+
+def test_normalize_self_exclude_accepts_relative_and_anchored_dirs():
+    from src.models import normalize_self_exclude
+
+    assert normalize_self_exclude(None) == ()
+    assert normalize_self_exclude(["avatar/**", "/.staging/**", "a/b", "/.cr/**", "avatar"]) == (
+        "avatar/**", ".staging/**", "a/b/**", ".cr/**",
+    )
+
+
+@pytest.mark.parametrize(
+    "patterns",
+    [
+        "avatar/**",
+        ["//etc/**"],
+        ["../x/**"],
+        ["a/../b"],
+        ["a/*.tmp"],
+        ["a//b"],
+        [""],
+        [3],
+        ["x"] * 17,
+    ],
+)
+def test_normalize_self_exclude_rejects_invalid(patterns):
+    from src.models import normalize_self_exclude
+
+    with pytest.raises(ValueError):
+        normalize_self_exclude(patterns)
+
+
+def test_v2_self_extra_exclude_rules_hidden_dirs_and_key():
+    self_ = RoleMountSpec(
+        "self", "b", "roles/r1", "rw", layout_version=2, extra_exclude=("avatar/**", ".staging/**", ".cr/**")
+    )
+    assert self_.exclude == ("/.cr/**", "/avatar/**", "/.staging/**")
+    assert self_.hidden_dirs == ("/self/.cr", "/self/avatar", "/self/.staging")
+    assert self_.key != _v2("self", "roles/r1").key
+    assert _v2("self", "roles/r1").hidden_dirs == ("/self/.cr",)
+    assert _v2("diary", "roles/r1/diary", "ro").hidden_dirs == ()
+
+
+def test_build_wa_env_merges_instance_hidden_roots():
+    from src.manager.container_manager import ContainerManager
+
+    manager = ContainerManager.__new__(ContainerManager)
+    manager._build_container_env = lambda sandbox_type, extra_env: {}
+    env = manager._build_wa_env("code", "tok", None, 2, ("/self/.cr", "/self/avatar"))
+    assert env["SANDBOX_HIDDEN_ROOTS"] == "/self/.cr:/self/avatar"
+    v1 = manager._build_wa_env("code", "tok", None, 1, ("/self/avatar",))
+    assert "SANDBOX_HIDDEN_ROOTS" not in v1
