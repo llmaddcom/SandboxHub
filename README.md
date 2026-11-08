@@ -200,7 +200,7 @@ curl -X POST http://localhost:8088/v1/sandboxes/acquire \
 ```
 
 Key/value pairs in `env` are injected as container environment variables at creation time
-(e.g. for in-sandbox CLIs like `skills` / `todo` calling back to the backend). Semantics:
+(e.g. for the platform-projected client `/opt/cr/tools/cr_tools.py` calling back to the backend). Semantics:
 
 - **Creation-time only** — ignored when reusing an existing sandbox for the same
   `(user_id, role_id)` (callers use sliding-renewal tokens, so the initially injected value stays valid);
@@ -492,7 +492,7 @@ is reachable (verified on Docker 29.2.1: container → host gateway port / LAN /
 host → container and container → container on the same network work). The container can then only
 reach the gateway container `cr-host` (`images/gateway`, alpine + socat), attached to both networks,
 which forwards exactly two platform channels to the host: MinIO (dropped once FUSE goes away) and the
-createrole API (memory/todo CLI). Deployment: `SANDBOX_NETWORK` must be a user-defined network
+createrole API (the memory CLI and `/opt/cr/tools/cr_tools.py`). Deployment: `SANDBOX_NETWORK` must be a user-defined network
 (default `cr-sb-net`; delete any old `SANDBOX_NETWORK=bridge` from `.env`), `MINIO_ENDPOINT` becomes a
 host-reachable address, createrole's `SANDBOX_MARKET_CLI_API_BASE` becomes `http://cr-host:<port>` with
 that port listed in `SANDBOX_GATEWAY_FORWARDS`, and the gateway image is built / imported with the
