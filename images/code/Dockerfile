@@ -149,10 +149,11 @@ ARG ENGINE_ALLOW_SCRIPTS=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,protob
 COPY code/install-engines.sh /tmp/install-engines.sh
 RUN bash /tmp/install-engines.sh && rm -f /tmp/install-engines.sh
 
-# ===== 6. 预装单文件 CLI（issue #15/#16/#24/#63：skills / todo / memory / tools）=====
+# ===== 6. 预装单文件 CLI（issue #20：memory）=====
 # code/bin/ 下的脚本装进 /usr/local/bin（去 .py 扩展名，须自带 shebang）。
-# CLI 本体由上游仓维护（createrole 仓 server/infrastructure/sandbox_cli/），落地后
-# 丢进该目录即随镜像预装；目录当前仅 README 占位，构建不因此失败。
+# CLI 本体由上游仓维护，落地后丢进该目录即随镜像预装。待办、技能、外接工具不再预装
+# （#79）：平台把零依赖客户端 /opt/cr/tools/cr_tools.py 随 context 投影进来
+# （createrole_com_api#511），与镜像版本解耦。
 COPY code/bin/ /opt/sandbox-cli/
 RUN set -e; for f in /opt/sandbox-cli/*; do \
         case "$f" in *.md) continue;; esac; \
@@ -187,7 +188,7 @@ RUN mkdir -p /etc/sandbox && { \
       echo "- playwright 浏览器：$(ls /opt/ms-playwright | tr '\n' ' ')（headless chromium，\`playwright screenshot\` 可直接用）"; \
       echo "- 中文字体：$(fc-list :lang=zh family | sort -u | tr '\n' ';' )"; \
       echo; echo "## 命令行工具"; echo; \
-      for c in git curl wget rg fd jq tree less vim nano zip unzip xz tmux rclone gcc make pkg-config todo memory skills tools \
+      for c in git curl wget rg fd jq tree less vim nano zip unzip xz tmux rclone gcc make pkg-config memory \
                file xxd antiword catdoc xls2csv catppt pdftotext pdfinfo pdftoppm pdfimages; do \
         if command -v "$c" >/dev/null 2>&1; then echo "- $c：已装"; else echo "- $c：未装"; fi; done; \
       echo; echo "常见但**没有预装**的工具（断网时不可用，联网时可 apt-get 安装）："; \
@@ -211,8 +212,9 @@ RUN mkdir -p /etc/sandbox && { \
     } > /etc/sandbox/MANIFEST.md && \
     test "$(wc -l < /etc/sandbox/MANIFEST.md)" -gt 40 && \
     grep -q "^pandas==" /etc/sandbox/MANIFEST.md && \
-    grep -q "^- todo：已装" /etc/sandbox/MANIFEST.md && \
-    grep -q "^- tools：已装" /etc/sandbox/MANIFEST.md && \
+    grep -q "^- memory：已装" /etc/sandbox/MANIFEST.md && \
+    ! command -v todo >/dev/null && ! command -v skills >/dev/null && ! command -v tools >/dev/null && \
+    python3 -c 'import sys; assert sys.version_info >= (3, 8)' && \
     grep -q "^- antiword：已装" /etc/sandbox/MANIFEST.md && \
     grep -q "^- fd：已装" /etc/sandbox/MANIFEST.md && \
     grep -q "^- 执行引擎运行时.*pi ${PI_VERSION}，dsh ${DSH_VERSION}，codex-acp ${CODEX_ACP_VERSION}（codex ${CODEX_VERSION}），claude-agent-acp ${CLAUDE_AGENT_ACP_VERSION}（claude-agent-sdk ${CLAUDE_AGENT_SDK_VERSION}）$" /etc/sandbox/MANIFEST.md && \
