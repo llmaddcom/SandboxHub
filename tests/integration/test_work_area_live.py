@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 RAND = uuid.uuid4().hex[:6]
-IMAGE_CODE = os.environ.get("LIVE_IMAGE_CODE", "sandbox-code:2026.11.07-2")
+IMAGE_CODE = os.environ.get("LIVE_IMAGE_CODE", "sandbox-code:2026.11.08-1")
 IMAGE_FS = os.environ.get("LIVE_IMAGE_FS", "sandbox-fs:2026.10.06-1")
 GW_PORT = 18555
 # 测试里所有命令都受这个上限约束（平台对每个 job 生效），单条命令须远短于它
@@ -587,8 +587,12 @@ async def test_work_area_layout_v2_end_to_end(live):
         if os.environ.get("LIVE_EXPECT_V2_IMAGE") == "1":
             code, out = await _sh(a, "cat /etc/codex/managed_config.toml")
             assert '[projects."/workspace"]' in out, out
-            code, out = await _sh(a, "tools --help; grep -c CR_SKILLS_DIR /usr/local/bin/skills")
-            assert "/opt/cr/tools/INDEX.md" in out and "/workspace/context" not in out, out
+            # 待办、技能、外接工具不再预装（#79）：改由平台投影 /opt/cr/tools/cr_tools.py。
+            code, out = await _sh(
+                a, "command -v todo skills tools; command -v memory; python3 -c 'import sys; print(sys.version_info >= (3, 8))'"
+            )
+            assert "/usr/local/bin/memory" in out and "True" in out, out
+            assert "/usr/local/bin/todo" not in out and "/usr/local/bin/tools" not in out, out
 
         # ── 7. Hub 重启：按布局标签收养 ─────────────────────────────────────────
         manager2 = ContainerManager()
