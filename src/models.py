@@ -26,6 +26,8 @@ SESSION_LABEL = "sandboxhub.session"
 MOUNT_LAYOUT_LABEL = "sandboxhub.mount-layout"
 # 实例的目录布局版本（#71）：缺省视为 1（引入本标签之前创建的实例都是 v1）。
 LAYOUT_VERSION_LABEL = "sandboxhub.layout-version"
+# /tmp 绑定到工作区宿主目录的实例（请求带 tmp 规则）：Hub 重启收养后仍知道回收时要按规则清理。
+TMP_BOUND_LABEL = "sandboxhub.tmp-bound"
 
 # 布局 v2（#71，file-up）的角色目录：``self`` = 角色空间根（排除平台保留区 ``.cr/``），
 # ``diary`` = 叠在其上的只读日记。v1 的角色目录一律在 ``/workspace/role/<name>``。
@@ -238,6 +240,8 @@ class WorkAreaInstance:
     layout_version: int = 1
     # 是否持有角色目录挂载引用（创建中途失败时尚未取得，释放时不得多减）
     mounts_held: bool = False
+    # /tmp 是否绑定到工作区的宿主目录（请求带 tmp 规则时）；回收时据此决定要不要按规则清理
+    tmp_bound: bool = False
     acquired_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
     last_active_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
 

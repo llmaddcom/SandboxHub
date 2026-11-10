@@ -32,6 +32,7 @@ from src.config import settings
 from src.manager import layouts
 from src.manager.fs_sidecar import FsOpError
 from src.manager.wa_instances import LAYOUT_VERSION, AcquireSpec, WorkAreaError, WorkAreaService
+from src.manager.work_areas import TmpPolicy
 from src.manager.wa_jobs import TERMINAL_START_PATHS, iso_utc
 from src.models import InputFileSpec, RoleMountSpec, normalize_self_exclude
 from src.proxy.forwarder import forward
@@ -122,6 +123,13 @@ class LimitsModel(BaseModel):
     pids: int = Field(default=0, ge=0)
 
 
+class TmpPolicyModel(BaseModel):
+    """实例 /tmp 的清理规则：回收时是否清空临时文件、超长工具结果全文保留多久（0 = 不按时间清）。"""
+
+    clear_on_release: bool = True
+    outputs_keep_seconds: int = Field(default=0, ge=0)
+
+
 class AcquireV2Request(BaseModel):
     user_id: str
     role_id: str
@@ -140,6 +148,8 @@ class AcquireV2Request(BaseModel):
     env: Optional[dict[str, str]] = None
     policy: Optional[v1.PolicySpec] = None
     limits: LimitsModel = LimitsModel()
+    # 布局 v2：实例 /tmp 的清理规则。给出时 /tmp 落在工作区的宿主目录；None = /tmp 仍是容器临时层
+    tmp: Optional[TmpPolicyModel] = None
 
 
 class InputsRequest(BaseModel):
@@ -219,6 +229,14 @@ async def acquire(work_area_id: str, req: AcquireV2Request):
         env=req.env,
         network_mode=mode,
         limits=req.limits.model_dump(),
+        tmp=(
+            TmpPolicy(
+                clear_on_release=req.tmp.clear_on_release,
+                outputs_keep_seconds=req.tmp.outputs_keep_seconds,
+            )
+            if req.tmp is not None
+            else None
+        ),
     )
     try:
         instance, reused = await service.acquire(spec)
@@ -355,7 +373,7 @@ async def usage(work_area_id: str, fresh: bool = False):
 @router.get("/work-areas/{work_area_id}/files", dependencies=_auth)
 async def list_files(
     work_area_id: str,
-    root: Literal["work", "deliverables"] = "deliverables",
+    root: Literal["work", "deliverables", "tmp"] = "deliverables",
     max_files: Optional[int] = Query(default=None, ge=1),
 ):
     """``observed_at``：开始列举前取的 Hub 时钟，与 ``/jobs`` 的时间同源可比。"""
@@ -383,7 +401,7 @@ async def list_jobs(work_area_id: str):
 async def file_content(
     work_area_id: str,
     path: str,
-    root: Literal["work", "deliverables"] = "deliverables",
+    root: Literal["work", "deliverables", "tmp"] = "deliverables",
 ):
     """文件内容 + 头 ``X-File-Size`` / ``X-File-Mtime-Ns`` / ``X-File-Sha256`` / ``X-File-Stable``
     （读取前后 size、mtime 不变为 1）。归档点据此判定稳定性。"""
@@ -426,7 +444,7 @@ async def import_files(
 @router.post("/work-areas/{work_area_id}/files/checksums", dependencies=_auth)
 async def file_checksums(
     work_area_id: str, payload: ChecksumsRequest,
-    root: Literal["work", "deliverables"] = "work",
+    root: Literal["work", "deliverables", "tmp"] = "work",
 ):
     """按显式路径批量核对指纹；保留普通文件、稳定性和路径隔离检查。"""
     try:

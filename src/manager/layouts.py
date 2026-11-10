@@ -21,7 +21,8 @@ v2（借 Linux 目录约定，用根目录区分归属）::
     /self/diary               ro  日记（叠在 /self 之上的只读挂载）
     /mnt/drive                ro  授权文件（硬链接视图，机制同 v1 inputs）
     /opt/cr                   ro  平台生成文件（同 v1 context，可嵌套）
-    /tmp                      rw  容器临时层，实例回收即清
+    /tmp                      rw  请求带 tmp 规则时是工作区的宿主目录 tmp/（实例回收后仍可列举、读取，
+                                  按规则清理）；不带时是容器临时层，实例回收即清
 
 v2 的工作区仍是宿主 ``work-areas/<id>/{work,deliverables}``：容器视图里工作区卷就是
 ``/workspace``，归档、导入、统计的 ``root`` 语义与 v1 相同，已有工作区不需要搬迁。

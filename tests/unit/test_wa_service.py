@@ -778,3 +778,112 @@ async def test_startup_adopts_v2_instance_with_self_exclude(env):
     adopted = service.registry.get("sb_ex")
     assert adopted is not None and adopted.mounts == (SELF_EX, DIARY)
     assert service.mounts.refs() == {SELF_EX.key: 1, DIARY.key: 1}
+
+
+# ── 实例 /tmp 落在工作区的宿主目录（请求带 tmp 规则）────────────────────────────
+
+from src.manager.work_areas import TmpPolicy  # noqa: E402
+from src.models import TMP_BOUND_LABEL  # noqa: E402
+
+
+def _cleartmp_calls(sidecar) -> list[tuple]:
+    return [c.args for c in sidecar.fsops.await_args_list if c.args and c.args[0] == "cleartmp"]
+
+
+async def test_v2_without_tmp_policy_keeps_container_tmp(env):
+    service, manager, sidecar, _ = env
+    instance, _ = await service.acquire(_v2spec(mounts=[SELF, DIARY]))
+    binds = {b.target for b in manager.run_wa_container.await_args.kwargs["binds"]}
+    assert "/tmp" not in binds and instance.tmp_bound is False
+    assert manager.run_wa_container.await_args.kwargs["tmp_bound"] is False
+    assert all(m["target"] != "/tmp" for m in service.effective_report(instance)["mounts"])
+    await service.release(instance.sandbox_id)
+    assert _cleartmp_calls(sidecar) == []
+    assert not (sidecar.root / "work-areas" / "wa1" / "tmp").exists()
+
+
+async def test_v2_tmp_policy_binds_host_tmp_and_clears_on_release(env):
+    service, manager, sidecar, _ = env
+    instance, _ = await service.acquire(_v2spec(mounts=[SELF, DIARY], tmp=TmpPolicy()))
+    kwargs = manager.run_wa_container.await_args.kwargs
+    binds = {b.target: b for b in kwargs["binds"]}
+    host_tmp = sidecar.root / "work-areas" / "wa1" / "tmp"
+    assert binds["/tmp"].source == str(host_tmp) and not binds["/tmp"].read_only
+    assert host_tmp.is_dir() and (host_tmp.stat().st_mode & 0o7777) == 0o1777
+    assert kwargs["tmp_bound"] is True and instance.tmp_bound
+    assert {"target": "/tmp", "mode": "rw", "source": "work_area_tmp"} in service.effective_report(instance)["mounts"]
+    # 启动前清一遍（默认规则：清空除 outputs/ 外的全部），回收时再清一遍
+    assert _cleartmp_calls(sidecar) == [("cleartmp", "wa1", "all", "0")]
+    await service.release(instance.sandbox_id)
+    assert _cleartmp_calls(sidecar) == [("cleartmp", "wa1", "all", "0")] * 2
+    assert host_tmp.is_dir()  # 路径固定：实例没了目录还在
+
+
+async def test_v2_tmp_keep_files_only_sweeps_runtime_at_start(env):
+    service, manager, sidecar, _ = env
+    policy = TmpPolicy(clear_on_release=False, outputs_keep_seconds=3600)
+    instance, _ = await service.acquire(_v2spec(mounts=[SELF, DIARY], tmp=policy))
+    assert _cleartmp_calls(sidecar) == [("cleartmp", "wa1", "runtime", "3600")]
+    await service.release(instance.sandbox_id)
+    assert _cleartmp_calls(sidecar)[-1] == ("cleartmp", "wa1", "none", "3600")
+    # 不清临时文件、也不按时间清全文：回收时什么都不做
+    sidecar.fsops.reset_mock()
+    instance, _ = await service.acquire(
+        _v2spec("wa2", mounts=[SELF, DIARY], tmp=TmpPolicy(clear_on_release=False))
+    )
+    await service.release(instance.sandbox_id)
+    assert _cleartmp_calls(sidecar) == [("cleartmp", "wa2", "runtime", "0")]
+
+
+async def test_v2_tmp_policy_follows_latest_request_and_survives_restart(env):
+    service, manager, sidecar, _ = env
+    first, _ = await service.acquire(_v2spec(mounts=[SELF, DIARY], tmp=TmpPolicy()))
+    again, reused = await service.acquire(
+        _v2spec(mounts=[SELF, DIARY], tmp=TmpPolicy(clear_on_release=False))
+    )
+    assert reused and again.sandbox_id == first.sandbox_id
+    assert service.work_areas.load_tmp_policy("wa1") == TmpPolicy(clear_on_release=False)
+    sidecar.fsops.reset_mock()
+    await service.release(first.sandbox_id)
+    assert _cleartmp_calls(sidecar) == []
+
+
+async def test_v2_tmp_rule_does_not_rebuild_running_instance(env):
+    """在跑的实例创建时没带规则：不为绑定 /tmp 重建它，等它自然回收后下次再绑。"""
+    service, manager, sidecar, _ = env
+    first, _ = await service.acquire(_v2spec(mounts=[SELF, DIARY]))
+    second, reused = await service.acquire(_v2spec(mounts=[SELF, DIARY], tmp=TmpPolicy()))
+    assert reused and second.sandbox_id == first.sandbox_id and not second.tmp_bound
+    assert all(m["target"] != "/tmp" for m in service.effective_report(second)["mounts"])
+    await service.release(first.sandbox_id)
+    assert _cleartmp_calls(sidecar) == []
+    third, _ = await service.acquire(_v2spec(mounts=[SELF, DIARY], tmp=TmpPolicy()))
+    assert third.tmp_bound
+
+
+async def test_tmp_policy_rejected_on_layout_v1(env):
+    service, _, _, _ = env
+    with pytest.raises(WorkAreaError) as ei:
+        await service.acquire(_spec(tmp=TmpPolicy()))
+    assert ei.value.reason == "tmp_unsupported"
+
+
+async def test_adopted_instance_remembers_tmp_binding(env):
+    service, manager, sidecar, _ = env
+    sidecar.mounted[SELF.key] = True
+    sidecar.mounted[DIARY.key] = True
+    managed = _managed("sb_tmp", "wa1", mounts=(SELF, DIARY))
+    managed.labels[LAYOUT_VERSION_LABEL] = "2"
+    managed.labels[TMP_BOUND_LABEL] = "true"
+    manager.list_managed.return_value = [managed]
+    (sidecar.root / "work-areas" / "wa1").mkdir(parents=True)
+    service.work_areas.save_tmp_policy("wa1", TmpPolicy(outputs_keep_seconds=60))
+    await service.startup()
+    assert service.registry.get("sb_tmp").tmp_bound
+    await service.release("sb_tmp")
+    assert _cleartmp_calls(sidecar) == [("cleartmp", "wa1", "all", "60")]
+
+
+def test_capabilities_report_tmp_root(env):
+    service, _, _, _ = env
+    assert service.capabilities()["tmp_root"] is True
