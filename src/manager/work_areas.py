@@ -5,6 +5,9 @@
 
 - ``work-areas/<work_area_id>/{work,deliverables}``：工作区，实例以读写 bind 进入；
   实例回收后保留，删除工作区须显式调用。读取、统计、导入、删除经 cr-fs（root、不跟随软链接）。
+- ``work-areas/<work_area_id>/tmp``：实例 ``/tmp`` 的宿主目录（布局 v2、请求带 ``tmp`` 规则时
+  以读写 bind 进入）。路径固定、实例回收后仍可列举和读取；里面的东西留不留由清理规则决定
+  （``tmp-policy.json`` 记最近一次请求下发的规则，不在 bind 范围内）。占用计入工作区用量。
 - ``instances/<sandbox_id>/{inputs,context}``：每实例的只读视图，由 Hub 写入；实例释放即删。
   ``inputs.json`` 是 inputs 清单（不在 bind 范围内，租户看不到）。布局 v2 另有
   ``workspace-files/{AGENTS.md,CLAUDE.md}``：以单文件只读 bind 进 ``/workspace``，更新须就地改写
@@ -23,6 +26,7 @@ import stat
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
@@ -34,8 +38,30 @@ from src.manager.layouts import WORKSPACE_FILE_MAX_BYTES, WORKSPACE_FILES
 from src.manager.paths import require_id, split_relative
 
 WORK_AREA_ROOTS = ("work", "deliverables")
+# 实例 /tmp 的宿主目录：可列举、可读取，不接受导入。
+TMP_ROOT = "tmp"
+READ_ROOTS = (*WORK_AREA_ROOTS, TMP_ROOT)
+TMP_POLICY_FILE = "tmp-policy.json"
 CONTEXT_MAX_FILE_BYTES = 1024 * 1024
 CONTEXT_MAX_FILES = 64
+
+
+@dataclass(frozen=True)
+class TmpPolicy:
+    """实例 ``/tmp`` 的清理规则（随 acquire 下发）。
+
+    ``clear_on_release``：实例回收时清空除 ``outputs/`` 外的临时文件。
+    ``outputs_keep_seconds``：``outputs/`` 里超长工具结果全文的保留时长，0 = 不按时间清。
+    """
+
+    clear_on_release: bool = True
+    outputs_keep_seconds: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "clear_on_release": self.clear_on_release,
+            "outputs_keep_seconds": self.outputs_keep_seconds,
+        }
 
 
 def _with_soft_cap(data: dict, *, cached: bool) -> dict:
@@ -63,6 +89,47 @@ class WorkAreas:
 
     async def ensure(self, work_area_id: str) -> None:
         await asyncio.to_thread(self._ensure_sync, work_area_id)
+
+    # ── 实例 /tmp 的宿主目录 ────────────────────────────────────────────────────
+
+    def tmp_dir(self, work_area_id: str) -> Path:
+        return self.host_dir(work_area_id) / TMP_ROOT
+
+    def _ensure_tmp_sync(self, work_area_id: str) -> None:
+        path = self.tmp_dir(work_area_id)
+        path.mkdir(parents=True, exist_ok=True)
+        # 与容器里的 /tmp 一致：所有用户可写、带粘滞位。目录属主是 Hub 用户，chmod 不需要 cr-fs。
+        path.chmod(0o1777)
+
+    async def ensure_tmp(self, work_area_id: str) -> None:
+        await asyncio.to_thread(self._ensure_tmp_sync, work_area_id)
+
+    def save_tmp_policy(self, work_area_id: str, policy: "TmpPolicy") -> None:
+        """记下最近一次请求下发的清理规则：实例回收时按它清，Hub 重启后仍在。"""
+        target = self.host_dir(work_area_id) / TMP_POLICY_FILE
+        tmp = target.with_suffix(".json.new")
+        tmp.write_text(json.dumps(policy.to_dict()))
+        os.replace(tmp, target)
+
+    def load_tmp_policy(self, work_area_id: str) -> Optional["TmpPolicy"]:
+        """没有记录（工作区从未带规则申请过）返回 None：不绑定 /tmp，也不清理。"""
+        try:
+            data = json.loads((self.host_dir(work_area_id) / TMP_POLICY_FILE).read_text())
+            return TmpPolicy(
+                clear_on_release=bool(data["clear_on_release"]),
+                outputs_keep_seconds=max(0, int(data["outputs_keep_seconds"])),
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    async def clear_tmp(self, work_area_id: str, mode: str, outputs_keep_seconds: int) -> dict:
+        """经 cr-fs 清实例 /tmp 的宿主目录（``mode``：all / runtime / none，见 fsops ``cleartmp``）。"""
+        require_id(work_area_id, "工作区 ID")
+        result = await self._fs.fsops(
+            "cleartmp", work_area_id, mode, str(max(0, int(outputs_keep_seconds)))
+        )
+        self._usage_cache.pop(work_area_id, None)
+        return result
 
     def _clear_v2_mountpoints_sync(self, work_area_id: str) -> list[str]:
         """布局 v2 把 deliverables 与平台文件叠挂在宿主 ``work/`` 里：``work/deliverables`` 须是目录、
@@ -112,7 +179,7 @@ class WorkAreas:
 
     async def list_files(self, work_area_id: str, root: str, max_files: Optional[int] = None) -> dict:
         require_id(work_area_id, "工作区 ID")
-        if root not in WORK_AREA_ROOTS:
+        if root not in READ_ROOTS:
             raise ValueError(f"非法目录：{root!r}")
         limit = max(1, min(max_files or settings.WORK_AREA_LIST_MAX_FILES, settings.WORK_AREA_LIST_MAX_FILES))
         return await self._fs.fsops("list", work_area_id, root, str(limit))
@@ -120,7 +187,7 @@ class WorkAreas:
     async def read(self, work_area_id: str, root: str, relpath: str) -> ReadResult:
         """把文件读到 Hub 暂存区（调用方负责删除 ``result.path``）。"""
         require_id(work_area_id, "工作区 ID")
-        if root not in WORK_AREA_ROOTS:
+        if root not in READ_ROOTS:
             raise ValueError(f"非法目录：{root!r}")
         split_relative(relpath)
         staging = self._fs.host_path("staging")
@@ -135,7 +202,7 @@ class WorkAreas:
     async def checksums(self, work_area_id: str, root: str, paths: list[str]) -> dict:
         """一次 cr-fs 调用核对最多 128 个文件，不把私密正文传回 Hub。"""
         require_id(work_area_id, "工作区 ID")
-        if root not in WORK_AREA_ROOTS or not 1 <= len(paths) <= 128:
+        if root not in READ_ROOTS or not 1 <= len(paths) <= 128:
             raise ValueError("指纹目录或路径数量无效")
         for path in paths:
             split_relative(path)

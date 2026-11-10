@@ -159,7 +159,7 @@ def test_read_missing_and_invalid(root):
         fsops.read_file("wa1", "work", "../../wa2/work/secret.txt", io.BytesIO(), io.StringIO())
     assert ei.value.code == fsops.EXIT_INVALID
     with pytest.raises(fsops.OpError) as ei:
-        fsops.read_file("wa1", "tmp", "x", io.BytesIO(), io.StringIO())
+        fsops.read_file("wa1", "inputs", "x", io.BytesIO(), io.StringIO())
     assert ei.value.code == fsops.EXIT_INVALID
 
 
@@ -231,3 +231,105 @@ def test_main_exit_codes(root, capsys):
 
 def test_mount_status_ignores_unrelated_mounts(root):
     assert fsops.mount_status() == {"mounts": {}}
+
+
+# ── 实例 /tmp 的宿主目录（tmp 根）与清理规则 ──────────────────────────────────
+
+
+def _tmp(root: Path, wa: str = "wa1") -> Path:
+    path = root / "work-areas" / wa / "tmp"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_tmp_root_is_listable_and_readable_but_not_importable(root):
+    tmp = _tmp(root)
+    (tmp / "outputs" / "t1").mkdir(parents=True)
+    (tmp / "outputs" / "t1" / "0-c.txt").write_text("full text")
+    (tmp / "x.txt").write_text("scratch")
+    listed = fsops.list_files("wa1", "tmp", 100)
+    assert sorted(f["path"] for f in listed["files"]) == ["outputs/t1/0-c.txt", "x.txt"]
+    assert fsops.stat_file("wa1", "tmp", "x.txt")["size"] == 7
+    tar = _tar(root, [("a.txt", b"a")])
+    with pytest.raises(fsops.OpError) as ei:
+        fsops.import_tar("wa1", "tmp", tar)
+    assert ei.value.code == fsops.EXIT_INVALID
+
+
+def test_tmp_listing_does_not_follow_symlink_to_other_work_area(root):
+    tmp = _tmp(root)
+    os.symlink(_wa(root, "wa2"), tmp / "peek")
+    listed = fsops.list_files("wa1", "tmp", 100)
+    assert listed["files"] == []
+    with pytest.raises(fsops.OpError) as ei:
+        fsops.stat_file("wa1", "tmp", "peek/secret.txt")
+    assert ei.value.code == fsops.EXIT_NOT_REGULAR
+
+
+def test_cleartmp_all_keeps_outputs(root):
+    tmp = _tmp(root)
+    (tmp / "outputs" / "t1").mkdir(parents=True)
+    (tmp / "outputs" / "t1" / "0-c.txt").write_text("full")
+    (tmp / "x.txt").write_text("scratch")
+    (tmp / "cr-jobs").mkdir()
+    (tmp / "cr-jobs" / "j_1.origin").write_text("{}")
+    (tmp / "build").mkdir()
+    (tmp / "build" / "a.o").write_text("o")
+    result = fsops.clear_tmp("wa1", "all", 0)
+    assert result == {"exists": True, "removed": 3, "outputs_removed": 0}
+    assert sorted(p.name for p in tmp.iterdir()) == ["outputs"]
+    assert (tmp / "outputs" / "t1" / "0-c.txt").read_text() == "full"
+
+
+def test_cleartmp_runtime_only_removes_stale_runtime_files(root):
+    tmp = _tmp(root)
+    (tmp / "x.txt").write_text("scratch")
+    (tmp / "notes").mkdir()
+    for name in ("cr-jobs", "cr-procs", "tmux-0", ".X11-unix"):
+        (tmp / name).mkdir()
+    (tmp / ".X1-lock").write_text("1")
+    os.mkfifo(tmp / "pipe")
+    result = fsops.clear_tmp("wa1", "runtime", 0)
+    assert result["removed"] == 6
+    assert sorted(p.name for p in tmp.iterdir()) == ["notes", "x.txt"]
+
+
+def test_cleartmp_none_only_prunes_outputs(root):
+    tmp = _tmp(root)
+    (tmp / "x.txt").write_text("scratch")
+    old = tmp / "outputs" / "old"
+    new = tmp / "outputs" / "new"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (old / "0-a.txt").write_text("old")
+    (new / "0-b.txt").write_text("new")
+    now = 1_000_000.0
+    os.utime(old / "0-a.txt", (now - 7200, now - 7200))
+    os.utime(new / "0-b.txt", (now - 60, now - 60))
+    result = fsops.clear_tmp("wa1", "none", 3600, now=now)
+    assert result == {"exists": True, "removed": 0, "outputs_removed": 1}
+    assert (tmp / "x.txt").exists()
+    assert not old.exists()  # 空目录一并收掉
+    assert (new / "0-b.txt").read_text() == "new"
+
+
+def test_cleartmp_does_not_follow_symlinks(root):
+    tmp = _tmp(root)
+    os.symlink(_wa(root, "wa2"), tmp / "peek")
+    fsops.clear_tmp("wa1", "all", 0)
+    assert not (tmp / "peek").exists() and not (tmp / "peek").is_symlink()
+    assert (_wa(root, "wa2") / "secret.txt").read_text() == "other tenant"
+    # outputs 被换成指向别的工作区的软链接：不进入、不删对面的文件
+    os.symlink(_wa(root, "wa2"), tmp / "outputs")
+    os.utime(_wa(root, "wa2") / "secret.txt", (1, 1))
+    result = fsops.clear_tmp("wa1", "all", 10)
+    assert result["outputs_removed"] == 0
+    assert (_wa(root, "wa2") / "secret.txt").exists()
+
+
+def test_cleartmp_missing_dir_and_bad_args(root):
+    assert fsops.clear_tmp("wa1", "all", 0) == {"exists": False, "removed": 0, "outputs_removed": 0}
+    with pytest.raises(fsops.OpError):
+        fsops.clear_tmp("wa1", "everything", 0)
+    with pytest.raises(fsops.OpError):
+        fsops.clear_tmp("wa1", "all", -1)

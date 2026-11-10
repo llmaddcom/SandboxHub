@@ -457,3 +457,21 @@ async def test_acquire_v2_invalid_self_exclude_is_invalid_mount(client, service,
         r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
     assert r.status_code == 400 and r.json()["detail"]["reason"] == "invalid_mount"
     service.acquire.assert_not_called()
+
+
+async def test_acquire_v2_maps_tmp_policy(client, service, with_key):
+    body = {
+        "user_id": "u1", "role_id": "r1", "layout_version": 2,
+        "tmp": {"clear_on_release": False, "outputs_keep_seconds": 86400},
+    }
+    async with client:
+        r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
+        assert r.status_code == 200, r.text
+        spec = service.acquire.await_args.args[0]
+        assert spec.tmp.clear_on_release is False and spec.tmp.outputs_keep_seconds == 86400
+        body.pop("tmp")
+        r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
+        assert service.acquire.await_args.args[0].tmp is None
+        body["tmp"] = {"outputs_keep_seconds": -1}
+        r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
+        assert r.status_code == 422

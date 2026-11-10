@@ -4,11 +4,12 @@
 工作区目录由租户容器以 root 写入，Hub 进程（普通用户）可能无权读取或删除，
 因此读取、统计、导入、删除都在 cr-fs 内完成。
 
-所有路径限定在 ``$CRFS_ROOT/work-areas/<work_area_id>/<root>/`` 之下；逐级以
+所有路径限定在 ``$CRFS_ROOT/work-areas/<work_area_id>/<root>/`` 之下（``root`` 为 work、deliverables，
+只读命令另接受 tmp：实例 ``/tmp`` 的宿主目录）；逐级以
 ``O_NOFOLLOW`` 相对目录 fd 打开（遍历用 ``os.fwalk``），不跟随租户写入的软链接（软链接可能
 指向其他工作区）。租户实例可能同时在写，先检查后操作的路径字符串会被换成软链接，故一律不用。
 
-命令：usage / list / stat / read / mkwa / rmwa / import / mounts（见 ``main``）。stdout 输出 JSON
+命令：usage / list / stat / read / mkwa / rmwa / import / cleartmp / mounts（见 ``main``）。stdout 输出 JSON
 （``read`` 输出文件内容，读前读后的 size/mtime 写 stderr）。
 
 退出码：0 成功；2 参数非法；3 不存在；4 不是普通文件或路径含软链接。
@@ -25,9 +26,18 @@ import stat
 import sys
 import tarfile
 import threading
+import time
 
 CRFS_ROOT = os.environ.get("CRFS_ROOT", "/srv")
 WORK_AREA_ROOTS = ("work", "deliverables")
+# 实例 /tmp 的宿主目录：只读命令（list / stat / read / checksums）可用，不接受导入。
+TMP_ROOT = "tmp"
+READ_ROOTS = (*WORK_AREA_ROOTS, TMP_ROOT)
+# 超长工具结果全文所在的子目录：清空临时文件时保留，按保留时长单独清理。
+TMP_OUTPUTS = "outputs"
+# 上一个实例留下的运行时文件（任务日志、进程目录、引擎主目录、tmux 与 X 的套接字和锁）：
+# 新实例启动前总要清掉，否则会被当成还在跑的任务，或让桌面服务起不来。
+_RUNTIME_PREFIXES = ("cr-", "tmux-", ".")
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _CHUNK = 1024 * 1024
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -49,8 +59,8 @@ def work_area_dir(work_area_id: str) -> str:
     return os.path.join(CRFS_ROOT, "work-areas", work_area_id)
 
 
-def _root_dir(work_area_id: str, root: str) -> str:
-    if root not in WORK_AREA_ROOTS:
+def _root_dir(work_area_id: str, root: str, *, roots: tuple[str, ...] = READ_ROOTS) -> str:
+    if root not in roots:
         raise OpError(EXIT_INVALID, f"非法目录：{root!r}")
     return os.path.join(work_area_dir(work_area_id), root)
 
@@ -268,6 +278,95 @@ def remove_work_area(work_area_id: str) -> dict:
     return {"removed": True}
 
 
+def _remove_entry(dir_fd: int, name: str) -> bool:
+    """删掉目录 fd 下的一项（不跟随软链接）；目录整棵删除。删不掉返回 False。"""
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    try:
+        if stat.S_ISDIR(st.st_mode):
+            shutil.rmtree(name, dir_fd=dir_fd)
+        else:
+            os.unlink(name, dir_fd=dir_fd)
+    except OSError:
+        return False
+    return True
+
+
+def _prune_outputs(tmp_fd: int, keep_seconds: int, now: float) -> int:
+    """删掉 ``outputs/`` 里修改时间早于保留时长的普通文件，再收掉空目录；返回删除的文件数。"""
+    try:
+        fd = os.open(TMP_OUTPUTS, _DIR_FLAGS, dir_fd=tmp_fd)
+    except OSError:
+        return 0
+    removed = 0
+    cutoff = now - keep_seconds
+    try:
+        for _dirpath, dirnames, filenames, dirfd in os.fwalk(
+            dir_fd=fd, topdown=False, follow_symlinks=False
+        ):
+            for name in filenames:
+                try:
+                    st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+                    if st.st_mtime < cutoff:
+                        os.unlink(name, dir_fd=dirfd)
+                        removed += 1
+                except OSError:
+                    continue
+            for name in dirnames:
+                try:
+                    os.rmdir(name, dir_fd=dirfd)
+                except OSError:
+                    continue
+    finally:
+        os.close(fd)
+    return removed
+
+
+def clear_tmp(work_area_id: str, mode: str, outputs_keep_seconds: int, now: float | None = None) -> dict:
+    """按清理规则清实例 ``/tmp`` 的宿主目录。
+
+    ``mode``：``all`` 清掉除 ``outputs/`` 外的全部内容；``runtime`` 只清上一个实例的运行时文件
+    （名字以 ``cr-``、``tmux-``、``.`` 开头的项，以及套接字、管道等非普通文件）；``none`` 不清。
+    ``outputs_keep_seconds`` > 0 时另删 ``outputs/`` 里早于该时长的全文，0 = 不按时间清。
+    全程相对目录 fd 操作，不跟随租户留下的软链接。
+    """
+    if mode not in ("all", "runtime", "none"):
+        raise OpError(EXIT_INVALID, f"非法清理方式：{mode!r}")
+    if outputs_keep_seconds < 0:
+        raise OpError(EXIT_INVALID, "保留时长不能为负")
+    base = os.path.join(work_area_dir(work_area_id), TMP_ROOT)
+    try:
+        fd = os.open(base, _DIR_FLAGS)
+    except FileNotFoundError:
+        return {"exists": False, "removed": 0, "outputs_removed": 0}
+    except OSError as exc:
+        raise OpError(EXIT_NOT_REGULAR, "tmp 不是目录") from exc
+    removed = outputs_removed = 0
+    try:
+        if mode != "none":
+            for name in sorted(os.listdir(fd)):
+                if name == TMP_OUTPUTS:
+                    continue
+                if mode == "runtime" and not name.startswith(_RUNTIME_PREFIXES):
+                    try:
+                        st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+                        continue
+                if _remove_entry(fd, name):
+                    removed += 1
+        if outputs_keep_seconds > 0:
+            outputs_removed = _prune_outputs(
+                fd, outputs_keep_seconds, time.time() if now is None else now
+            )
+    finally:
+        os.close(fd)
+    return {"exists": True, "removed": removed, "outputs_removed": outputs_removed}
+
+
 def _write_member(dest: str, parts: list[str], member: tarfile.TarInfo, source) -> None:
     parent = _open_parent(dest, parts, create=True)
     try:
@@ -297,7 +396,7 @@ def import_tar(work_area_id: str, root: str, tar_path: str) -> dict:
     staging = os.path.join(CRFS_ROOT, "staging") + os.sep
     if not os.path.realpath(tar_path).startswith(staging):
         raise OpError(EXIT_INVALID, f"tar 须位于 {staging}")
-    dest = _root_dir(work_area_id, root)
+    dest = _root_dir(work_area_id, root, roots=WORK_AREA_ROOTS)
     os.makedirs(dest, mode=0o755, exist_ok=True)
     count = 0
     total = 0
@@ -391,6 +490,8 @@ def main(argv: list[str]) -> int:
             result = remove_work_area(args[0])
         elif cmd == "import" and len(args) == 3:
             result = import_tar(*args)
+        elif cmd == "cleartmp" and len(args) == 3:
+            result = clear_tmp(args[0], args[1], int(args[2]))
         elif cmd == "mounts" and not args:
             json.dump(mount_status(), sys.stdout)
             sys.stdout.write("\n")

@@ -36,9 +36,10 @@ from src.manager.netguard import NetGuard, SelfTest
 from src.manager.paths import valid_id, valid_mount_name, valid_prefix
 from src.manager.wa_jobs import JOB_ORIGIN_HEADER, JobLedger, iso_utc, parse_report
 from src.manager.wa_registry import LimitExceeded, WorkAreaRegistry
-from src.manager.work_areas import InstanceDirs, WorkAreas, validate_workspace_files
+from src.manager.work_areas import InstanceDirs, TmpPolicy, WorkAreas, validate_workspace_files
 from src.models import (
     LAYOUT_VERSION_LABEL,
+    TMP_BOUND_LABEL,
     MOUNT_LAYOUT_LABEL,
     ROLE_LABEL,
     SANDBOX_ID_LABEL,
@@ -95,6 +96,9 @@ class AcquireSpec:
     layout_version: int = LAYOUT_VERSION
     # 布局 v2：/workspace 根的只读平台文件（AGENTS.md、CLAUDE.md）；None = 不变
     workspace_files: Optional[dict[str, str]] = None
+    # 布局 v2：实例 /tmp 的清理规则。给出时 /tmp 落在工作区的宿主目录（实例回收后仍可读）；
+    # None = 调用方不认识这项能力，/tmp 仍是容器临时层。
+    tmp: Optional[TmpPolicy] = None
 
 
 def validate_spec(spec: AcquireSpec) -> None:
@@ -163,6 +167,11 @@ def validate_spec(spec: AcquireSpec) -> None:
             validate_workspace_files(spec.workspace_files)
         except ValueError as exc:
             raise WorkAreaError(400, "invalid_workspace_files", str(exc)) from exc
+    if spec.tmp is not None:
+        if layout.version < 2:
+            raise WorkAreaError(400, "tmp_unsupported", "tmp 规则只在布局 v2 可用")
+        if spec.tmp.outputs_keep_seconds < 0:
+            raise WorkAreaError(400, "invalid_request", "tmp.outputs_keep_seconds 不能为负")
     if spec.inputs is not None:
         try:
             validate_inputs(spec.inputs)
@@ -269,6 +278,7 @@ class WorkAreaService:
             session_id=labels.get(SESSION_LABEL, ""),
             network_mode=network_mode,
             layout_version=version,
+            tmp_bound=labels.get(TMP_BOUND_LABEL) == "true",
         )
 
     async def _adopt(
@@ -321,6 +331,8 @@ class WorkAreaService:
             {
                 "layout_version": LAYOUT_VERSION,
                 "layout_versions": list(layouts.SUPPORTED_LAYOUTS),
+                # 实例 /tmp 可落在工作区的宿主目录（acquire 带 tmp 规则；文件接口的 tmp 根）
+                "tmp_root": True,
                 "cwd": CWD,
                 "limits": {
                     "max_per_role": settings.WORK_AREA_MAX_PER_ROLE,
@@ -369,6 +381,11 @@ class WorkAreaService:
                 ],
                 {"target": layout.inputs_target, "mode": "ro", "source": "inputs"},
                 {"target": layout.context_target, "mode": "ro", "source": "context"},
+                *(
+                    [{"target": "/tmp", "mode": "rw", "source": "work_area_tmp"}]
+                    if instance.tmp_bound
+                    else []
+                ),
             ]
         else:
             base_mounts = [
@@ -505,7 +522,8 @@ class WorkAreaService:
             and await self._manager.is_healthy(info.container_ip)
         )
         same_shape = (
-            existing.layout_version == spec.layout_version
+            existing.tmp_bound == (spec.tmp is not None)
+            and existing.layout_version == spec.layout_version
             and existing.sandbox_type == spec.sandbox_type
             and existing.mount_keys == tuple(sorted(m.key for m in spec.mounts))
             and {m.target for m in existing.mounts} == {m.target for m in spec.mounts}
@@ -530,6 +548,11 @@ class WorkAreaService:
             await self._apply_views(
                 existing, spec.inputs, spec.context, spec.workspace_files
             )
+            if spec.tmp is not None:
+                # 规则可能被热改：以最近一次请求为准
+                await asyncio.to_thread(
+                    self.work_areas.save_tmp_policy, existing.work_area_id, spec.tmp
+                )
             await asyncio.to_thread(
                 self._save_origin,
                 existing,
@@ -587,6 +610,16 @@ class WorkAreaService:
             spec.workspace_files if layout.version >= 2 else None,
         )
         sources = self.work_areas.bind_sources(instance.work_area_id)
+        tmp_binds: list[Bind] = []
+        if spec.tmp is not None and layout.version >= 2:
+            await self.work_areas.ensure_tmp(instance.work_area_id)
+            await asyncio.to_thread(
+                self.work_areas.save_tmp_policy, instance.work_area_id, spec.tmp
+            )
+            # 上一个实例留下的运行时文件（任务日志、套接字、锁）总要清掉；回收时没清成的也在这里补
+            await self._clear_tmp(instance.work_area_id, spec.tmp, starting=True)
+            tmp_binds = [Bind(str(self.work_areas.tmp_dir(instance.work_area_id)), "/tmp", False)]
+            instance.tmp_bound = True
         if layout.version >= 2:
             # 父目录先于子挂载（Docker 按目标路径深度排序，这里也按顺序列出）
             base_binds = [
@@ -609,6 +642,7 @@ class WorkAreaService:
             ]
         binds = [
             *base_binds,
+            *tmp_binds,
             Bind(
                 str(self.dirs.inputs_dir(instance.sandbox_id)),
                 layout.inputs_target,
@@ -653,6 +687,7 @@ class WorkAreaService:
             api_token=instance.api_token,
             binds=binds,
             mount_layout=mount_layout,
+            tmp_bound=instance.tmp_bound,
             extra_env=spec.env or None,
             network=settings.wa_network_for_mode(spec.network_mode),
             limits=spec.limits or {},
@@ -1062,8 +1097,38 @@ class WorkAreaService:
             instance.mounts_held = False
             await self.mounts.release(instance.mount_keys)
         self.dirs.remove(instance.sandbox_id)
+        if instance.tmp_bound and instance.work_area_id not in self._deleting:
+            policy = await asyncio.to_thread(
+                self.work_areas.load_tmp_policy, instance.work_area_id
+            )
+            if policy is not None:
+                await self._clear_tmp(instance.work_area_id, policy, starting=False)
         logger.info(
             f"v2 实例已销毁 | id={instance.sandbox_id} | work_area={instance.work_area_id} | reason={reason}"
+        )
+
+    async def _clear_tmp(self, work_area_id: str, policy: TmpPolicy, *, starting: bool) -> None:
+        """按清理规则清实例 /tmp 的宿主目录；失败只记日志（下次启动实例前会再清一遍）。
+
+        回收时：``clear_on_release`` 清空除 ``outputs/`` 外的全部内容，否则不动临时文件。
+        启动前：同上，另外总会清掉上一个实例的运行时文件。两处都按保留时长清 ``outputs/``。
+        """
+        if policy.clear_on_release:
+            mode = "all"
+        else:
+            mode = "runtime" if starting else "none"
+        if mode == "none" and policy.outputs_keep_seconds <= 0:
+            return
+        try:
+            result = await self.work_areas.clear_tmp(
+                work_area_id, mode, policy.outputs_keep_seconds
+            )
+        except Exception as exc:
+            logger.warning(f"清理实例 /tmp 失败 | work_area={work_area_id} | mode={mode} | err={exc}")
+            return
+        logger.info(
+            f"实例 /tmp 已清理 | work_area={work_area_id} | when={'start' if starting else 'release'} "
+            f"| mode={mode} | removed={result.get('removed')} | outputs_removed={result.get('outputs_removed')}"
         )
 
     # ── 对账 ────────────────────────────────────────────────────────────────

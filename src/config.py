@@ -271,7 +271,7 @@ class Settings(BaseSettings):
     WORK_AREA_ENABLED: bool = True
     DOCKER_IMAGE_CODE_V2: str = "sandbox-code:2026.11.08-1"
     DOCKER_IMAGE_UBUNTU_V2: str = "sandbox-ubuntu:2026.11.08-1"
-    DOCKER_IMAGE_FS: str = "sandbox-fs:2026.10.06-1"
+    DOCKER_IMAGE_FS: str = "sandbox-fs:2026.11.10-1"
     WORK_AREA_MAX_PER_ROLE: int = 2
     WORK_AREA_MAX_PER_USER: int = 4
     WORK_AREA_JOB_MAX_LIFETIME: int = 21600

@@ -25,6 +25,7 @@ from src.config import settings
 from src.manager import layouts
 from src.models import (
     LAYOUT_VERSION_LABEL,
+    TMP_BOUND_LABEL,
     MOUNT_LAYOUT_LABEL,
     ROLE_LABEL,
     SANDBOX_ID_LABEL,
@@ -834,6 +835,7 @@ class ContainerManager:
         limits: dict,
         layout_version: int = 1,
         hidden_roots: tuple[str, ...] = (),
+        tmp_bound: bool = False,
     ) -> tuple[str, str, str]:
         image = settings.image_v2_for_type(sandbox_type)
         name = f"cr-wa-{sandbox_type}-{sandbox_id.removeprefix('sb_')}"
@@ -851,6 +853,8 @@ class ContainerManager:
         }
         if extra_env:
             labels[_ENV_LABEL] = "true"
+        if tmp_bound:
+            labels[TMP_BOUND_LABEL] = "true"
         mounts = [
             docker.types.Mount(
                 target=b.target,
