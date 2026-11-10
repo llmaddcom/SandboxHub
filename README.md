@@ -637,7 +637,7 @@ its legacy `layout_version` field stays `1` so backends that only know v1 keep w
 | `/workspace/context` | `/opt/cr` | ro | generated platform files, nested paths allowed |
 | `/workspace/role/<name>` | `/self` | as requested | v2 mount `self` = role-space root `roles/{role_id}`, `.cr/**` excluded by rclone |
 | — | `/self/diary` | ro | v2 mount `diary` = `roles/{role_id}/diary`, layered over `/self` |
-| `/tmp` | `/tmp` | rw | container layer, gone when the instance is recycled |
+| `/tmp` | `/tmp` | rw | container layer, gone when the instance is recycled; on v2 with a `tmp` rule in the acquire request it is the work area's host directory `tmp/` instead (see below) |
 
 A v2 acquire looks like:
 
@@ -669,6 +669,30 @@ these mount points inside `work/` (a symlink, a directory named `AGENTS.md`, a f
 `work/AGENTS.md` is only hidden while v2 instances run. The effective report lists the v2
 mounts, the `exclude` of `self`, and `workspace_files.files` (the names with content).
 
+**Persistent `/tmp` (v2).** When the acquire request carries
+`"tmp": {"clear_on_release": true, "outputs_keep_seconds": 0}`, the instance's `/tmp` is a
+read-write bind of `work-areas/<id>/tmp` (mode 1777). The path is fixed: it survives the
+instance, counts toward the work area's usage and soft cap, is removed with the work area, and
+can be listed and read through the files endpoints with `root=tmp` (not importable). The fixed
+subdirectory `outputs/` (mode 1777) is created with it and is never removed by the rule. What
+stays in it is decided by the rule, which Hub applies in the background and logs:
+
+- when the instance is recycled (release, idle backstop, rebuild): `clear_on_release` removes
+  everything except `outputs/`; with `false` nothing is removed;
+- before a new instance starts: the same rule again, and always the previous instance's runtime
+  files (top-level names starting with `cr-`, `tmux-` or `.`, plus sockets and FIFOs), so stale
+  job logs are not reported as running jobs;
+- `outputs_keep_seconds > 0` also deletes files under `outputs/` older than that at both
+  points; `0` keeps them until the work area is deleted.
+
+The latest request's rule wins (stored next to the work area, so it survives a Hub restart).
+Without the `tmp` field nothing changes: `/tmp` stays on the container layer. A running
+instance is never rebuilt just to switch between the two; the binding follows the request the
+next time an instance is created. `GET /v2/capabilities` reports
+`tmp_root: true`, and the effective report lists `{"target": "/tmp", "mode": "rw",
+"source": "work_area_tmp"}` when bound. Cleanup runs in cr-fs through directory descriptors and
+never follows tenant symlinks.
+
 v2 instances get `SANDBOX_CWD=/workspace`, `SANDBOX_LAYOUT=work-area/v2`,
 `CR_SKILLS_DIR=/self/skills`, `CR_TOOLS_DIR=/opt/cr/tools`, plus `SANDBOX_READONLY_ROOTS` and
 `SANDBOX_HIDDEN_ROOTS`; v1 keeps its previous environment. With these, the file API reports a
@@ -695,7 +719,7 @@ acquire fails or is cancelled, references acquired by that operation are release
 | `/v2/sandboxes/{id}/proxy/{path}` | Forward tool requests with the instance's API token |
 | `POST /v2/sandboxes/policy/apply` | Broadcast effective network policy to registered v2 instances |
 | `GET /v2/work-areas/{id}/usage` | Usage plus soft cap and `over_soft_cap` |
-| `GET /v2/work-areas/{id}/files?root=deliverables` | Bounded listing, reporting truncated or skipped entries; `observed_at` is the Hub clock taken before listing |
+| `GET /v2/work-areas/{id}/files?root=deliverables` | `root` is `work`, `deliverables` or `tmp`. Bounded listing, reporting truncated or skipped entries; `observed_at` is the Hub clock taken before listing |
 | `GET /v2/work-areas/{id}/jobs` | Origin `(session_id, turn_id)` and start/end time of terminal jobs; `known=false` when completeness cannot be guaranteed |
 | `GET /v2/work-areas/{id}/files/content?root=deliverables&path=...` | Host snapshot, refusing symlinks and path escape |
 | `POST /v2/work-areas/{id}/files/checksums?root=work` | SHA-256 and stability for 1–128 paths (`{"paths": [...]}`); missing files reported individually, symlinks refused |
