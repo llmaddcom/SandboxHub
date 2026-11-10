@@ -673,8 +673,9 @@ mounts, the `exclude` of `self`, and `workspace_files.files` (the names with con
 `"tmp": {"clear_on_release": true, "outputs_keep_seconds": 0}`, the instance's `/tmp` is a
 read-write bind of `work-areas/<id>/tmp` (mode 1777). The path is fixed: it survives the
 instance, counts toward the work area's usage and soft cap, is removed with the work area, and
-can be listed and read through the files endpoints with `root=tmp` (not importable). What stays
-in it is decided by the rule, which Hub applies in the background and logs:
+can be listed and read through the files endpoints with `root=tmp` (not importable). The fixed
+subdirectory `outputs/` (mode 1777) is created with it and is never removed by the rule. What
+stays in it is decided by the rule, which Hub applies in the background and logs:
 
 - when the instance is recycled (release, idle backstop, rebuild): `clear_on_release` removes
   everything except `outputs/`; with `false` nothing is removed;
