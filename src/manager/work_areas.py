@@ -40,6 +40,8 @@ from src.manager.paths import require_id, split_relative
 WORK_AREA_ROOTS = ("work", "deliverables")
 # 实例 /tmp 的宿主目录：可列举、可读取，不接受导入。
 TMP_ROOT = "tmp"
+# /tmp 下的固定目录，与 images/fs/fsops.py 的 TMP_OUTPUTS 同名。
+TMP_OUTPUTS = "outputs"
 READ_ROOTS = (*WORK_AREA_ROOTS, TMP_ROOT)
 TMP_POLICY_FILE = "tmp-policy.json"
 CONTEXT_MAX_FILE_BYTES = 1024 * 1024
@@ -100,6 +102,15 @@ class WorkAreas:
         path.mkdir(parents=True, exist_ok=True)
         # 与容器里的 /tmp 一致：所有用户可写、带粘滞位。目录属主是 Hub 用户，chmod 不需要 cr-fs。
         path.chmod(0o1777)
+        # outputs/ 是固定目录（超长工具结果全文落在这里）：始终存在，里面的东西留不留由清理规则
+        # 决定（cleartmp 不删它本身）。/tmp 归租户可写，所以不跟随已有的同名项：已存在就不动，
+        # 只给自己刚建的目录设权限。
+        outputs = path / TMP_OUTPUTS
+        try:
+            os.mkdir(outputs)
+        except FileExistsError:
+            return
+        os.chmod(outputs, 0o1777)
 
     async def ensure_tmp(self, work_area_id: str) -> None:
         await asyncio.to_thread(self._ensure_tmp_sync, work_area_id)

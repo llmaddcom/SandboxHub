@@ -810,6 +810,9 @@ async def test_v2_tmp_policy_binds_host_tmp_and_clears_on_release(env):
     host_tmp = sidecar.root / "work-areas" / "wa1" / "tmp"
     assert binds["/tmp"].source == str(host_tmp) and not binds["/tmp"].read_only
     assert host_tmp.is_dir() and (host_tmp.stat().st_mode & 0o7777) == 0o1777
+    # 固定目录 outputs/ 随绑定建好：没有落盘结果时模型 ls /tmp/outputs 也不会报不存在。
+    outputs = host_tmp / "outputs"
+    assert outputs.is_dir() and (outputs.stat().st_mode & 0o7777) == 0o1777
     assert kwargs["tmp_bound"] is True and instance.tmp_bound
     assert {"target": "/tmp", "mode": "rw", "source": "work_area_tmp"} in service.effective_report(instance)["mounts"]
     # 启动前清一遍（默认规则：清空除 outputs/ 外的全部），回收时再清一遍
@@ -817,6 +820,7 @@ async def test_v2_tmp_policy_binds_host_tmp_and_clears_on_release(env):
     await service.release(instance.sandbox_id)
     assert _cleartmp_calls(sidecar) == [("cleartmp", "wa1", "all", "0")] * 2
     assert host_tmp.is_dir()  # 路径固定：实例没了目录还在
+    assert outputs.is_dir()
 
 
 async def test_v2_tmp_keep_files_only_sweeps_runtime_at_start(env):
@@ -887,3 +891,16 @@ async def test_adopted_instance_remembers_tmp_binding(env):
 def test_capabilities_report_tmp_root(env):
     service, _, _, _ = env
     assert service.capabilities()["tmp_root"] is True
+
+
+async def test_v2_tmp_outputs_left_alone_when_tenant_put_something_there(env):
+    """/tmp 归租户可写：outputs 已经是别的东西（如软链接）时不跟随、不改权限。"""
+    service, _manager, sidecar, _ = env
+    host_tmp = sidecar.root / "work-areas" / "wa1" / "tmp"
+    host_tmp.mkdir(parents=True)
+    target = sidecar.root / "elsewhere"
+    target.mkdir(mode=0o700)
+    (host_tmp / "outputs").symlink_to(target)
+    await service.acquire(_v2spec(mounts=[SELF, DIARY], tmp=TmpPolicy()))
+    assert (host_tmp / "outputs").is_symlink()
+    assert (target.stat().st_mode & 0o7777) == 0o700
