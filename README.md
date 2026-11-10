@@ -685,8 +685,9 @@ in it is decided by the rule, which Hub applies in the background and logs:
   points; `0` keeps them until the work area is deleted.
 
 The latest request's rule wins (stored next to the work area, so it survives a Hub restart).
-Without the `tmp` field nothing changes: `/tmp` stays on the container layer. An instance is
-rebuilt when a request switches between the two. `GET /v2/capabilities` reports
+Without the `tmp` field nothing changes: `/tmp` stays on the container layer. A running
+instance is never rebuilt just to switch between the two; the binding follows the request the
+next time an instance is created. `GET /v2/capabilities` reports
 `tmp_root: true`, and the effective report lists `{"target": "/tmp", "mode": "rw",
 "source": "work_area_tmp"}` when bound. Cleanup runs in cr-fs through directory descriptors and
 never follows tenant symlinks.

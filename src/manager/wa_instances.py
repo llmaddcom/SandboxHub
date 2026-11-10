@@ -521,9 +521,9 @@ class WorkAreaService:
             and info is not None
             and await self._manager.is_healthy(info.container_ip)
         )
+        # /tmp 绑没绑不算形状差异：在跑的实例不为它重建（里面可能有任务），下次自然重建时再按请求绑定
         same_shape = (
-            existing.tmp_bound == (spec.tmp is not None)
-            and existing.layout_version == spec.layout_version
+            existing.layout_version == spec.layout_version
             and existing.sandbox_type == spec.sandbox_type
             and existing.mount_keys == tuple(sorted(m.key for m in spec.mounts))
             and {m.target for m in existing.mounts} == {m.target for m in spec.mounts}

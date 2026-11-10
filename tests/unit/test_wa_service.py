@@ -848,11 +848,17 @@ async def test_v2_tmp_policy_follows_latest_request_and_survives_restart(env):
     assert _cleartmp_calls(sidecar) == []
 
 
-async def test_v2_tmp_shape_change_rebuilds_instance(env):
+async def test_v2_tmp_rule_does_not_rebuild_running_instance(env):
+    """在跑的实例创建时没带规则：不为绑定 /tmp 重建它，等它自然回收后下次再绑。"""
     service, manager, sidecar, _ = env
     first, _ = await service.acquire(_v2spec(mounts=[SELF, DIARY]))
     second, reused = await service.acquire(_v2spec(mounts=[SELF, DIARY], tmp=TmpPolicy()))
-    assert not reused and second.sandbox_id != first.sandbox_id and second.tmp_bound
+    assert reused and second.sandbox_id == first.sandbox_id and not second.tmp_bound
+    assert all(m["target"] != "/tmp" for m in service.effective_report(second)["mounts"])
+    await service.release(first.sandbox_id)
+    assert _cleartmp_calls(sidecar) == []
+    third, _ = await service.acquire(_v2spec(mounts=[SELF, DIARY], tmp=TmpPolicy()))
+    assert third.tmp_bound
 
 
 async def test_tmp_policy_rejected_on_layout_v1(env):
