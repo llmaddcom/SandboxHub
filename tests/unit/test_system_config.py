@@ -81,6 +81,15 @@ def test_checked_in_system_yaml_loads_without_warnings():
     assert s.image_for_type("ubuntu") == s.DOCKER_IMAGE_UBUNTU
 
 
+def test_old_branch_pins_v1_and_v2_images_to_its_app_version():
+    """两代入口都使用此分支的镜像，不能意外运行不含旧 CLI 的 latest。"""
+    s = load_settings(env_file=None)
+    version = (REPO_ROOT / "images/ubuntu/app/VERSION").read_text().strip()
+    assert s.DOCKER_IMAGE_CODE == s.DOCKER_IMAGE_CODE_V2 == f"sandbox-code:{version}"
+    assert s.DOCKER_IMAGE_UBUNTU == s.DOCKER_IMAGE_UBUNTU_V2 == f"sandbox-ubuntu:{version}"
+    assert s.DOCKER_IMAGE_GATEWAY == f"sandbox-gateway:{version}"
+
+
 def test_system_keys_read_from_yaml_only(tmp_path, monkeypatch):
     """env 同名变量无效并告警；文件值生效；坏值 / 缺键仅该项回退默认；null = 沿用默认。"""
     path = tmp_path / "system.yaml"
@@ -114,7 +123,8 @@ def test_missing_yaml_falls_back_to_defaults(tmp_path, monkeypatch):
         monkeypatch.delenv(k, raising=False)
     with _warnings() as records:
         s = load_settings(system_yaml=tmp_path / "missing.yaml", env_file=None)
-    assert s.WARM_POOL_UBUNTU == 3 and s.DOCKER_IMAGE_CODE == "sandbox-code:latest"
+    version = (REPO_ROOT / "images/ubuntu/app/VERSION").read_text().strip()
+    assert s.WARM_POOL_UBUNTU == 3 and s.DOCKER_IMAGE_CODE == f"sandbox-code:{version}"
     assert any("不存在" in r for r in records)
 
 

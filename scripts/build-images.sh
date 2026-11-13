@@ -10,8 +10,8 @@
 # gateway = cr-host 网关镜像（alpine + socat，网络策略平台通道，SandboxHub#42）
 # fs      = cr-fs 文件侧车镜像（rclone + fuse3 + iptables，按工作区分配的实例用，ADR 0025）
 #
-# NO_LATEST=1：只打版本标签、不动 :latest。线上 v1 沙盒用 :latest，切换窗口之前构建新镜像
-# 必须带上它，避免在跑的 v1 warm pool 换成未经演练的镜像。
+# old 分支默认只打版本标签，不覆盖其他版本使用的 :latest。
+# 确有需要时可显式设置 NO_LATEST= 才同时更新 :latest。
 #
 # 代理：ubuntu 镜像需从境外拉 Chrome/noVNC/pyenv 等（见 README「使用代理构建」）。
 # 设置 BUILD_PROXY 后自动以 --network host + 代理 build-arg 构建，例：
@@ -23,7 +23,7 @@ VERSION="$(tr -d '[:space:]' < "$ROOT/images/ubuntu/app/VERSION")"
 FS_VERSION="$(tr -d '[:space:]' < "$ROOT/images/fs/VERSION")"
 TARGET="${1:-all}"
 BUILD_PROXY="${BUILD_PROXY:-}"
-NO_LATEST="${NO_LATEST:-}"
+NO_LATEST="${NO_LATEST-1}"
 
 # tags <镜像名> [版本]：输出 -t 参数（版本标签恒有；:latest 视 NO_LATEST 而定）
 tags() {

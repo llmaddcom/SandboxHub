@@ -57,25 +57,36 @@ An empty manifest revokes the previous view; omitting it preserves compatibility
 
 Periodic reconciliation prunes unmounted old views and evicts unreferenced blobs within the cache budget. Active mounts and views prepared within the last minute are preserved. A failed Docker inventory never triggers pruning.
 
+### The `old` branch and createrole main
+
+This branch is based on SandboxHub `a577e2a` and matches createrole main `3b01472`.
+It retains the v1 sandbox API, workspace mounts, readonly file-center inputs,
+network policy, and the code image's `skills`, `todo`, and `memory` commands.
+Newer SandboxHub images removed some of these commands, so this branch pins its
+v1 and v2 execution images and gateway to `2026.10.25-2` rather than `:latest`.
+Build the required images before use; updating the checkout does not replace
+containers that are already running.
+
 ### 1. Build the sandbox image
 
-Preferred: the build script (tags both `latest` and the version from `images/ubuntu/app/VERSION`):
+Preferred: the build script (version tags only by default, without replacing another branch's `latest`):
 
 ```bash
-scripts/build-images.sh          # build code + ubuntu
+scripts/build-images.sh          # build code, ubuntu, gateway, and fs
 scripts/build-images.sh code     # code only
-NO_LATEST=1 scripts/build-images.sh fs   # cr-fs uses images/fs/VERSION
+scripts/build-images.sh gateway  # network policy gateway
+scripts/build-images.sh fs       # cr-fs uses images/fs/VERSION
 ```
 
 Manual builds:
 
 ```bash
 # Full desktop image (GUI + browser + skills)
-docker build -t sandbox-ubuntu:latest images/ubuntu/
+docker build -t sandbox-ubuntu:2026.10.25-2 images/ubuntu/
 
 # Lightweight headless code image (Python + Node + dev/office libs, no GUI)
 # Build context is images/ (shares ubuntu/app code), so -f + context are required:
-docker build -f images/code/Dockerfile -t sandbox-code:latest images
+docker build -f images/code/Dockerfile -t sandbox-code:2026.10.25-2 images
 ```
 
 > **Image version reconciliation (deployment-drift guard):** when changing app code under `images/`, bump
@@ -108,7 +119,7 @@ docker build --network host \
   --build-arg HTTPS_PROXY=${HTTP_PROXY_URL} \
   --build-arg http_proxy=${HTTP_PROXY_URL} \
   --build-arg https_proxy=${HTTP_PROXY_URL} \
-  -t sandbox-ubuntu:latest images/ubuntu/
+  -t sandbox-ubuntu:2026.10.25-2 images/ubuntu/
 ```
 
 > `--network host` shares the host network stack with build-stage `RUN` commands, allowing them to reach a proxy bound to `127.0.0.1`.
@@ -424,7 +435,7 @@ Full API docs available at `http://localhost:8000/docs` inside a running contain
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `image.ubuntu` / `image.code` | `sandbox-ubuntu:latest` / `sandbox-code:latest` | Image name per profile |
+| `image.ubuntu` / `image.code` | `sandbox-ubuntu:2026.10.25-2` / `sandbox-code:2026.10.25-2` | Image name per profile |
 | `warm_pool.ubuntu` / `warm_pool.code` | `3` / `0` (this repo's live box: ubuntu=1) | Pre-warmed containers, 0 = cold start on acquire |
 | `warm_pool.maintain_interval` | `30` | Seconds between pool replenishment checks |
 | `sandbox.api_port` | `8000` | FastAPI port inside the container; matches the image entrypoint |
@@ -580,12 +591,12 @@ pip install -e ".[dev]"
 WORK_AREA_ROOT=$(mktemp -d) python -m pytest -q && PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests -n auto
 
 # Build image for a specific architecture
-docker build --platform linux/amd64 -t sandbox-ubuntu:latest images/ubuntu/
+docker build --platform linux/amd64 -t sandbox-ubuntu:2026.10.25-2 images/ubuntu/
 
 # Run a sandbox container directly (without SandboxHub)
 docker run -d --name sandbox --shm-size=2g \
   -p 8000:8000 -p 8001:8001 -p 6080:6080 -p 5900:5900 \
-  sandbox-ubuntu:latest
+  sandbox-ubuntu:2026.10.25-2
 ```
 
 - While developing, run only the tests that cover your change, e.g. `python -m pytest -q tests/unit/test_warm_pool.py` or `PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests/test_procs.py`. Run the full line before opening a PR.

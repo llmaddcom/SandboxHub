@@ -245,9 +245,10 @@ class Settings(BaseSettings):
 
     # ── 系统调优（config/system.yaml）：以下为代码默认兜底，env 不读 ─────────
     # 各键含义见 SYSTEM_KNOBS 与 config/system.yaml 内注释。
-    DOCKER_IMAGE_UBUNTU: str = "sandbox-ubuntu:latest"
-    DOCKER_IMAGE_CODE: str = "sandbox-code:latest"
-    DOCKER_IMAGE_GATEWAY: str = "sandbox-gateway:latest"
+    # old 分支与 createrole main 配套，不能回退到可能已移除旧 CLI 的 :latest。
+    DOCKER_IMAGE_UBUNTU: str = "sandbox-ubuntu:2026.10.25-2"
+    DOCKER_IMAGE_CODE: str = "sandbox-code:2026.10.25-2"
+    DOCKER_IMAGE_GATEWAY: str = "sandbox-gateway:2026.10.25-2"
     WARM_POOL_UBUNTU: int = 3
     WARM_POOL_CODE: int = 0
     POOL_MAINTAIN_INTERVAL: int = 30

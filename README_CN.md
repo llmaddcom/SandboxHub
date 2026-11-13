@@ -59,24 +59,34 @@ v2 工作区分配时，不同角色目录并发准备，所有分配共用最�
 
 ## 快速开始
 
+### `old` 分支与 createrole main
+
+本分支以 SandboxHub `a577e2a` 为基线，配套 createrole main `3b01472`：保留 v1 沙盒
+API、工作区挂载、文件中心只读原件、网络策略，以及 code 镜像内的 `skills`、`todo`、
+`memory` 命令。较新的 SandboxHub 镜像已移除其中部分命令，不能直接用其 `:latest`。
+本分支的 v1 和 v2 镜像均固定为 `2026.10.25-2`，网关使用同一构建标签；首次使用前
+请按下方脚本构建需要的镜像。运行中的服务须按部署流程更新，单独切换代码不会替换容器。
+
 ### 1. 构建沙盒镜像
 
-推荐用构建脚本（同时打 `latest` 与版本标签，版本取自 `images/ubuntu/app/VERSION`）：
+推荐用构建脚本（默认只打版本标签，不覆盖其他分支使用的 `latest`；执行镜像版本取自
+`images/ubuntu/app/VERSION`）：
 
 ```bash
-scripts/build-images.sh          # 构建 code + ubuntu
+scripts/build-images.sh          # 构建 code、ubuntu、gateway、fs
 scripts/build-images.sh code     # 只构建 code
+scripts/build-images.sh gateway  # 网络策略需要的网关
 ```
 
 也可手动构建：
 
 ```bash
 # 完整桌面镜像（GUI + 浏览器 + 技能）
-docker build -t sandbox-ubuntu:latest images/ubuntu/
+docker build -t sandbox-ubuntu:2026.10.25-2 images/ubuntu/
 
 # 轻量无 GUI 的 code 镜像（Python + Node + 开发/办公库）
 # 构建上下文为 images/（复用 ubuntu/app 代码），故必须 -f 指定 Dockerfile 并以 images 为上下文：
-docker build -f images/code/Dockerfile -t sandbox-code:latest images
+docker build -f images/code/Dockerfile -t sandbox-code:2026.10.25-2 images
 ```
 
 > **镜像版本对账（防部署漂移）：** 改动 `images/` 下的 app 代码时请同步更新 `images/ubuntu/app/VERSION` 并重建镜像。
@@ -108,7 +118,7 @@ docker build --network host \
   --build-arg HTTPS_PROXY=${HTTP_PROXY_URL} \
   --build-arg http_proxy=${HTTP_PROXY_URL} \
   --build-arg https_proxy=${HTTP_PROXY_URL} \
-  -t sandbox-ubuntu:latest images/ubuntu/
+  -t sandbox-ubuntu:2026.10.25-2 images/ubuntu/
 ```
 
 > `--network host` 使构建阶段的 `RUN` 命令与宿主机共享网络栈，从而能访问 `127.0.0.1` 上监听的本地代理。
@@ -399,7 +409,7 @@ Ubuntu 容器对外暴露 40+ REST 接口和 30+ MCP 工具，主要分类：
 
 | 键 | 默认值 | 说明 |
 |----|--------|------|
-| `image.ubuntu` / `image.code` | `sandbox-ubuntu:latest` / `sandbox-code:latest` | 两种 profile 的镜像名 |
+| `image.ubuntu` / `image.code` | `sandbox-ubuntu:2026.10.25-2` / `sandbox-code:2026.10.25-2` | 两种 profile 的镜像名 |
 | `warm_pool.ubuntu` / `warm_pool.code` | `3` / `0`（本仓线上 ubuntu=1） | 预热容器数，0=不预热 |
 | `warm_pool.maintain_interval` | `30` | 预热池补齐检查间隔（秒） |
 | `sandbox.api_port` | `8000` | 容器内 FastAPI 端口，与镜像 entrypoint 一致 |
@@ -557,12 +567,12 @@ pip install -e ".[dev]"
 WORK_AREA_ROOT=$(mktemp -d) python -m pytest -q && PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests -n auto
 
 # 构建特定架构镜像
-docker build --platform linux/amd64 -t sandbox-ubuntu:latest images/ubuntu/
+docker build --platform linux/amd64 -t sandbox-ubuntu:2026.10.25-2 images/ubuntu/
 
 # 直接运行沙盒容器（不经过 SandboxHub）
 docker run -d --name sandbox --shm-size=2g \
   -p 8000:8000 -p 8001:8001 -p 6080:6080 -p 5900:5900 \
-  sandbox-ubuntu:latest
+  sandbox-ubuntu:2026.10.25-2
 ```
 
 - 开发中只跑覆盖本次改动的测试，如 `python -m pytest -q tests/unit/test_warm_pool.py` 或 `PYTHONPATH=images/ubuntu python -m pytest -q images/ubuntu/tests/test_procs.py`；开 PR 前跑上面那行全量。
