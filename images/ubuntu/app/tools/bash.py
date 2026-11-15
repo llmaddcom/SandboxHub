@@ -177,11 +177,17 @@ _SCRIPT_HEADER = b"Script started on "
 _SCRIPT_FOOTER_RE = re.compile(rb"\n?Script done on [^\n]*\n?$")
 # 终端转义序列（CSI / OSC / 其余 ESC 序列）：TERM=dumb 下程序基本不发，兜底清理
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+# 行尾的一个或多个 \r 都只是换行（pty ONLCR 会叠加），不是进度条覆盖
+_CRLF_RE = re.compile(r"\r+\n")
 
 
 def _clean_tty(text: str) -> str:
-    """PTY 输出 → 模型可读文本：去转义序列、CRLF→LF、``\\r`` 覆盖只留最后一段（进度条）。"""
-    text = _ANSI_RE.sub("", text).replace("\r\n", "\n")
+    """PTY 输出 → 模型可读文本：去转义序列、``\\r+\\n``→LF、``\\r`` 覆盖只留最后一段（进度条）。
+
+    行尾的 ``\\r`` 不是覆盖：``cat`` 一份 script(1) 日志（行尾本就是 ``\\r\\n``）时 pty 再补一个 ``\\r``，
+    得到 ``内容\\r\\r\\n``；先归一行尾，否则整行会被当成进度条覆盖掉（#94）。
+    """
+    text = _CRLF_RE.sub("\n", _ANSI_RE.sub("", text))
     if "\r" in text:
         text = "\n".join(seg.rsplit("\r", 1)[-1] for seg in text.split("\n"))
     return text
