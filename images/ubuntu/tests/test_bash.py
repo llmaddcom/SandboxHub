@@ -78,6 +78,15 @@ def test_clean_tty_normalizes_pty_output():
     assert _clean_tty("\x1b]0;title\x07plain") == "plain"
 
 
+def test_clean_tty_keeps_lines_ending_in_doubled_cr():
+    """#94：cat 一份 CRLF 日志时 pty 再补一个 \\r，行尾成了 \\r\\r\\n，不能当进度条把整行清空。"""
+    assert _clean_tty("第 1 分钟\r\r\n第 2 分钟\r\r\n") == "第 1 分钟\n第 2 分钟\n"
+    assert _clean_tty("a\r\nb\r\n") == "a\nb\n"
+    assert _clean_tty("a\rb\n") == "b\n"
+    # 进度条后接叠加的行尾：覆盖照常生效，行尾仍只是换行
+    assert _clean_tty("10%\r100%\r\r\ndone\r\n") == "100%\ndone\n"
+
+
 # ── job 契约：submit / wait / kill ────────────────────────────────────────────
 
 @pytest.mark.asyncio
