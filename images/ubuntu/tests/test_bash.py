@@ -78,6 +78,15 @@ def test_clean_tty_normalizes_pty_output():
     assert _clean_tty("\x1b]0;title\x07plain") == "plain"
 
 
+def test_clean_tty_keeps_lines_ending_in_doubled_cr():
+    """#94：cat 一份 CRLF 日志时 pty 再补一个 \\r，行尾成了 \\r\\r\\n，不能当进度条把整行清空。"""
+    assert _clean_tty("第 1 分钟\r\r\n第 2 分钟\r\r\n") == "第 1 分钟\n第 2 分钟\n"
+    assert _clean_tty("a\r\nb\r\n") == "a\nb\n"
+    assert _clean_tty("a\rb\n") == "b\n"
+    # 进度条后接叠加的行尾：覆盖照常生效，行尾仍只是换行
+    assert _clean_tty("10%\r100%\r\r\ndone\r\n") == "100%\ndone\n"
+
+
 # ── job 契约：submit / wait / kill ────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -216,6 +225,24 @@ async def test_cwd_and_exported_env_persist_across_jobs(tmp_path):
     await tool.submit("unset FOO", wait=5)
     job = await tool.submit("echo FOO=${FOO-unset}", wait=5)
     assert job.read(0)[0] == "FOO=unset\n"
+
+
+@pytest.mark.asyncio
+async def test_control_token_never_reaches_job_shell(monkeypatch):
+    """#96：控制面凭据不进 job 的初始环境、.envin 与 shell；租户凭据照常透传。"""
+    monkeypatch.setenv("SANDBOX_API_TOKEN", "control-secret")
+    monkeypatch.setenv("CR_SANDBOX_TOKEN", "tenant-token")
+    monkeypatch.setenv("CR_API_BASE", "http://api.local")
+    tool = BashTool()
+    assert "SANDBOX_API_TOKEN" not in tool.session._initial_env
+    job = await tool.submit(
+        'echo "ctl=${SANDBOX_API_TOKEN-unset} tenant=$CR_SANDBOX_TOKEN base=$CR_API_BASE"', wait=5
+    )
+    assert job.read(0)[0] == "ctl=unset tenant=tenant-token base=http://api.local\n"
+    for suffix in (".envin", ".env"):
+        dumped = job.state_base.with_suffix(suffix).read_bytes()
+        assert b"control-secret" not in dumped
+        assert b"CR_SANDBOX_TOKEN=tenant-token" in dumped
 
 
 @pytest.mark.asyncio

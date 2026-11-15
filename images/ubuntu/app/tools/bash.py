@@ -86,7 +86,11 @@ _SIGNALS = {"INT": signal.SIGINT, "KILL": signal.SIGKILL, "TERM": signal.SIGTERM
 JOB_ACTIVITY_ENV = "CR_SANDBOX_JOB_ID"
 PROC_ROOT = Path("/proc")
 _JOB_ACTIVITY_RE = re.compile(rb"(?:^|\x00)CR_SANDBOX_JOB_ID=(j_[0-9A-HJKMNP-TV-Z]{26})(?:\x00|$)")
-_ENV_SKIP = {"_", "PWD", "OLDPWD", "SHLVL", "TMUX", "TMUX_PANE", "LINES", "COLUMNS", JOB_ACTIVITY_ENV}
+# 控制面凭据：只供本应用校验调用方，不进租户 shell（与 procs 一致，#96）。
+# 租户调平台工具用的 CR_SANDBOX_TOKEN / CR_API_BASE 由后端按会话注入，不在此列。
+_CONTROL_ENV = frozenset({"SANDBOX_API_TOKEN"})
+_ENV_SKIP = {"_", "PWD", "OLDPWD", "SHLVL", "TMUX", "TMUX_PANE", "LINES", "COLUMNS", JOB_ACTIVITY_ENV,
+             *_CONTROL_ENV}
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -177,11 +181,17 @@ _SCRIPT_HEADER = b"Script started on "
 _SCRIPT_FOOTER_RE = re.compile(rb"\n?Script done on [^\n]*\n?$")
 # 终端转义序列（CSI / OSC / 其余 ESC 序列）：TERM=dumb 下程序基本不发，兜底清理
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+# 行尾的一个或多个 \r 都只是换行（pty ONLCR 会叠加），不是进度条覆盖
+_CRLF_RE = re.compile(r"\r+\n")
 
 
 def _clean_tty(text: str) -> str:
-    """PTY 输出 → 模型可读文本：去转义序列、CRLF→LF、``\\r`` 覆盖只留最后一段（进度条）。"""
-    text = _ANSI_RE.sub("", text).replace("\r\n", "\n")
+    """PTY 输出 → 模型可读文本：去转义序列、``\\r+\\n``→LF、``\\r`` 覆盖只留最后一段（进度条）。
+
+    行尾的 ``\\r`` 不是覆盖：``cat`` 一份 script(1) 日志（行尾本就是 ``\\r\\n``）时 pty 再补一个 ``\\r``，
+    得到 ``内容\\r\\r\\n``；先归一行尾，否则整行会被当成进度条覆盖掉（#94）。
+    """
+    text = _CRLF_RE.sub("\n", _ANSI_RE.sub("", text))
     if "\r" in text:
         text = "\n".join(seg.rsplit("\r", 1)[-1] for seg in text.split("\n"))
     return text
@@ -384,6 +394,11 @@ class Tmux:
     def __init__(self, socket: str | None = None):
         self.socket = socket if socket is not None else TMUX_SOCKET
 
+    @staticmethod
+    def _env() -> dict[str, str]:
+        """tmux 客户端的环境：去掉控制面凭据。server 由第一次调用启动并继承它，窗口再继承 server。"""
+        return {k: v for k, v in os.environ.items() if k not in _CONTROL_ENV}
+
     def _argv(self, *args: str) -> list[str]:
         base = ["tmux"] + (["-S", self.socket] if self.socket else [])
         return base + list(args)
@@ -394,6 +409,7 @@ class Tmux:
         proc = await asyncio.to_thread(
             subprocess.run, self._argv(*args),
             stdin=subprocess.DEVNULL, capture_output=True, timeout=15, check=False,
+            env=self._env(),
         )
         if proc.returncode != 0:
             raise ToolError(f"tmux {args[0]} 失败: {proc.stderr.decode(errors='replace').strip()}")
@@ -408,7 +424,8 @@ class Tmux:
 
     def run_sync(self, *args: str) -> None:
         subprocess.run(self._argv(*args), stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                       env=self._env())
 
     async def list_panes(self, *, strict: bool = False) -> list[dict]:
         """server 上全部 pane：pane_id / dead / dead_status / activity / session / window。"""
