@@ -13,7 +13,10 @@
   实例销毁或停止时仍未结束的任务按销毁时刻结束（上界）。
 - 不完整：实例在最后一次成功观测之后又启动过终端任务、却没能再观测就没了，记一段
   ``gap``；容器回报的无来源任务也照记。两者在保留期内都让 ``/jobs`` 返回 ``known=false``。
-- 清理：结束超过 ``WORK_AREA_JOB_MAX_LIFETIME``（0 时按 1 天）的任务与 gap 删除。
+- 结果（SandboxHub#90）：容器随清单回报退出码、终止原因、谁停的、是否 detached（后台任务），
+  台账照记；实例没了仍未结束的任务记 ``kill_reason=instance_gone``。每有任务结束，台账的结束
+  序号 ``seq`` 加一，``/jobs`` 的 ``cursor`` 即此序号，供调用方长轮询「有没有新结束的任务」。
+- 清理：结束超过 ``WORK_AREA_JOB_LEDGER_RETENTION`` 的任务与 gap 删除（0 = 不清理）。
 
 所有时间在台账内为 epoch 秒（float），对外格式化为带 ``Z`` 的 ISO-8601 UTC。
 """
@@ -40,7 +43,9 @@ JOB_ORIGIN_HEADER = "X-Sandbox-Job-Origin"
 # 它也不进本台账（容器只回报终端 job），活性另经 activity 的 running_jobs / running_procs 体现。
 TERMINAL_START_PATHS = frozenset({"api/terminal/execute", "api/terminal/execute/stream"})
 JOB_ID_RE = re.compile(r"^j_[0-9A-HJKMNP-TV-Z]{26}$")
-DEFAULT_RETENTION = 86400.0
+KILLERS = ("model", "user", "platform")
+# 实例销毁或停止时仍未结束、也没有自己结束原因的任务
+REASON_INSTANCE_GONE = "instance_gone"
 
 
 def iso_utc(ts: float) -> str:
@@ -48,7 +53,8 @@ def iso_utc(ts: float) -> str:
 
 
 def retention_seconds() -> float:
-    return float(settings.WORK_AREA_JOB_MAX_LIFETIME or DEFAULT_RETENTION)
+    """已结束任务与 gap 的保留时长（秒）；0 = 不清理。"""
+    return float(max(0, settings.WORK_AREA_JOB_LEDGER_RETENTION))
 
 
 @dataclass(frozen=True)
@@ -58,6 +64,10 @@ class ReportedJob:
     turn_id: Optional[str]
     started_at: float
     ended_at: Optional[float]
+    exit_code: Optional[int] = None
+    kill_reason: Optional[str] = None
+    killed_by: Optional[str] = None
+    detached: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,6 +105,10 @@ def parse_report(data: dict) -> Optional[JobsReport]:
             or not (ended is None or _number(ended))
             or not _opt_str(item.get("session_id"))
             or not _opt_str(item.get("turn_id"))
+            or not _opt_str(item.get("kill_reason"))
+            or item.get("killed_by") not in (None, *KILLERS)
+            or not (item.get("exit_code") is None or type(item.get("exit_code")) is int)
+            or type(item.get("detached", False)) is not bool
         ):
             raise ValueError(f"任务条目字段无效：{job_id!r}")
         jobs.append(
@@ -104,6 +118,10 @@ def parse_report(data: dict) -> Optional[JobsReport]:
                 turn_id=item.get("turn_id"),
                 started_at=float(item["started_at"]),
                 ended_at=None if ended is None else float(ended),
+                exit_code=item.get("exit_code"),
+                kill_reason=item.get("kill_reason"),
+                killed_by=item.get("killed_by"),
+                detached=item.get("detached", False),
             )
         )
     for job_id in raw_live:
@@ -136,6 +154,7 @@ class JobLedger:
             "jobs": {},
             "unobserved": {},
             "gaps": [],
+            "seq": 0,
         }
 
     def _load(self, work_area_id: str, now: float) -> dict:
@@ -226,15 +245,22 @@ class JobLedger:
             reported.add(item.job_id)
             current = jobs.get(item.job_id)
             if current is None:
-                jobs[item.job_id] = {
+                current = jobs[item.job_id] = {
                     "session_id": item.session_id,
                     "turn_id": item.turn_id,
                     "sandbox_id": sandbox_id,
                     "started_at": item.started_at,
-                    "ended_at": item.ended_at,
+                    "ended_at": None,
                 }
-            elif current["ended_at"] is None and item.ended_at is not None:
-                current["ended_at"] = item.ended_at
+            if current["ended_at"] is None:
+                # 结果字段随观测补齐（退出码可能先于「后代进程全部消失」到达）；已结束的不再改
+                for key in ("exit_code", "kill_reason", "killed_by"):
+                    value = getattr(item, key)
+                    if value is not None and current.get(key) is None:
+                        current[key] = value
+                current["detached"] = bool(current.get("detached")) or item.detached
+                if item.ended_at is not None:
+                    self._end(ledger, current, item.ended_at)
         live = set(report.unattributed_live)
         for job_id in live - reported:
             # 容器里活着却没有来源记录的任务：来源未知，保留期内报告 known=false
@@ -256,7 +282,7 @@ class JobLedger:
                 and job_id not in live
             ):
                 # 容器已不再回报、也没有存活进程：最迟在本次观测时已结束
-                job["ended_at"] = now
+                self._end(ledger, job, now)
         if token is not None and token == self._start_seq[sandbox_id]:
             ledger["unobserved"].pop(sandbox_id, None)
         self._prune(ledger, now)
@@ -271,11 +297,20 @@ class JobLedger:
         self._in_flight.pop(sandbox_id, None)
 
     @staticmethod
-    def _settle(ledger: dict, sandboxes: set[str], now: float) -> bool:
+    def _end(ledger: dict, job: dict, at: float) -> None:
+        """记一个任务结束，并推进台账的结束序号（``/jobs`` 长轮询的游标）。"""
+        job["ended_at"] = at
+        ledger["seq"] = int(ledger.get("seq", 0)) + 1
+        job["end_seq"] = ledger["seq"]
+
+    @classmethod
+    def _settle(cls, ledger: dict, sandboxes: set[str], now: float) -> bool:
         changed = False
         for job in ledger["jobs"].values():
             if job["sandbox_id"] in sandboxes and job["ended_at"] is None:
-                job["ended_at"] = now
+                if job.get("exit_code") is None and job.get("kill_reason") is None:
+                    job["kill_reason"] = REASON_INSTANCE_GONE
+                cls._end(ledger, job, now)
                 changed = True
         for sandbox_id in sandboxes & set(ledger["unobserved"]):
             since = ledger["unobserved"].pop(sandbox_id)
@@ -285,7 +320,10 @@ class JobLedger:
 
     @staticmethod
     def _prune(ledger: dict, now: float) -> bool:
-        cutoff = now - retention_seconds()
+        retention = retention_seconds()
+        if retention <= 0:
+            return False
+        cutoff = now - retention
         jobs = ledger["jobs"]
         stale = [k for k, j in jobs.items() if j["ended_at"] is not None and j["ended_at"] < cutoff]
         for key in stale:
@@ -322,7 +360,15 @@ class JobLedger:
                     "turn_id": job["turn_id"],
                     "started_at": iso_utc(job["started_at"]),
                     "ended_at": None if job["ended_at"] is None else iso_utc(job["ended_at"]),
+                    "exit_code": job.get("exit_code"),
+                    "kill_reason": job.get("kill_reason"),
+                    "killed_by": job.get("killed_by"),
+                    "detached": bool(job.get("detached")),
                 }
             )
         out.sort(key=lambda j: (j["started_at"], j["job_id"]))
         return out, complete
+
+    def seq(self, work_area_id: str, now: float) -> int:
+        """台账的结束序号：每有一个任务结束加一；工作区删除后从 0 重新计。"""
+        return int(self._load(work_area_id, now).get("seq", 0))

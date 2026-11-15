@@ -14,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 
 from src.config import settings
 from src.main import app
+from src.manager import wa_instances
 from src.manager.wa_instances import WorkAreaError, WorkAreaService
 from src.manager.wa_jobs import JOB_ORIGIN_HEADER, JobLedger, JobsReport, ReportedJob, iso_utc, parse_report
 from src.models import ContainerInfo, WorkAreaInstance
@@ -67,7 +68,8 @@ def test_ledger_persists_and_reloads(tmp_path):
     reloaded = JobLedger(tmp_path)  # Hub 重启 / 实例重建后从宿主文件恢复
     jobs, complete = reloaded.snapshot("wa1", {"sb_a"}, now=120.0)
     assert complete and jobs == [
-        {"job_id": J1, "session_id": "s1", "turn_id": "t1", "started_at": iso_utc(100.0), "ended_at": None}
+        {"job_id": J1, "session_id": "s1", "turn_id": "t1", "started_at": iso_utc(100.0), "ended_at": None,
+         "exit_code": None, "kill_reason": None, "killed_by": None, "detached": False}
     ]
     assert (tmp_path / "wa1.json").stat().st_mode & 0o777 == 0o600
 
@@ -91,7 +93,7 @@ def test_open_job_missing_from_report_is_closed_at_observation(tmp_path):
 
 
 def test_unattributed_live_job_makes_ledger_unknown_until_retention(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "WORK_AREA_JOB_MAX_LIFETIME", 100)
+    monkeypatch.setattr(settings, "WORK_AREA_JOB_LEDGER_RETENTION", 100)
     ledger = JobLedger(tmp_path)
     ledger.merge("wa1", "sb_a", _report((J1, None, None, 10.0, 20.0), live=(J2,)), now=30.0, token=0)
     jobs, complete = ledger.snapshot("wa1", {"sb_a"}, now=40.0)
@@ -104,7 +106,7 @@ def test_unattributed_live_job_makes_ledger_unknown_until_retention(tmp_path, mo
 
 
 def test_unobserved_starts_become_gap_when_instance_dies(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "WORK_AREA_JOB_MAX_LIFETIME", 100)
+    monkeypatch.setattr(settings, "WORK_AREA_JOB_LEDGER_RETENTION", 100)
     ledger = JobLedger(tmp_path)
     ledger.start_begin("wa1", "sb_a", now=10.0)
     ledger.start_end("sb_a")
@@ -142,7 +144,7 @@ def test_snapshot_settles_jobs_of_vanished_instances(tmp_path):
 
 
 def test_retention_cleans_ended_jobs(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "WORK_AREA_JOB_MAX_LIFETIME", 100)
+    monkeypatch.setattr(settings, "WORK_AREA_JOB_LEDGER_RETENTION", 100)
     ledger = JobLedger(tmp_path)
     ledger.merge(
         "wa1", "sb_a",
@@ -178,8 +180,10 @@ async def test_job_report_lists_tagged_jobs(svc):
     report = await service.job_report("wa1")
     assert report["known"] is True and ISO_Z.match(report["now"])
     assert report["jobs"] == [
-        {"job_id": J1, "session_id": "s1", "turn_id": "t1", "started_at": iso_utc(100.0), "ended_at": None}
+        {"job_id": J1, "session_id": "s1", "turn_id": "t1", "started_at": iso_utc(100.0), "ended_at": None,
+         "exit_code": None, "kill_reason": None, "killed_by": None, "detached": False}
     ]
+    assert report["cursor"] == "0"  # 不带 wait：立即返回，只多一个游标
     # activity 本身也照常回报计数（闲置判定不受影响）
     activity = await service.activity(instance)
     assert activity["known"] and activity["jobs_known"] and activity["marked_processes"] == 1
@@ -446,3 +450,117 @@ async def test_forwarder_drops_caller_origin_header_and_injects_hub_one():
         assert sent[JOB_ORIGIN_HEADER] == "hub"
     finally:
         forwarder._get_client = original
+
+
+# ── 任务结果与结束游标（SandboxHub#90）──────────────────────────────────────────
+
+
+def test_parse_report_reads_result_fields_and_rejects_bad_ones():
+    item = dict(_job(J1, ended=101.0), exit_code=3, kill_reason="kill:INT", killed_by="user", detached=True)
+    [job] = parse_report(_activity(item)).jobs
+    assert (job.exit_code, job.kill_reason, job.killed_by, job.detached) == (3, "kill:INT", "user", True)
+    [plain] = parse_report(_activity(_job(J1))).jobs  # 旧镜像不带结果字段
+    assert (plain.exit_code, plain.kill_reason, plain.killed_by, plain.detached) == (None, None, None, False)
+    for bad in ({"exit_code": "0"}, {"exit_code": True}, {"killed_by": "root"}, {"detached": "yes"}, {"kill_reason": 1}):
+        with pytest.raises(ValueError):
+            parse_report(_activity(dict(_job(J1), **bad)))
+
+
+def test_ledger_records_results_and_bumps_seq_once_per_ended_job(tmp_path):
+    ledger = JobLedger(tmp_path)
+    ledger.merge("wa1", "sb_a", _report((J1, "s1", "t1", 100.0, None), (J2, "s1", "t1", 101.0, None)), now=110.0, token=0)
+    assert ledger.seq("wa1", 110.0) == 0
+    # 退出码先到（窗口已结束、后代进程还在）：记下结果，但任务尚未结束、游标不动
+    ledger.merge(
+        "wa1", "sb_a",
+        _report((J1, "s1", "t1", 100.0, None, 0, None, None, True), (J2, "s1", "t1", 101.0, None)),
+        now=115.0, token=0,
+    )
+    assert ledger.seq("wa1", 115.0) == 0
+    ledger.merge(
+        "wa1", "sb_a",
+        _report((J1, "s1", "t1", 100.0, 118.0, 0, None, None, True),
+                (J2, "s1", "t1", 101.0, 119.0, 130, "kill:INT", "user")),
+        now=120.0, token=0,
+    )
+    assert ledger.seq("wa1", 120.0) == 2
+    # 再次观测同样的清单：已结束的不重开、不重复计数
+    ledger.merge(
+        "wa1", "sb_a",
+        _report((J1, "s1", "t1", 100.0, 118.0, 9, "x", "model"), (J2, "s1", "t1", 101.0, 119.0)),
+        now=125.0, token=0,
+    )
+    reloaded = JobLedger(tmp_path)
+    assert reloaded.seq("wa1", 126.0) == 2
+    jobs, complete = reloaded.snapshot("wa1", {"sb_a"}, now=126.0)
+    assert complete and [
+        (j["job_id"], j["exit_code"], j["kill_reason"], j["killed_by"], j["detached"]) for j in jobs
+    ] == [(J1, 0, None, None, True), (J2, 130, "kill:INT", "user", False)]
+
+
+def test_jobs_lost_with_their_instance_are_marked_instance_gone(tmp_path):
+    ledger = JobLedger(tmp_path)
+    ledger.merge(
+        "wa1", "sb_a",
+        _report((J1, "s1", "t1", 100.0, None), (J2, "s1", "t1", 101.0, None, 0)),
+        now=110.0, token=0,
+    )
+    ledger.settle_sandbox("wa1", "sb_a", now=200.0)
+    jobs, _ = ledger.snapshot("wa1", set(), now=201.0)
+    by_id = {j["job_id"]: j for j in jobs}
+    assert by_id[J1]["kill_reason"] == "instance_gone" and by_id[J1]["exit_code"] is None
+    # 已经有退出码的（只是后代进程没走完）不算丢失
+    assert by_id[J2]["kill_reason"] is None and by_id[J2]["exit_code"] == 0
+    assert ledger.seq("wa1", 201.0) == 2
+
+
+def test_ledger_retention_zero_never_prunes(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "WORK_AREA_JOB_LEDGER_RETENTION", 0)
+    ledger = JobLedger(tmp_path)
+    ledger.merge("wa1", "sb_a", _report((J1, "s1", "t1", 1.0, 2.0)), now=3.0, token=0)
+    jobs, _ = ledger.snapshot("wa1", {"sb_a"}, now=10**9)
+    assert [j["job_id"] for j in jobs] == [J1]
+
+
+async def test_job_report_long_poll_returns_when_a_job_ends(svc, monkeypatch):
+    service, _ = svc
+    monkeypatch.setattr(wa_instances, "JOBS_POLL_INTERVAL", 0.01)
+    await service.acquire(_spec(session_id="s1", turn_id="t1"))
+    begun = time.time() - 10
+    running = _activity(_job(J1, started=begun), marked=1)
+    ended = _activity(dict(_job(J1, started=begun, ended=begun + 5), exit_code=2))
+    service._probe_terminal.side_effect = [running, running, ended, ended, ended]
+    started = time.monotonic()
+    report = await service.job_report("wa1", wait=30.0)
+    assert time.monotonic() - started < 5  # 有任务结束即返回，不等满
+    assert report["cursor"] == "1" and report["jobs"][0]["exit_code"] == 2
+    assert service._probe_terminal.await_count == 3
+    # 带上次的游标且没有新结束：等满 wait 才返回，游标不变
+    service._probe_terminal.side_effect = None
+    service._probe_terminal.return_value = ended
+    again = await service.job_report("wa1", wait=0.05, since=1)
+    assert again["cursor"] == "1"
+    # 游标落后（错过了结束）或超前（工作区重建后序号归零）：立即返回
+    for since in (0, 99):
+        started = time.monotonic()
+        assert (await service.job_report("wa1", wait=30.0, since=since))["cursor"] == "1"
+        assert time.monotonic() - started < 5
+
+
+async def test_job_report_wait_is_capped_by_setting(svc, monkeypatch):
+    service, _ = svc
+    monkeypatch.setattr(wa_instances, "JOBS_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(settings, "WORK_AREA_JOBS_WAIT_MAX", 1)
+    await service.acquire(_spec())
+    started = time.monotonic()
+    await service.job_report("wa1", wait=3600.0)
+    assert 0.9 < time.monotonic() - started < 5
+
+
+async def test_capabilities_report_terminal_jobs_and_limits(svc, monkeypatch):
+    service, _ = svc
+    monkeypatch.setattr(settings, "WORK_AREA_MAX_LIVE_JOBS", 7)
+    caps = service.capabilities()
+    assert caps["terminal_jobs"] == 2
+    assert caps["limits"]["max_live_jobs"] == 7
+    assert {"jobs_wait_max", "job_ledger_retention", "job_log_retention", "job_max_lifetime"} <= set(caps["limits"])

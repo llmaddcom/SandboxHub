@@ -12,7 +12,12 @@
   （EXIT trap）把 ``pwd`` 与 ``env -0`` 落盘，同 session 的下一个 job 以此为起点。
   ``cd``/``export``/``source venv`` 因而跨调用保留；shell 函数/别名/未导出变量不跨越。
 - 多 job 并行：同一容器同时可跑多个 job。活跃窗口到 ``MAX_LIVE_WINDOWS`` 时
-  拒绝新提交，已有任务继续运行；只回收已完成窗口。
+  拒绝新提交（``JobLimitError``，机器码 ``job_limit_reached``），已有任务继续运行；提交前先回收
+  已完成窗口。
+- detached（SandboxHub#90）：调用方不再等它的 job（提交时 ``background``，或之后 ``detach``）。
+  它结束时**不回写**会话的 cwd / 导出环境——否则会覆盖其后前台命令留下的状态；前台跑完的照旧回写。
+- 结果落盘：结算时把退出码、终止原因、谁停的、是否 detached 写进 ``<job_id>.result``，任务台账
+  （activity）据此回报，不依赖内存里的 job 记录。
 - 完成判定：``remain-on-exit`` 下轮询 ``pane_dead`` / ``pane_dead_status``（= 命令退出码，
   信号致死为 128+N）；结束后窗口即销毁，日志保留。
 - ``timeout``：无默认、无上限。到期先 SIGINT，宽限后 SIGKILL 整个进程组。
@@ -47,13 +52,18 @@ MAX_JOB_RECORDS = 200     # 内存保留的 job 记录数（日志文件不删�
 # 任务来源台账（SandboxHub#47）：每个 job 落 ``<job_id>.origin``（来源 + 开始时间）与
 # ``<job_id>.end``（窗口结束且不再有带该 job 标记的存活进程的时刻）。activity 回报保留期内的条目。
 END_POLL_INTERVAL = 1.0   # 窗口已结束、后代进程仍在时，轮询其消失的间隔（结束时间精度）
-LEDGER_RETENTION = MAX_JOB_LIFETIME or 86400.0
+# 已结束任务在台账（activity 回报）里保留多久（秒，0 = 不清理）；Hub 注入 work_area.job_ledger_retention
+LEDGER_RETENTION = float(os.getenv("SANDBOX_JOB_LEDGER_RETENTION") or 86400.0)
+# 已结束任务的日志与状态文件保留多久（秒，0 = 不清理）；Hub 注入 work_area.job_log_retention
+LOG_RETENTION = float(os.getenv("SANDBOX_JOB_LOG_RETENTION") or 0)
 JOB_ID_RE = re.compile(r"^j_[0-9A-HJKMNP-TV-Z]{26}$")
 
 # ---- tmux ----
 TMUX_SOCKET = os.getenv("CR_TMUX_SOCKET") or None   # None = 默认 socket（容器内 tmux ls 直接可见）
 DEFAULT_SESSION = "default"
-MAX_LIVE_WINDOWS = 64     # 整个 tmux server 的活跃窗口上限（对标 codex MAX_UNIFIED_EXEC_PROCESSES）
+# 整个 tmux server 的活跃窗口上限（0 = 不限；默认对标 codex MAX_UNIFIED_EXEC_PROCESSES）。
+# Hub 注入 work_area.max_live_jobs。
+MAX_LIVE_WINDOWS = int(os.getenv("SANDBOX_JOB_MAX_LIVE") or 64)
 POLL_INTERVAL = 0.1       # 轮询 pane 状态的间隔
 DEAD_STATUS_TICKS = 10    # pane 已死但退出码未到时最多再等的轮询次数
 PANE_COLUMNS, PANE_LINES = 200, 50
@@ -237,6 +247,24 @@ def session_name(raw: str | None) -> str:
     return name or DEFAULT_SESSION
 
 
+class JobLimitError(ToolError):
+    """活跃终端已满：新命令未执行。``limit`` / ``running`` 供调用方原样告诉使用者。"""
+
+    code = "job_limit_reached"
+
+    def __init__(self, limit: int, running: int):
+        super().__init__(
+            f"活跃终端已达容量 {limit}（当前 {running} 个在运行），新命令未执行，已有任务继续运行。"
+            "请等待任务结束，或先终止不再需要的任务后再提交。"
+        )
+        self.limit = limit
+        self.running = running
+        self.args = (self.message,)
+
+
+KILLERS = ("model", "user", "platform")
+
+
 @dataclass
 class Job:
     id: str
@@ -255,6 +283,10 @@ class Job:
     origin: dict | None = None
     # 窗口结束且不再有带本 job 标记的存活进程的时刻（上界）；None = 仍可能在跑
     ended_at: float | None = None
+    # 调用方不再等它（后台任务）：结束时不回写会话 cwd / 导出环境
+    detached: bool = False
+    # 谁要求终止的："model" | "user" | "platform"；未说明或自然结束为 None
+    killed_by: str | None = None
     dead_ticks: int = 0
     sigkilled: bool = False             # 我方已对进程组发过 SIGKILL（退出码兜底 137）
     done: asyncio.Event = field(default_factory=asyncio.Event)
@@ -450,13 +482,15 @@ class JobSession:
 
     # ------------------------------------------------------------------ 提交
     async def start_job(self, command: str, timeout: float | None = None,
-                        session: str | None = None, origin: dict | None = None) -> Job:
+                        session: str | None = None, origin: dict | None = None,
+                        background: bool = False) -> Job:
         # 容量检查与创建窗口原子化，避免并发提交越过窗口上限。
         async with self._submit_lock:
-            return await self._start_job(command, timeout, session, origin)
+            return await self._start_job(command, timeout, session, origin, background)
 
     async def _start_job(self, command: str, timeout: float | None,
-                         session: str | None, origin: dict | None = None) -> Job:
+                         session: str | None, origin: dict | None = None,
+                         background: bool = False) -> Job:
         """在该 session 的 tmux 会话里开一个窗口跑命令；返回 running 的 job。"""
         if not command:
             raise ToolError("未提供命令。")
@@ -475,6 +509,7 @@ class JobSession:
             state_base=base,
             timeout=timeout,
             origin=origin,
+            detached=background,
         )
         base.with_suffix(".sh").write_text(command + "\n")
         base.with_suffix(".run.sh").write_text(_WRAPPER)
@@ -495,11 +530,14 @@ class JobSession:
         window_cmd = f"exec script -q -f -e -c {shlex.quote(inner)} {shlex.quote(str(job.log_path))}"
         # 来源先于进程落盘：台账不会漏掉已经在跑的 job
         self._write_origin(job)
+        if job.detached:
+            self._mark_detached(job)
         self._starting.add(job_id)
         try:
             job.pane_id = await self._open_window(st.name, job_id, cwd, window_cmd)
         except BaseException:
             base.with_suffix(".origin").unlink(missing_ok=True)
+            base.with_suffix(".detached").unlink(missing_ok=True)
             raise
         finally:
             self._starting.discard(job_id)
@@ -527,19 +565,16 @@ class JobSession:
         return out.strip()
 
     async def _reap_windows(self) -> None:
-        """容量满时拒绝新任务，不强杀旧任务。"""
+        """先清已结算的退出窗口，再查容量；容量满时拒绝新任务，不强杀旧任务。"""
         panes = await self.tmux.list_panes(strict=True)
-        live = [pane for pane in panes if not pane["dead"]]
-        if len(live) >= MAX_LIVE_WINDOWS:
-            raise ToolError(
-                f"活跃终端已达容量 {MAX_LIVE_WINDOWS}，新命令未执行，已有任务继续运行。"
-                "请等待任务结束，或通过 /api/terminal/kill 显式终止不再需要的 job 后再提交。"
-            )
         # 仅清已结算的退出窗口；日志与 job 记录保留供 wait/read 查询。
         for pane in panes:
             job = self._job_by_pane(pane["pane_id"])
             if pane["dead"] and job is not None and job.finished:
                 await self.tmux.ok("kill-pane", "-t", pane["pane_id"])
+        live = [pane for pane in panes if not pane["dead"]]
+        if 0 < MAX_LIVE_WINDOWS <= len(live):
+            raise JobLimitError(MAX_LIVE_WINDOWS, len(live))
 
     def _job_by_pane(self, pane_id: str) -> Job | None:
         for job in self.jobs.values():
@@ -596,7 +631,10 @@ class JobSession:
         job.kill_reason = kill_reason
         job.status = STATUS_KILLED if kill_reason else STATUS_EXITED
         job.finished_at = time.time()
-        self._load_state(job)
+        if not job.detached:
+            # detached 的任务不回写：它启动时的 cwd / 环境快照早已过时，回写会盖掉之后前台命令的状态
+            self._load_state(job)
+        self._write_result(job)
         job.done.set()
         self._ensure_end_tracker()
         if kill_reason:
@@ -698,6 +736,53 @@ class JobSession:
         job.state_base.with_suffix(".origin").write_text(json.dumps(value))
 
     @staticmethod
+    def _mark_detached(job: Job) -> None:
+        try:
+            job.state_base.with_suffix(".detached").write_text("1")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _write_result(job: Job) -> None:
+        """结算结果落盘：台账在内存记录被淘汰或服务重启后仍能回报退出码与结束原因。"""
+        value = {
+            "exit_code": job.exit_code,
+            "kill_reason": job.kill_reason,
+            "killed_by": job.killed_by,
+            "detached": job.detached,
+        }
+        try:
+            job.state_base.with_suffix(".result").write_text(json.dumps(value))
+        except OSError:
+            pass
+
+    def _result(self, job_id: str) -> dict:
+        """一个 job 的结果字段：内存记录优先，其次落盘的 ``.result`` / ``.detached``。"""
+        job = self.jobs.get(job_id)
+        base = JOB_DIR / job_id
+        if job is not None:
+            return {
+                "exit_code": job.exit_code,
+                "kill_reason": job.kill_reason if job.finished else None,
+                "killed_by": job.killed_by if job.finished else None,
+                "detached": job.detached,
+            }
+        out = {"exit_code": None, "kill_reason": None, "killed_by": None,
+               "detached": base.with_suffix(".detached").exists()}
+        try:
+            saved = json.loads(base.with_suffix(".result").read_text())
+        except (OSError, ValueError):
+            return out
+        if not isinstance(saved, dict):
+            return out
+        code, reason, by = saved.get("exit_code"), saved.get("kill_reason"), saved.get("killed_by")
+        out["exit_code"] = code if type(code) is int else None
+        out["kill_reason"] = reason if isinstance(reason, str) else None
+        out["killed_by"] = by if by in KILLERS else None
+        out["detached"] = out["detached"] or saved.get("detached") is True
+        return out
+
+    @staticmethod
     def _write_end(job_id: str, at: float) -> None:
         try:
             (JOB_DIR / job_id).with_suffix(".end").write_text(repr(at))
@@ -736,7 +821,8 @@ class JobSession:
         live = set(marked) | {j.id for j in self.running} | set(self._starting)
         entries: list[dict] = []
         recorded: set[str] = set()
-        cutoff = now - LEDGER_RETENTION
+        cutoff = now - LEDGER_RETENTION if LEDGER_RETENTION != 0 else float("-inf")
+        self._sweep_logs(live, now)
         try:
             paths = list(JOB_DIR.glob("j_*.origin"))
         except OSError:
@@ -766,7 +852,8 @@ class JobSession:
             if ended is not None and ended < cutoff:
                 # 超过保留期：Hub 早已观测并自行持久化，删掉以免台账随容器寿命无限增长
                 path.unlink(missing_ok=True)
-                path.with_suffix(".end").unlink(missing_ok=True)
+                for suffix in (".end", ".result", ".detached"):
+                    path.with_suffix(suffix).unlink(missing_ok=True)
                 continue
             session, turn = meta.get("session_id"), meta.get("turn_id")
             entries.append({
@@ -775,9 +862,32 @@ class JobSession:
                 "turn_id": turn if isinstance(turn, str) else None,
                 "started_at": started,
                 "ended_at": ended,
+                **self._result(job_id),
             })
         entries.sort(key=lambda e: (e["started_at"], e["job_id"]))
         return {"jobs": entries, "unattributed_live": sorted(live - recorded)}
+
+    def _sweep_logs(self, live: set[str], now: float) -> None:
+        """删掉结束超过 ``LOG_RETENTION`` 的任务的日志与状态文件（0 = 不清理）；台账文件另按其保留期。"""
+        if LOG_RETENTION <= 0:
+            return
+        cutoff = now - LOG_RETENTION
+        try:
+            logs = list(JOB_DIR.glob("j_*.log"))
+        except OSError:
+            return
+        for path in logs:
+            job_id = path.name[: -len(".log")]
+            job = self.jobs.get(job_id)
+            if job_id in live or (job is not None and not job.finished):
+                continue
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            for suffix in (".log", ".sh", ".run.sh", ".envin", ".env", ".cwd", ".pid", ".rc"):
+                (JOB_DIR / f"{job_id}{suffix}").unlink(missing_ok=True)
 
     def _prune(self) -> None:
         if len(self.jobs) <= MAX_JOB_RECORDS:
@@ -805,17 +915,37 @@ class JobSession:
         except asyncio.TimeoutError:
             pass
 
-    async def kill(self, job: Job, sig: str = "INT", reason: str | None = None) -> None:
-        """向 job 的进程组发信号；已结束的 job 无操作。"""
+    async def kill(self, job: Job, sig: str = "INT", reason: str | None = None,
+                   by: str | None = None) -> None:
+        """向 job 的进程组发信号；已结束的 job 无操作。``by`` 记录是谁要求终止的（先到先得）。"""
         if job.finished:
             return
         try:
             signum = _SIGNALS[sig.upper()]
         except KeyError:
             raise ToolError(f"不支持的信号：{sig}（可选 INT / TERM / KILL）")
+        if by is not None and by not in KILLERS:
+            raise ToolError(f"不支持的 by：{by}（可选 {' / '.join(KILLERS)}）")
         async with job._kill_lock:
             job.kill_reason = job.kill_reason or reason or f"kill:{sig.upper()}"
+            job.killed_by = job.killed_by or by
             await self._signal(job, signum)
+
+    def detach(self, job: Job) -> None:
+        """标成 detached（幂等）：调用方不再等它，结束时不回写会话 cwd / 导出环境。已结束的无操作。"""
+        if job.finished or job.detached:
+            return
+        job.detached = True
+        self._mark_detached(job)
+
+    async def send_input(self, job: Job, text: str, enter: bool = True) -> None:
+        """向 job 的终端输入文本（按字面，不解释按键名），``enter`` 时再按一次回车。"""
+        if job.finished:
+            raise ToolError(f"job 已结束，无法输入：{job.id}")
+        if text:
+            await self.tmux.run("send-keys", "-t", job.pane_id, "-l", "--", text)
+        if enter:
+            await self.tmux.run("send-keys", "-t", job.pane_id, "Enter")
 
     async def reset(self, session: str | None = None) -> None:
         """kill 该 session 仍在跑的 job（SIGKILL）并销毁其 tmux 会话，cwd / env 复位。"""
@@ -858,9 +988,12 @@ class BashTool:
 
     # ------------------------------------------------------------------ job 契约
     async def submit(self, command: str, wait: float = DEFAULT_WAIT, timeout: float | None = None,
-                     session: str | None = None, origin: dict | None = None) -> Job:
-        """提交命令并最多等 wait 秒（上限 MAX_WAIT）。"""
-        job = await self.session.start_job(command, timeout=timeout, session=session, origin=origin)
+                     session: str | None = None, origin: dict | None = None,
+                     background: bool = False) -> Job:
+        """提交命令并最多等 wait 秒（上限 MAX_WAIT）；``background`` 的任务一启动即 detached。"""
+        job = await self.session.start_job(
+            command, timeout=timeout, session=session, origin=origin, background=background
+        )
         await self.session.wait(job, min(max(wait, 0.0), MAX_WAIT))
         return job
 
@@ -872,11 +1005,24 @@ class BashTool:
         await self.session.wait(job, min(max(wait, 0.0), MAX_WAIT))
         return job
 
-    async def kill(self, job_id: str, sig: str = "INT") -> Job:
+    async def kill(self, job_id: str, sig: str = "INT", by: str | None = None) -> Job:
         job = self.session.get(job_id)
-        await self.session.kill(job, sig)
+        await self.session.kill(job, sig, by=by)
         # 给进程一点时间退出，让 kill 响应里尽量直接带 killed 终态
         await self.session.wait(job, 1.0)
+        return job
+
+    def detach(self, job_id: str) -> Job:
+        job = self.session.get(job_id)
+        self.session.detach(job)
+        return job
+
+    async def send_input(self, job_id: str, text: str, enter: bool = True,
+                         settle: float = 0.3) -> Job:
+        job = self.session.get(job_id)
+        await self.session.send_input(job, text, enter)
+        # 留一点时间让程序回显 / 处理输入，响应里的增量输出才有内容
+        await self.session.wait(job, settle)
         return job
 
     def pop_notes(self, session: str | None = None) -> str | None:
