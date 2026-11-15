@@ -60,6 +60,10 @@ from src.proxy.forwarder import SANDBOX_TOKEN_HEADER, close_client
 # 未声明 layout_version 的请求按 v1 处理（引入 v2 之前的调用方）；能力里的 ``layout_version`` 也报 1，
 # 新调用方看 ``layout_versions``（#71：报最高版会让只认 1 的已发布后端拒绝整个 Hub）。
 LAYOUT_VERSION = layouts.V1.version
+# 终端任务契约代次，经 /v2/capabilities 的 ``terminal_jobs`` 上报（SandboxHub#90）
+TERMINAL_JOBS_VERSION = 2
+# ``/jobs`` 长轮询等待期间多久观测一次容器（单次最多等多久见 work_area.jobs_wait_max）
+JOBS_POLL_INTERVAL = 1.0
 CWD = layouts.V1.cwd
 # 这些原因下实例 API 已不可达，销毁前不再做最后一次任务观测（徒增超时）
 _UNREACHABLE_REASONS = frozenset({"container_gone", "unhealthy", "create_failed"})
@@ -333,11 +337,18 @@ class WorkAreaService:
                 "layout_versions": list(layouts.SUPPORTED_LAYOUTS),
                 # 实例 /tmp 可落在工作区的宿主目录（acquire 带 tmp 规则；文件接口的 tmp 根）
                 "tmp_root": True,
+                # 终端任务契约代次（SandboxHub#90）：2 = detach / input / kill.by、任务清单带退出码
+                # 与结束原因、/jobs 支持 wait + since 长轮询、容量已满回 job_limit_reached
+                "terminal_jobs": TERMINAL_JOBS_VERSION,
                 "cwd": CWD,
                 "limits": {
                     "max_per_role": settings.WORK_AREA_MAX_PER_ROLE,
                     "max_per_user": settings.WORK_AREA_MAX_PER_USER,
                     "job_max_lifetime": settings.WORK_AREA_JOB_MAX_LIFETIME,
+                    "max_live_jobs": settings.WORK_AREA_MAX_LIVE_JOBS,
+                    "jobs_wait_max": settings.WORK_AREA_JOBS_WAIT_MAX,
+                    "job_ledger_retention": settings.WORK_AREA_JOB_LEDGER_RETENTION,
+                    "job_log_retention": settings.WORK_AREA_JOB_LOG_RETENTION,
                     "idle_backstop_ttl": settings.WORK_AREA_IDLE_BACKSTOP_TTL,
                     "idle_release_seconds": settings.WORK_AREA_IDLE_RELEASE_SECONDS,
                     "soft_cap_bytes": settings.WORK_AREA_SOFT_CAP_BYTES,
@@ -1022,8 +1033,31 @@ class WorkAreaService:
         finally:
             self.jobs.start_end(instance.sandbox_id)
 
-    async def job_report(self, work_area_id: str) -> dict:
-        """``GET /v2/work-areas/{id}/jobs``：工作区任务来源清单（契约见 createrole_com_api#38 C.2）。"""
+    async def job_report(
+        self, work_area_id: str, *, wait: float = 0.0, since: Optional[int] = None
+    ) -> dict:
+        """``GET /v2/work-areas/{id}/jobs``：工作区任务来源清单（契约见 createrole_com_api#38 C.2）。
+
+        ``wait`` > 0 时长轮询（SandboxHub#90）：台账的结束序号超过 ``since``（不带则取本次调用
+        开始时的序号）即返回，否则每 ``JOBS_POLL_INTERVAL`` 秒观测一次直到 ``wait`` 用完（上限
+        ``work_area.jobs_wait_max``，0 = 不限）。响应的
+        ``cursor`` 是返回时的结束序号，下次原样作 ``since``。``since`` 比当前序号还大（工作区
+        删除重建后序号归零）按「有变化」立即返回。
+        """
+        cap = settings.WORK_AREA_JOBS_WAIT_MAX
+        wait = max(wait, 0.0)
+        deadline = time.monotonic() + (min(wait, cap) if cap > 0 else wait)
+        while True:
+            report = await self._job_report_once(work_area_id)
+            seq = report.pop("_seq")
+            report["cursor"] = str(seq)
+            if since is None:
+                since = seq
+            if seq != since or time.monotonic() >= deadline:
+                return report
+            await asyncio.sleep(min(JOBS_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
+
+    async def _job_report_once(self, work_area_id: str) -> dict:
         if not valid_id(work_area_id):
             raise WorkAreaError(400, "invalid_request", f"work_area_id 非法：{work_area_id!r}")
         instance = self.registry.find_by_work_area(work_area_id)
@@ -1042,7 +1076,12 @@ class WorkAreaService:
                 observed = observed and report.get("jobs_known") is True
         now = time.time()
         jobs, complete = self.jobs.snapshot(work_area_id, live, now)
-        return {"known": observed and complete, "now": iso_utc(now), "jobs": jobs}
+        return {
+            "known": observed and complete,
+            "now": iso_utc(now),
+            "jobs": jobs,
+            "_seq": self.jobs.seq(work_area_id, now),
+        }
 
     async def delete_work_area(self, work_area_id: str, *, force: bool = False) -> dict:
         if not valid_id(work_area_id):

@@ -475,3 +475,32 @@ async def test_acquire_v2_maps_tmp_policy(client, service, with_key):
         body["tmp"] = {"outputs_keep_seconds": -1}
         r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
         assert r.status_code == 422
+
+
+async def test_jobs_route_passes_long_poll_params_and_rejects_bad_cursor(client, service, with_key):
+    service.job_report = AsyncMock(return_value={"known": True, "now": "x", "jobs": [], "cursor": "4"})
+    async with client:
+        r = await client.get("/v2/work-areas/wa1/jobs", headers=HEADERS)
+        assert r.status_code == 200 and r.json()["cursor"] == "4"
+        service.job_report.assert_awaited_with("wa1", wait=0.0, since=None)
+        r = await client.get("/v2/work-areas/wa1/jobs?wait=30&since=3", headers=HEADERS)
+        assert r.status_code == 200
+        service.job_report.assert_awaited_with("wa1", wait=30.0, since=3)
+        r = await client.get("/v2/work-areas/wa1/jobs?since=abc", headers=HEADERS)
+        assert r.status_code == 400 and r.json()["detail"]["reason"] == "invalid_request"
+
+
+@pytest.mark.parametrize("path", ["api/terminal/detach", "api/terminal/input", "api/terminal/kill"])
+async def test_proxy_forwards_job_control_endpoints_without_origin_tag(client, service, with_key, monkeypatch, path):
+    """detach / input / kill 原样转发给容器；只有启动任务的请求才打来源标。"""
+    service.get.return_value = _instance()
+    from fastapi import Response
+
+    forwarded = AsyncMock(return_value=Response(status_code=200, content=b"{}"))
+    monkeypatch.setattr(v2_router, "forward", forwarded)
+    async with client:
+        r = await client.post(f"/v2/sandboxes/sb_1/proxy/{path}", json={"job_id": "j"}, headers=HEADERS)
+    assert r.status_code == 200
+    args, kwargs = forwarded.await_args
+    assert args[1] == path and "extra_headers" not in kwargs
+    service.terminal_start.assert_not_called()

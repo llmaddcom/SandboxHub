@@ -251,8 +251,24 @@ curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/kil
 `tmux kill-window`). `POST /api/terminal/restart` (`{"session": "…"}`) kills that session's
 running jobs, destroys its tmux session and resets cwd / env.
 
-The server retains a capacity of 64 live windows and rejects new commands when full;
-existing jobs keep running. `GET /api/terminal/activity` reports `running_jobs`,
+**Background jobs (SandboxHub#90).** A job is *detached* when its caller no longer waits for
+it: submit with `"background": true` (returns at once; without `wait` it is treated as `wait=0`
+instead of the blocking legacy contract), or call `POST /api/terminal/detach {"job_id"}` on a
+running job (idempotent; a no-op once the job has ended). A detached job does **not** write its
+cwd / exported environment back to the session when it ends — otherwise it would overwrite what
+later foreground commands left; foreground jobs still write back.
+`POST /api/terminal/input {"job_id", "text", "enter": true, "cursor"?}` types `text` literally into
+a running job's terminal (key names are not interpreted) and presses Enter when `enter` is true;
+it returns the output produced since the input (or from `cursor`), `404` for an unknown job and
+`409` once the job has ended. `kill` accepts an optional `by` (`model` | `user` | `platform`),
+recorded as the job's `killed_by` (first writer wins). Every job payload carries `exit_code`,
+`kill_reason`, `killed_by`, `ended_at` (epoch seconds, `null` while the job or a marked
+descendant may still run) and `detached`.
+
+The server keeps at most `work_area.max_live_jobs` live windows (default 64, `0` = unlimited).
+Exited windows are reaped before the check; when full, `execute` returns
+`409 {"detail": {"code": "job_limit_reached", "limit": 64, "running": 64, "message": "…"}}`
+and existing jobs keep running. `GET /api/terminal/activity` reports `running_jobs`,
 `live_panes`, and `marked_processes` (running long-lived procs are included in
 `running_jobs` and also reported as `running_procs`, see below). Each job passes an internal, non-secret ID to
 its child processes, so `/proc` activity also protects `nohup`, background `&`, and
@@ -261,8 +277,12 @@ is excluded from saved session environment; zombies do not count. Idle reclaim
 requires all three counters to be zero. Unreadable process activity, missing fields,
 and unavailable or old container APIs are preserved rather than assumed idle.
 The same response carries the job-origin ledger used by v2 `GET /v2/work-areas/{id}/jobs`:
-`jobs` (`job_id`, `session_id`, `turn_id`, `started_at`, `ended_at` as epoch seconds) and
-`unattributed_live` (live marked jobs without an origin record). A job ends once its
+`jobs` (`job_id`, `session_id`, `turn_id`, `started_at`, `ended_at` as epoch seconds, plus
+`exit_code`, `kill_reason`, `killed_by`, `detached`) and
+`unattributed_live` (live marked jobs without an origin record). Results are persisted next to
+the log (`<job_id>.result`), so they survive the in-memory record. Ledger entries are kept for
+`work_area.job_ledger_retention` seconds after the job ends, log files for
+`work_area.job_log_retention` (both `0` = never removed). A job ends once its
 window has exited and no marked descendant remains (tracked about once per second).
 
 `POST /api/file/view` accepts `max_chars` (default 16000) and `column` (default 0),
@@ -385,7 +405,7 @@ The Ubuntu container exposes 40+ REST endpoints and 30+ MCP tools. Key categorie
 
 | Category | Endpoints | Description |
 |----------|-----------|-------------|
-| Terminal | `/api/terminal/execute`, `/wait`, `/kill`, `/restart`, `/execute/stream` | Job-based bash execution in per-conversation tmux sessions, long-poll, kill, SSE streaming |
+| Terminal | `/api/terminal/execute`, `/wait`, `/kill`, `/detach`, `/input`, `/restart`, `/execute/stream` | Job-based bash execution in per-conversation tmux sessions, long-poll, kill, SSE streaming |
 | Procs | `/api/procs`, `/{id}/stdin`, `/{id}/read`, `/{id}/signal`, `DELETE /{id}` | Long-lived stdio processes (execution engines): explicit env, separate byte-exact stdout/stderr logs, cursor long-poll |
 | Screen | `/api/screen/screenshot`, `/screenshot/region` | Full-screen or region capture |
 | Mouse | `/api/mouse/click`, `/move`, `/drag`, `/scroll` | Pixel-level mouse control |
@@ -750,10 +770,24 @@ jobs, and a final probe before quiesce/release) merges the report into
 and Hub restarts. `GET /v2/work-areas/{id}/jobs` returns:
 
 ```json
-{"known": true, "now": "2026-10-22T08:00:00.123456Z",
+{"known": true, "now": "2026-10-22T08:00:00.123456Z", "cursor": "7",
  "jobs": [{"job_id": "j_…", "session_id": "…", "turn_id": "…",
-           "started_at": "2026-10-22T07:59:00.000000Z", "ended_at": null}]}
+           "started_at": "2026-10-22T07:59:00.000000Z", "ended_at": null,
+           "exit_code": null, "kill_reason": null, "killed_by": null, "detached": true}]}
 ```
+
+`exit_code` / `kill_reason` / `killed_by` / `detached` come from the container
+(SandboxHub#90); `exit_code` may arrive before `ended_at` when descendants outlive the
+window. A job still open when its instance is stopped or removed gets
+`kill_reason: "instance_gone"` unless it already had an exit code or a reason.
+**Long-poll:** `?wait=<seconds>&since=<cursor>` returns as soon as any job has ended after
+`since` (pass the previous response's `cursor`; without `since` the baseline is the start of
+this call), otherwise after `wait` seconds, capped by `work_area.jobs_wait_max` (default 60,
+`0` = uncapped). A `since` ahead of the current cursor (the work area was deleted and
+recreated) returns immediately. Without `wait` the call returns at once, as before.
+`GET /v2/capabilities` reports `terminal_jobs: 2` for this contract generation and the
+effective limits under `limits` (`max_live_jobs`, `jobs_wait_max`, `job_ledger_retention`,
+`job_log_retention`, `job_max_lifetime`).
 
 All times are ISO-8601 UTC with `Z` on the host clock (containers share the host
 kernel's real-time clock). `ended_at` is an upper bound; `null` means still running.
@@ -761,8 +795,8 @@ Jobs still open when their instance is stopped or removed end at that moment.
 `known=false` when the live instance cannot be probed or runs an image without the
 ledger, a live job has no origin, an instance vanished after terminal starts that were
 never observed, or the ledger file is unreadable; the last three keep the ledger
-unknown until they age past `job_max_lifetime` (one day when 0). Ended records are
-removed after the same period. A missing work area returns
+unknown until they age past `job_ledger_retention`. Ended records are
+removed after the same period (`0` = kept forever). A missing work area returns
 `404 {"detail": {"reason": "work_area_not_found", ...}}`.
 
 **Execution engines (SandboxHub#52).** Engine processes run through the proxy as
@@ -799,6 +833,10 @@ Resource settings belong to `config/system.yaml`, under `work_area`:
 | `idle_release_seconds` | 900 | Platform idle reclaim threshold, advertised in capabilities |
 | `soft_cap_bytes` | 10737418240 | 10 GiB; platform checks before file writes, not a hard filesystem quota |
 | `job_max_lifetime` | 21600 | Kill a background terminal job after 6 hours, `kill_reason=max_lifetime` (procs are not capped) |
+| `max_live_jobs` | 64 | Live terminal jobs per instance; new jobs are refused with `job_limit_reached` when full (`0` = unlimited) |
+| `jobs_wait_max` | 60 | Cap of one `GET /v2/work-areas/{id}/jobs` long-poll in seconds (`0` = uncapped) |
+| `job_ledger_retention` | 86400 | Seconds an ended job stays in the job ledger (`0` = never removed) |
+| `job_log_retention` | 0 | Seconds an ended job's log file stays in the instance (`0` = never removed) |
 | `idle_backstop_ttl` | 86400 | Hub backstop for instances without API traffic; work areas remain |
 
 Both v2 networks deny peer access and unapproved host ports. v2 gateway forwarding

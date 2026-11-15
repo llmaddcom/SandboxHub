@@ -388,11 +388,23 @@ async def list_files(
 
 
 @router.get("/work-areas/{work_area_id}/jobs", dependencies=_auth)
-async def list_jobs(work_area_id: str):
-    """工作区终端任务来源。``ended_at=null`` = 仍在运行或结束时间未知（按运行到 ``now``）；
-    Hub 无法保证清单完整时 ``known=false``。"""
+async def list_jobs(
+    work_area_id: str,
+    wait: float = Query(default=0.0, ge=0.0),
+    since: Optional[str] = Query(default=None),
+):
+    """工作区终端任务来源与结果。``ended_at=null`` = 仍在运行或结束时间未知（按运行到 ``now``）；
+    Hub 无法保证清单完整时 ``known=false``。
+
+    ``wait``（秒，上限 ``work_area.jobs_wait_max``，超出按上限）：长轮询，有任务结束即返回；``since`` 传上次响应的 ``cursor``，不带则以
+    本次调用开始时为基线。不带 ``wait`` 时立即返回（行为同前，另多一个 ``cursor`` 字段）。"""
+    baseline: Optional[int] = None
+    if since is not None:
+        if not since.isdigit():
+            raise HTTPException(400, detail={"reason": "invalid_request", "message": "since 须为上次响应的 cursor"})
+        baseline = int(since)
     try:
-        return await _svc().job_report(work_area_id)
+        return await _svc().job_report(work_area_id, wait=wait, since=baseline)
     except WorkAreaError as exc:
         return _error(exc)
 

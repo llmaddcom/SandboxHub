@@ -4,7 +4,9 @@
 接口列表：
 - POST /api/terminal/execute:        在会话的 tmux session 里开窗口跑命令，最多等 wait 秒后返回 job 状态
 - POST /api/terminal/wait:           从 cursor 起取 job 增量输出，最多等 wait 秒
-- POST /api/terminal/kill:           向 job 进程组发 INT / KILL
+- POST /api/terminal/kill:           向 job 进程组发 INT / KILL（可带 by：谁要求终止的）
+- POST /api/terminal/detach:         把在跑的 job 标成 detached（调用方不再等它；幂等）
+- POST /api/terminal/input:          向 job 的终端输入文本（交互式程序）
 - POST /api/terminal/execute/stream: SSE 流式执行（旧契约，保留）
 - POST /api/terminal/restart:        重启终端会话（kill 该会话在跑的 job，cwd / env 复位）
 - GET  /api/terminal/activity:       任务活性计数 + 任务来源台账（SandboxHub#47）
@@ -21,6 +23,10 @@ activity 回报保留期内每个 job 的来源与起止时间，Hub 据此回�
 ``default``）；同一 session 的 job 之间 cwd / 导出环境跨调用保留，模型可用 ``tmux
 send-keys / capture-pane / kill-window -t <job_id>`` 与仍在跑的 job 交互。多 job 可并行。
 
+后台任务（SandboxHub#90）：``execute`` 带 ``background=true``，或对在跑的 job 调 ``/detach``，
+该 job 即 detached——结束时不回写会话的 cwd / 导出环境（前台跑完的照旧回写）。活跃终端已满
+时 ``execute`` 回 409，``detail`` 为 ``{"code": "job_limit_reached", "limit", "running", "message"}``。
+
 兼容：请求体不带 ``wait`` 字段 = 旧契约（阻塞至结束，timeout 默认 30s / 上限 300s，
 响应含 success/output/error/system）。带 ``wait`` = job 契约（timeout 无默认、无上限）。
 两种形态的响应字段是同一超集，调用方按需取用。
@@ -33,7 +39,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..tools import BashTool, ToolError
-from ..tools.bash import DEFAULT_WAIT, MAX_WAIT, Job, scan_marked_processes
+from typing import Literal
+
+from ..tools.bash import DEFAULT_WAIT, MAX_WAIT, Job, JobLimitError, scan_marked_processes
 from . import procs as procs_router
 
 # 创建终端操作路由，设置前缀和标签
@@ -84,6 +92,13 @@ class ExecuteRequest(BaseModel):
             "cwd / 导出环境，并可用 tmux 互相看见；不同 session 互不可见。"
         ),
     )
+    background: bool = Field(
+        default=False,
+        description=(
+            "后台任务：一启动即 detached，结束时不回写会话的 cwd / 导出环境。"
+            "不带 wait 时按 wait=0 立即返回（不走旧契约的阻塞）。"
+        ),
+    )
 
 
 class JobResponse(BaseModel):
@@ -102,6 +117,14 @@ class JobResponse(BaseModel):
             "| restart | evicted | window_closed"
         ),
     )
+    killed_by: str | None = Field(
+        default=None, description="谁要求终止的：model | user | platform；未说明或自然结束为 null"
+    )
+    ended_at: float | None = Field(
+        default=None,
+        description="窗口结束且不再有带该 job 标记的存活进程的时刻（epoch 秒，上界）；仍可能在跑为 null",
+    )
+    detached: bool = Field(default=False, description="是否 detached（调用方不再等它的后台任务）")
 
 
 class ExecuteResponse(JobResponse):
@@ -125,6 +148,25 @@ class KillRequest(BaseModel):
     """终止 job 请求模型。"""
     job_id: str = Field(..., description="execute 返回的 job_id")
     signal: str = Field(default="INT", description="INT | TERM | KILL")
+    by: Literal["model", "user", "platform"] | None = Field(
+        default=None, description="谁要求终止的；记入 job 的 killed_by（先到先得）"
+    )
+
+
+class DetachRequest(BaseModel):
+    """把 job 标成 detached 的请求模型。"""
+    job_id: str = Field(..., description="execute 返回的 job_id")
+
+
+class InputRequest(BaseModel):
+    """向 job 终端输入的请求模型。"""
+    job_id: str = Field(..., description="execute 返回的 job_id")
+    text: str = Field(default="", description="要输入的文本（按字面送入，不解释按键名）")
+    enter: bool = Field(default=True, description="输入后是否再按一次回车")
+    cursor: int | None = Field(
+        default=None, ge=0,
+        description="响应里从该字节偏移起返回增量输出；不带 = 只返回本次输入之后的新输出",
+    )
 
 
 class RestartRequest(BaseModel):
@@ -165,7 +207,14 @@ def _job_payload(job: Job, start: int = 0) -> dict:
         "cursor": cursor,
         "log_path": str(job.log_path),
         "kill_reason": job.kill_reason,
+        "killed_by": job.killed_by,
+        "ended_at": job.ended_at,
+        "detached": job.detached,
     }
+
+
+def _unknown_job(exc: ToolError) -> bool:
+    return "未知 job" in exc.message
 
 
 @router.get("/activity", summary="查询终端任务活性（闲置回收前使用）")
@@ -207,7 +256,7 @@ async def execute_command(
     tool = get_bash_tool()
     origin = _origin(job_origin)
     try:
-        if request.wait is None:
+        if request.wait is None and not request.background:
             # 旧契约：阻塞至结束
             job, result = await tool.execute_job(
                 request.command, timeout=request.timeout, session=request.session, origin=origin
@@ -217,10 +266,15 @@ async def execute_command(
             return ExecuteResponse(**payload, success=True, error=result.error, system=result.system)
 
         job = await tool.submit(
-            request.command, wait=request.wait, timeout=request.timeout, session=request.session,
-            origin=origin,
+            request.command, wait=request.wait or 0.0, timeout=request.timeout,
+            session=request.session, origin=origin, background=request.background,
         )
         return ExecuteResponse(**_job_payload(job), success=True, system=tool.pop_notes(request.session))
+    except JobLimitError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": e.code, "message": e.message, "limit": e.limit, "running": e.running},
+        )
     except ToolError as e:
         raise HTTPException(status_code=400, detail=f"终端错误: {e.message}")
     except Exception as e:
@@ -245,11 +299,38 @@ async def kill_job(request: KillRequest):
     调用方在用户「停止」时调用，保证没有 timeout 的命令不会在用户离开后继续跑。"""
     tool = get_bash_tool()
     try:
-        job = await tool.kill(request.job_id, sig=request.signal)
+        job = await tool.kill(request.job_id, sig=request.signal, by=request.by)
     except ToolError as e:
-        status = 404 if "未知 job" in e.message else 400
+        status = 404 if _unknown_job(e) else 400
         raise HTTPException(status_code=status, detail=f"终端错误: {e.message}")
     return JobResponse(**_job_payload(job))
+
+
+@router.post("/detach", response_model=JobResponse, summary="把 job 标成 detached（后台任务）")
+async def detach_job(request: DetachRequest):
+    """调用方不再等这个 job（转入后台）：它结束时不回写会话的 cwd / 导出环境。幂等；
+    已结束的 job 无操作（它结束时若还没 detached，状态已按前台回写）。"""
+    tool = get_bash_tool()
+    try:
+        job = tool.detach(request.job_id)
+    except ToolError as e:
+        raise HTTPException(status_code=404, detail=f"终端错误: {e.message}")
+    return JobResponse(**_job_payload(job, job.log_size()))
+
+
+@router.post("/input", response_model=JobResponse, summary="向 job 的终端输入")
+async def input_job(request: InputRequest):
+    """向仍在跑的 job 的终端输入文本（REPL、安装向导等交互式程序）。``text`` 按字面送入，
+    ``enter`` 为真时再按回车。返回输入之后的增量输出（或从 ``cursor`` 起）。job 不存在回 404，
+    已结束回 409。"""
+    tool = get_bash_tool()
+    try:
+        start = request.cursor if request.cursor is not None else tool.get_job(request.job_id).log_size()
+        job = await tool.send_input(request.job_id, request.text, enter=request.enter)
+    except ToolError as e:
+        status = 404 if _unknown_job(e) else 409
+        raise HTTPException(status_code=status, detail=f"终端错误: {e.message}")
+    return JobResponse(**_job_payload(job, start))
 
 
 @router.post("/execute/stream", summary="流式执行 bash 命令 (SSE)")

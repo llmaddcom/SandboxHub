@@ -68,6 +68,10 @@ SYSTEM_KNOBS: tuple[SystemKnob, ...] = (
     SystemKnob("work_area.max_per_role", "WORK_AREA_MAX_PER_ROLE", "每个数字人同时存活的实例上限"),
     SystemKnob("work_area.max_per_user", "WORK_AREA_MAX_PER_USER", "每个用户同时存活的实例上限"),
     SystemKnob("work_area.job_max_lifetime", "WORK_AREA_JOB_MAX_LIFETIME", "实例内单个后台 job 最长存活（秒，0=不限）"),
+    SystemKnob("work_area.max_live_jobs", "WORK_AREA_MAX_LIVE_JOBS", "实例内同时在跑的终端任务上限，满了拒绝新任务（0=不限）"),
+    SystemKnob("work_area.jobs_wait_max", "WORK_AREA_JOBS_WAIT_MAX", "/v2/work-areas/{id}/jobs 长轮询单次最多等多久（秒，0=不限）"),
+    SystemKnob("work_area.job_ledger_retention", "WORK_AREA_JOB_LEDGER_RETENTION", "已结束任务在任务清单里保留多久（秒，0=不清理）"),
+    SystemKnob("work_area.job_log_retention", "WORK_AREA_JOB_LOG_RETENTION", "已结束任务的日志文件在实例里保留多久（秒，0=不清理）"),
     SystemKnob("work_area.idle_backstop_ttl", "WORK_AREA_IDLE_BACKSTOP_TTL", "Hub 兜底回收：无 API 往来超过此时长删实例（秒，0=关闭）"),
     SystemKnob("work_area.idle_release_seconds", "WORK_AREA_IDLE_RELEASE_SECONDS", "平台侧空闲回收：回合结束且无后台 job 后空闲多久释放实例（秒，经 capabilities 下发给平台）"),
     SystemKnob("work_area.soft_cap_bytes", "WORK_AREA_SOFT_CAP_BYTES", "工作区软上限（字节，平台在写类工具执行前检查，0=不限）"),
@@ -269,12 +273,16 @@ class Settings(BaseSettings):
     MOUNT_READY_INTERVAL: float = 0.5
     GATEWAY_MINIO_FORWARD: bool = True
     WORK_AREA_ENABLED: bool = True
-    DOCKER_IMAGE_CODE_V2: str = "sandbox-code:2026.11.08-1"
-    DOCKER_IMAGE_UBUNTU_V2: str = "sandbox-ubuntu:2026.11.08-1"
+    DOCKER_IMAGE_CODE_V2: str = "sandbox-code:2026.11.15-1"
+    DOCKER_IMAGE_UBUNTU_V2: str = "sandbox-ubuntu:2026.11.15-1"
     DOCKER_IMAGE_FS: str = "sandbox-fs:2026.11.10-1"
     WORK_AREA_MAX_PER_ROLE: int = 2
     WORK_AREA_MAX_PER_USER: int = 4
     WORK_AREA_JOB_MAX_LIFETIME: int = 21600
+    WORK_AREA_MAX_LIVE_JOBS: int = 64
+    WORK_AREA_JOBS_WAIT_MAX: int = 60
+    WORK_AREA_JOB_LEDGER_RETENTION: int = 86400
+    WORK_AREA_JOB_LOG_RETENTION: int = 0
     WORK_AREA_IDLE_BACKSTOP_TTL: int = 86400
     WORK_AREA_IDLE_RELEASE_SECONDS: int = 900
     WORK_AREA_SOFT_CAP_BYTES: int = 10 * 1024**3
