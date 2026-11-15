@@ -228,6 +228,24 @@ async def test_cwd_and_exported_env_persist_across_jobs(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_control_token_never_reaches_job_shell(monkeypatch):
+    """#96：控制面凭据不进 job 的初始环境、.envin 与 shell；租户凭据照常透传。"""
+    monkeypatch.setenv("SANDBOX_API_TOKEN", "control-secret")
+    monkeypatch.setenv("CR_SANDBOX_TOKEN", "tenant-token")
+    monkeypatch.setenv("CR_API_BASE", "http://api.local")
+    tool = BashTool()
+    assert "SANDBOX_API_TOKEN" not in tool.session._initial_env
+    job = await tool.submit(
+        'echo "ctl=${SANDBOX_API_TOKEN-unset} tenant=$CR_SANDBOX_TOKEN base=$CR_API_BASE"', wait=5
+    )
+    assert job.read(0)[0] == "ctl=unset tenant=tenant-token base=http://api.local\n"
+    for suffix in (".envin", ".env"):
+        dumped = job.state_base.with_suffix(suffix).read_bytes()
+        assert b"control-secret" not in dumped
+        assert b"CR_SANDBOX_TOKEN=tenant-token" in dumped
+
+
+@pytest.mark.asyncio
 async def test_env_values_with_newlines_survive():
     tool = BashTool()
     await tool.submit("export MULTI=$'l1\\nl2'", wait=5)
