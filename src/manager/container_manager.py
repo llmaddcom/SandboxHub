@@ -809,6 +809,9 @@ class ContainerManager:
                 "SANDBOX_API_TOKEN": api_token,
                 **layouts.get(layout_version).env(),
                 "SANDBOX_JOB_MAX_LIFETIME": str(max(0, settings.WORK_AREA_JOB_MAX_LIFETIME)),
+                "SANDBOX_JOB_MAX_LIVE": str(max(0, settings.WORK_AREA_MAX_LIVE_JOBS)),
+                "SANDBOX_JOB_LEDGER_RETENTION": str(max(0, settings.WORK_AREA_JOB_LEDGER_RETENTION)),
+                "SANDBOX_JOB_LOG_RETENTION": str(max(0, settings.WORK_AREA_JOB_LOG_RETENTION)),
             }
         )
         if hidden_roots and layout_version >= 2:

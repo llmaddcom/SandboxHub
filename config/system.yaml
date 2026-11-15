@@ -82,8 +82,8 @@ work_area:
   enabled: true
   # v2 实例镜像：须是带 sandboxhub.api_auth=1 标签的新镜像（容器内 API 校验每实例 token）。
   # 用版本标签，不用 :latest（v1 仍在用 :latest，回滚不受影响）。
-  image_code: "sandbox-code:2026.11.08-1"
-  image_ubuntu: "sandbox-ubuntu:2026.11.08-1"
+  image_code: "sandbox-code:2026.11.15-1"
+  image_ubuntu: "sandbox-ubuntu:2026.11.15-1"
   # cr-fs 特权 sidecar（host 网络）：rclone 角色目录挂载、netguard iptables、工作区文件操作
   image_fs: "sandbox-fs:2026.11.10-1"
   # 同时存活的实例上限：超限 acquire 返回 409 并列出占用者
@@ -91,6 +91,14 @@ work_area:
   max_per_user: 4
   # 实例内单个后台 job 最长存活（秒），到期由容器内监督器终止；0 = 不限
   job_max_lifetime: 21600
+  # 实例内同时在跑的终端任务上限：满了新任务被拒绝（job_limit_reached），已有任务继续跑；0 = 不限
+  max_live_jobs: 64
+  # GET /v2/work-areas/{id}/jobs 长轮询单次最多等多久（秒）；0 = 不限（调用方自己的 HTTP 超时兜底）
+  jobs_wait_max: 60
+  # 已结束任务在任务清单里保留多久（秒）；0 = 不清理
+  job_ledger_retention: 86400
+  # 已结束任务的日志文件（/tmp/cr-jobs/<job_id>.log）在实例里保留多久（秒）；0 = 不清理
+  job_log_retention: 0
   # Hub 兜底：实例无任何 API 往来超过此时长即删除（只删实例，不删工作区）。平台侧空闲 15 分钟
   # 就会主动释放，这里只兜平台失联。0 = 关闭
   idle_backstop_ttl: 86400

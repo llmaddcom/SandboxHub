@@ -418,8 +418,9 @@ async def test_capacity_rejects_new_command_without_killing_active_jobs(monkeypa
     old = await tool.submit("sleep 30", wait=0.2)
     mid = await tool.submit("sleep 30", wait=0.2)
     newest = await tool.submit("sleep 30", wait=0.2)
-    with pytest.raises(ToolError, match="新命令未执行"):
+    with pytest.raises(bash_mod.JobLimitError, match="新命令未执行") as raised:
         await tool.submit("echo four", wait=5)
+    assert (raised.value.limit, raised.value.running) == (3, 3)
     assert all(not job.finished for job in (old, mid, newest))
     for j in (old, mid, newest):
         await tool.kill(j.id, "KILL")

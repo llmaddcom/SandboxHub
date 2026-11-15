@@ -154,6 +154,7 @@ def test_entries_past_retention_are_dropped(client, monkeypatch):
     _wait_ended(client, job["job_id"])
     origin_file = bash_mod.JOB_DIR / f"{job['job_id']}.origin"
     assert origin_file.exists()
-    monkeypatch.setattr(bash_mod, "LEDGER_RETENTION", -1.0)
+    monkeypatch.setattr(bash_mod, "LEDGER_RETENTION", 1e-6)
+    time.sleep(0.01)
     assert _activity(client)["jobs"] == []
     assert not origin_file.exists()
