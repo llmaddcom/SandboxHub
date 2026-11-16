@@ -86,9 +86,9 @@ work_area:
   image_ubuntu: "sandbox-ubuntu:2026.11.15-3"
   # cr-fs 特权 sidecar（host 网络）：rclone 角色目录挂载、netguard iptables、工作区文件操作
   image_fs: "sandbox-fs:2026.11.10-1"
-  # 同时存活的实例上限：超限 acquire 返回 409 并列出占用者
-  max_per_role: 2
-  max_per_user: 4
+  # 同时存活的实例上限：超限 acquire 返回 409 并列出占用者；0 = 不限（默认，由超管按需设置）
+  max_per_role: 0
+  max_per_user: 0
   # 实例内单个后台 job 最长存活（秒），到期由容器内监督器终止；0 = 不限
   job_max_lifetime: 21600
   # 实例内同时在跑的终端任务上限：满了新任务被拒绝（job_limit_reached），已有任务继续跑；0 = 不限
