@@ -1,6 +1,6 @@
 # ============================================================
 # 轻量 code 沙箱镜像（无 GUI）
-# 提供 Python + Node 双语言环境 + 常用开发/办公库 + 终端/文件/系统/进程/长驻进程接口
+# 提供 Python + Node 双语言环境 + 常用开发/办公库 + headless LibreOffice + 终端/文件/系统/进程/长驻进程接口
 # + 平台托管的执行引擎运行时（/opt/cr-engines：Node 24 + pi + DSH，见第 5d 步）
 # 目标：秒级冷启动、国内镜像源直连、适合跑编码 Agent（参考 opencode / codex）与日常办公脚本
 # 构建上下文 = SandboxHub/images（复用 ubuntu/app 同一套 app 代码）
@@ -149,6 +149,18 @@ ARG ENGINE_ALLOW_SCRIPTS=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,protob
 COPY code/install-engines.sh /tmp/install-engines.sh
 RUN bash /tmp/install-engines.sh && rm -f /tmp/install-engines.sh
 
+# ===== 5e. headless LibreOffice（SandboxHub#101）=====
+# 只装 calc + writer 的 -nogui 包（不带 X11/GTK 前端，约 +360 MB）：`soffice --headless --convert-to xlsx`
+# 重算 openpyxl 写的公式（openpyxl 只存公式不存结果，读回核对看不出错），`--convert-to pdf` 出 PDF。
+# libreoffice-recalc.xcd 把「打开表格时重算」设为总是，缓存过期的表也按公式重算。构建期真实转换一遍，
+# 不可用即构建失败（见 code/verify-libreoffice.py）。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libreoffice-calc-nogui libreoffice-writer-nogui && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+COPY code/libreoffice-recalc.xcd /usr/lib/libreoffice/share/registry/sandbox-recalc.xcd
+COPY code/verify-libreoffice.py /tmp/verify-libreoffice.py
+RUN python /tmp/verify-libreoffice.py && rm -f /tmp/verify-libreoffice.py
+
 # ===== 6. 预装单文件 CLI（issue #20：memory）=====
 # code/bin/ 下的脚本装进 /usr/local/bin（去 .py 扩展名，须自带 shebang）。
 # CLI 本体由上游仓维护，落地后丢进该目录即随镜像预装。待办、技能、外接工具不再预装
@@ -189,10 +201,10 @@ RUN mkdir -p /etc/sandbox && { \
       echo "- 中文字体：$(fc-list :lang=zh family | sort -u | tr '\n' ';' )"; \
       echo; echo "## 命令行工具"; echo; \
       for c in git curl wget rg fd jq tree less vim nano zip unzip xz tmux rclone gcc make pkg-config memory \
-               file xxd antiword catdoc xls2csv catppt pdftotext pdfinfo pdftoppm pdfimages; do \
+               file xxd antiword catdoc xls2csv catppt pdftotext pdfinfo pdftoppm pdfimages soffice libreoffice; do \
         if command -v "$c" >/dev/null 2>&1; then echo "- $c：已装"; else echo "- $c：未装"; fi; done; \
       echo; echo "常见但**没有预装**的工具（断网时不可用，联网时可 apt-get 安装）："; \
-      for c in ffmpeg ffprobe libreoffice soffice pandoc tesseract convert; do \
+      for c in ffmpeg ffprobe pandoc tesseract convert; do \
         command -v "$c" >/dev/null 2>&1 && echo "- $c：已装" || echo "- $c：未装"; done; \
       echo; echo "## 文件格式 → 用什么读（断网时别 pip/apt，直接用下面的）"; echo; \
       echo "| 格式 | 首选 | 备选 |"; echo "|---|---|---|"; \
@@ -206,6 +218,8 @@ RUN mkdir -p /etc/sandbox && { \
       echo "| .ofd（政务公文） | zipfile 解开 + lxml 读 Doc_0/Pages/*/Content.xml | — |"; \
       echo "| 带密码的 Office | msoffcrypto-tool 解密到临时文件再按上面读 | pypdf 直接 \`decrypt()\`（PDF）|"; \
       echo "| .msg（Outlook） | \`markitdown x.msg\`（olefile） | — |"; \
+      echo "| 重算 xlsx 公式 / 核对公式结果 | \`soffice --headless --convert-to xlsx --outdir 出目录 x.xlsx\`，再 openpyxl \`load_workbook(出目录/x.xlsx, data_only=True)\` 读数值 | 同时跑多个 soffice 时各加 \`-env:UserInstallation=file:///tmp/lo-\$\$\` |"; \
+      echo "| 转 PDF（xlsx/xls/docx/doc） | \`soffice --headless --convert-to pdf --outdir 出目录 x.docx\` | — |"; \
       echo "| 没在表里的 | 先 \`file\` 看真实类型，很多附件只是改了扩展名 | — |"; \
       echo; echo "## Python 包（pip list）"; echo; echo '```'; pip list --format=freeze; echo '```'; \
       echo; echo "## Node 全局包（npm ls -g）"; echo; echo '```'; npm ls -g --depth=0 2>/dev/null; echo '```'; \
@@ -216,6 +230,7 @@ RUN mkdir -p /etc/sandbox && { \
     ! command -v todo >/dev/null && ! command -v skills >/dev/null && ! command -v tools >/dev/null && \
     python3 -c 'import sys; assert sys.version_info >= (3, 8)' && \
     grep -q "^- antiword：已装" /etc/sandbox/MANIFEST.md && \
+    grep -q "^- soffice：已装" /etc/sandbox/MANIFEST.md && \
     grep -q "^- fd：已装" /etc/sandbox/MANIFEST.md && \
     grep -q "^- 执行引擎运行时.*pi ${PI_VERSION}，dsh ${DSH_VERSION}，codex-acp ${CODEX_ACP_VERSION}（codex ${CODEX_VERSION}），claude-agent-acp ${CLAUDE_AGENT_ACP_VERSION}（claude-agent-sdk ${CLAUDE_AGENT_SDK_VERSION}）$" /etc/sandbox/MANIFEST.md && \
     grep -q "^olefile==" /etc/sandbox/MANIFEST.md && \
