@@ -89,7 +89,7 @@ docker build -f images/code/Dockerfile -t sandbox-code:latest images
 > - noVNC, websockify (GitHub)
 > - pyenv (GitHub)
 
-> **Code image toolchain:** Python 3.11 + Node 20 (yarn/pnpm), `git`/`ripgrep`/`fd`/`jq`/`vim`, build-essential, daily Python libs (pandas, openpyxl, python-docx/pptx, reportlab, pypdf, pymupdf, matplotlib, markitdown with docx/xlsx/pdf extras…), legacy Office readers (olefile, xlrd, msoffcrypto-tool, `antiword`, `catdoc`), `file`/`xxd` and `poppler-utils`. Agents can introspect it at runtime via `GET /api/system/env` or read `/etc/sandbox/MANIFEST.md` (includes a file-format → tool table).
+> **Code image toolchain:** Python 3.11 + Node 20 (yarn/pnpm), `git`/`ripgrep`/`fd`/`jq`/`vim`, build-essential, daily Python libs (pandas, openpyxl, python-docx/pptx, reportlab, pypdf, pymupdf, matplotlib, markitdown with docx/xlsx/pdf extras…), legacy Office readers (olefile, xlrd, msoffcrypto-tool, `antiword`, `catdoc`), `file`/`xxd`, `poppler-utils`, and headless LibreOffice calc + writer (`-nogui` packages, about +360 MB): `soffice --headless --convert-to xlsx` recalculates formulas written by openpyxl (the image sets recalc-on-load to always, so stale cached results are recomputed too) and `--convert-to pdf` exports xlsx/xls/docx/doc. Agents can introspect it at runtime via `GET /api/system/env` or read `/etc/sandbox/MANIFEST.md` (includes a file-format → tool table).
 
 > **Engine runtime (code image):** the platform-hosted execution engines live in `/opt/cr-engines`, separate from the system Node 20: a Node 24 LTS (`/opt/cr-engines/node`) plus pinned `@earendil-works/pi-coding-agent` (bin `pi`) and `@deepseek-ai/dsh` (bin `dsh`). `/opt/cr-engines/bin/pi` and `/opt/cr-engines/bin/dsh` are wrappers that always run that Node, whatever `PATH` says; they are not on `PATH` (the platform starts them through `/api/procs`). Build args: `ENGINE_NODE_VERSION` (default 24.22.1), `PI_VERSION` (1.4.0), `DSH_VERSION` (0.2.1-rc.3 — pinned exactly, npm `latest` is still rc.2), `NPM_REGISTRY` (npmmirror) and `ENGINE_ALLOW_SCRIPTS` (npm 11 skips dependency install scripts unless allowed; node-pty / koffi need theirs). The build fails unless `pi --version` / `dsh --version` print the requested versions, node-pty works, and one DSH ACP `initialize` and one pi RPC `get_state` round-trip succeed. The image is labelled `sandboxhub.procs="1"` and `sandboxhub.engines='{"pi":"…","dsh":"…"}'` (the ubuntu image carries `sandboxhub.procs` only); the engine runtime adds about 1.3 GB.
 
@@ -828,8 +828,8 @@ Resource settings belong to `config/system.yaml`, under `work_area`:
 
 | Key | Default | Behavior |
 | --- | --- | --- |
-| `max_per_role` | 2 | Concurrent instances per digital person |
-| `max_per_user` | 4 | Concurrent instances per owner |
+| `max_per_role` | 0 | Concurrent instances per digital person; over the cap acquire returns 409 with the holders (`0` = unlimited) |
+| `max_per_user` | 0 | Concurrent instances per owner (`0` = unlimited) |
 | `idle_release_seconds` | 900 | Platform idle reclaim threshold, advertised in capabilities |
 | `soft_cap_bytes` | 10737418240 | 10 GiB; platform checks before file writes, not a hard filesystem quota |
 | `job_max_lifetime` | 21600 | Kill a background terminal job after 6 hours, `kill_reason=max_lifetime` (procs are not capped) |

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  code 镜像 LibreOffice 系统默认（SandboxHub#101）：打开表格时总是重算公式。
+  LibreOffice 对 xlsx/ods 的默认是「从不重算」、直接用文件里缓存的结果；缓存过期的表
+  （别的工具改了数值没重算）经 soffice 转一遍仍是旧值，核对不出公式错误。0 = 总是重算。
+  装到 /usr/lib/libreoffice/share/registry/，对所有用户生效，用户配置仍可覆盖。
+-->
+<oor:data xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:oor="http://openoffice.org/2001/registry">
+  <dependency file="main"/>
+  <oor:component-data oor:name="Calc" oor:package="org.openoffice.Office">
+    <node oor:name="Formula">
+      <node oor:name="Load">
+        <prop oor:name="OOXMLRecalcMode" oor:op="fuse"><value>0</value></prop>
+        <prop oor:name="ODFRecalcMode" oor:op="fuse"><value>0</value></prop>
+      </node>
+    </node>
+  </oor:component-data>
+</oor:data>

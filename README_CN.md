@@ -89,7 +89,7 @@ docker build -f images/code/Dockerfile -t sandbox-code:latest images
 > - noVNC、websockify（GitHub）
 > - pyenv（GitHub）
 
-> **Code 镜像工具链：** Python 3.11 + Node 20（yarn/pnpm）、`git`/`ripgrep`/`fd`/`jq`/`vim`、build-essential，以及日常 Python 库（pandas、openpyxl、python-docx/pptx、reportlab、pypdf、matplotlib、markitdown…）。Agent 可在运行时通过 `GET /api/system/env` 自检环境。
+> **Code 镜像工具链：** Python 3.11 + Node 20（yarn/pnpm）、`git`/`ripgrep`/`fd`/`jq`/`vim`、build-essential，以及日常 Python 库（pandas、openpyxl、python-docx/pptx、reportlab、pypdf、matplotlib、markitdown…），以及 headless LibreOffice calc + writer（`-nogui` 包，约 +360 MB）：`soffice --headless --convert-to xlsx` 重算 openpyxl 写的公式（镜像把打开表格时重算设为总是，缓存过期的结果也会重算），`--convert-to pdf` 可把 xlsx/xls/docx/doc 转成 PDF。Agent 可在运行时通过 `GET /api/system/env` 自检环境。
 
 > **执行引擎运行时（code 镜像）：** 平台托管的执行引擎单独装在 `/opt/cr-engines`，与系统 Node 20 分开：一套 Node 24 LTS（`/opt/cr-engines/node`）+ 固定版本的 `@earendil-works/pi-coding-agent`（命令 `pi`）与 `@deepseek-ai/dsh`（命令 `dsh`）。`/opt/cr-engines/bin/pi`、`/opt/cr-engines/bin/dsh` 是包装脚本，不管 `PATH` 怎样都用这套 Node 执行；两者不在 `PATH` 里，由平台经 `/api/procs` 启动。构建参数：`ENGINE_NODE_VERSION`（默认 24.22.1）、`PI_VERSION`（1.4.0）、`DSH_VERSION`（0.2.1-rc.3，须写精确版本，npm `latest` 还是 rc.2）、`NPM_REGISTRY`（npmmirror）、`ENGINE_ALLOW_SCRIPTS`（npm 11 默认不跑依赖的安装脚本，node-pty / koffi 需要放行）。`pi --version` / `dsh --version` 与参数不一致、node-pty 不可用、DSH 的 ACP `initialize` 或 pi 的 RPC `get_state` 走不通一个来回，构建都会失败。镜像带标签 `sandboxhub.procs="1"` 与 `sandboxhub.engines='{"pi":"…","dsh":"…"}'`（ubuntu 镜像只带 `sandboxhub.procs`）；引擎运行时约占 1.3 GB。
 
