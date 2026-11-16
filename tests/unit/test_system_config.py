@@ -130,6 +130,16 @@ def test_dotenv_retired_keys_ignored(tmp_path, monkeypatch):
     assert any("已退役" in r and "WARM_POOL_UBUNTU" in r for r in records)
 
 
+def test_instance_limits_default_unlimited(tmp_path, monkeypatch):
+    """实例并发上限默认不限（#100）：代码默认与仓内 system.yaml 都是 0，超管按需设置。"""
+    for k in RETIRED_ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+    fallback = load_settings(system_yaml=tmp_path / "missing.yaml", env_file=None)
+    checked_in = load_settings(env_file=None)
+    for s in (fallback, checked_in):
+        assert s.WORK_AREA_MAX_PER_ROLE == 0 and s.WORK_AREA_MAX_PER_USER == 0
+
+
 def test_explicit_overrides_win():
     s = load_settings(env_file=None, WARM_POOL_UBUNTU=5, MINIO_ENDPOINT="m:9000")
     assert s.WARM_POOL_UBUNTU == 5 and s.MINIO_ENDPOINT == "m:9000"

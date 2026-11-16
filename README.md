@@ -828,8 +828,8 @@ Resource settings belong to `config/system.yaml`, under `work_area`:
 
 | Key | Default | Behavior |
 | --- | --- | --- |
-| `max_per_role` | 2 | Concurrent instances per digital person |
-| `max_per_user` | 4 | Concurrent instances per owner |
+| `max_per_role` | 0 | Concurrent instances per digital person; over the cap acquire returns 409 with the holders (`0` = unlimited) |
+| `max_per_user` | 0 | Concurrent instances per owner (`0` = unlimited) |
 | `idle_release_seconds` | 900 | Platform idle reclaim threshold, advertised in capabilities |
 | `soft_cap_bytes` | 10737418240 | 10 GiB; platform checks before file writes, not a hard filesystem quota |
 | `job_max_lifetime` | 21600 | Kill a background terminal job after 6 hours, `kill_reason=max_lifetime` (procs are not capped) |
