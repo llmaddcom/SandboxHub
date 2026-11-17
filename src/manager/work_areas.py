@@ -10,7 +10,7 @@
   （``tmp-policy.json`` 记最近一次请求下发的规则，不在 bind 范围内）。占用计入工作区用量。
 - ``instances/<sandbox_id>/{inputs,context}``：每实例的只读视图，由 Hub 写入；实例释放即删。
   ``inputs.json`` 是 inputs 清单（不在 bind 范围内，租户看不到）。布局 v2 另有
-  ``workspace-files/{AGENTS.md,CLAUDE.md}``：以单文件只读 bind 进 ``/workspace``，更新须就地改写
+  ``workspace-files/AGENTS.md``：以单文件只读 bind 进 ``/workspace``，更新须就地改写
   （单文件 bind 指向 inode，rename 替换对实例不可见）。
 
 工作区的 ``work`` / ``deliverables`` 由 Hub 直接创建（属主是 Hub 用户、0755）；租户在容器内是
@@ -34,7 +34,7 @@ from loguru import logger
 
 from src.config import settings
 from src.manager.fs_sidecar import FsSidecar, ReadResult
-from src.manager.layouts import WORKSPACE_FILE_MAX_BYTES, WORKSPACE_FILES
+from src.manager.layouts import RETIRED_WORKSPACE_FILES, WORKSPACE_FILE_MAX_BYTES, WORKSPACE_FILES
 from src.manager.paths import require_id, split_relative
 
 WORK_AREA_ROOTS = ("work", "deliverables")
@@ -145,8 +145,22 @@ class WorkAreas:
     def _clear_v2_mountpoints_sync(self, work_area_id: str) -> list[str]:
         """布局 v2 把 deliverables 与平台文件叠挂在宿主 ``work/`` 里：``work/deliverables`` 须是目录、
         ``work/AGENTS.md`` 等须是普通文件或不存在。租户留下的软链接或其他类型会让挂载落到别处或
-        直接失败，挪到一旁（``<名字>.moved-<时间>``），内容不删。返回被挪走的名字。"""
+        直接失败，挪到一旁（``<名字>.moved-<时间>``），内容不删。返回被挪走的名字。
+
+        不再下发的平台文件（``RETIRED_WORKSPACE_FILES``）早先的挂载点是宿主 ``work/`` 里的空文件，
+        实例回收后留在 ``/workspace``：空的普通文件直接删掉，非空的是租户写的内容，保留。"""
         work = self.bind_sources(work_area_id)["work"]
+        for name in RETIRED_WORKSPACE_FILES:
+            path = work / name
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(st.st_mode) and st.st_size == 0:
+                try:
+                    os.unlink(path)
+                except OSError as exc:
+                    logger.warning(f"遗留的空平台文件删不掉 | work_area={work_area_id} | {name} | err={exc}")
         expected = {"deliverables": stat.S_ISDIR, **{name: stat.S_ISREG for name in WORKSPACE_FILES}}
         moved: list[str] = []
         for name, ok in expected.items():

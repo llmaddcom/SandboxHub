@@ -16,7 +16,6 @@ v2（借 Linux 目录约定，用根目录区分归属）::
     /workspace                rw  工作区（cwd；宿主 work/ 目录，与 v1 的 /workspace/work 同一份数据）
     /workspace/deliverables   rw  交付目录（宿主 deliverables/，归档点读取，规则不变）
     /workspace/AGENTS.md      ro  平台写的盘说明书（workspace_files，单文件只读 bind）
-    /workspace/CLAUDE.md      ro  同上，给只认 CLAUDE.md 的框架
     /self                     ro|rw  角色空间根（rclone 排除 .cr/）
     /self/diary               ro  日记（叠在 /self 之上的只读挂载）
     /mnt/drive                ro  授权文件（硬链接视图，机制同 v1 inputs）
@@ -34,7 +33,9 @@ from dataclasses import dataclass
 from src.models import V2_ROLE_TARGETS
 
 # 平台写入 /workspace 根的只读文件：白名单，名字之外的一律拒绝
-WORKSPACE_FILES = ("AGENTS.md", "CLAUDE.md")
+WORKSPACE_FILES = ("AGENTS.md",)
+# 不再下发的平台文件：早先单文件 bind 在宿主 work/ 里留下的空挂载点，取实例前清掉（#99）
+RETIRED_WORKSPACE_FILES = ("CLAUDE.md",)
 WORKSPACE_FILE_MAX_BYTES = 1024 * 1024
 
 

@@ -143,7 +143,7 @@ class AcquireV2Request(BaseModel):
     # None = 不改（复用时保留现状）；[] / {} = 清空
     inputs: Optional[list[InputFileModel]] = None
     context: Optional[dict[str, str]] = None
-    # 布局 v2：/workspace 根的只读平台文件（白名单 AGENTS.md、CLAUDE.md）；None = 不改
+    # 布局 v2：/workspace 根的只读平台文件（白名单 AGENTS.md）；None = 不改
     workspace_files: Optional[dict[str, str]] = None
     env: Optional[dict[str, str]] = None
     policy: Optional[v1.PolicySpec] = None

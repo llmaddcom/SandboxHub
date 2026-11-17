@@ -98,7 +98,7 @@ class AcquireSpec:
     network_mode: NetworkMode = "allow"
     limits: dict = field(default_factory=dict)
     layout_version: int = LAYOUT_VERSION
-    # 布局 v2：/workspace 根的只读平台文件（AGENTS.md、CLAUDE.md）；None = 不变
+    # 布局 v2：/workspace 根的只读平台文件（AGENTS.md）；None = 不变
     workspace_files: Optional[dict[str, str]] = None
     # 布局 v2：实例 /tmp 的清理规则。给出时 /tmp 落在工作区的宿主目录（实例回收后仍可读）；
     # None = 调用方不认识这项能力，/tmp 仍是容器临时层。

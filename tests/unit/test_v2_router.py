@@ -132,7 +132,7 @@ async def test_acquire_v2_maps_layout_mounts_and_workspace_files(client, service
             {"name": "diary", "bucket": "b", "prefix": "roles/r1/diary", "mode": "ro"},
         ],
         "context": {"env/INDEX.md": "x"},
-        "workspace_files": {"AGENTS.md": "# 盘说明", "CLAUDE.md": "@AGENTS.md"},
+        "workspace_files": {"AGENTS.md": "# 盘说明"},
     }
     async with client:
         r = await client.post("/v2/work-areas/wa1/acquire", json=body, headers=HEADERS)
