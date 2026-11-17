@@ -290,6 +290,9 @@ and returns `path`, `next_offset`, `next_column`, `truncated`, and `total_lines`
 (known only at EOF). Continue using both returned offsets, including when a long line
 spans multiple pages. Reads use bounded fragments instead of loading the whole file.
 The response text includes the continuation parameters for older callers.
+Binary files (a NUL byte or a zip/OLE2/PDF header in the first 8 KiB) are rejected with 400 and
+`detail` = `查看文件失败: binary_file: <path> 是二进制文件，不能按文本查看（codec can't decode）`
+instead of a numbered page of replacement characters.
 
 `POST /api/file/upload` has no business size cap by default. The Hub streams request
 bodies; the container copies multipart temporary storage in 1MiB chunks and replaces
@@ -652,7 +655,7 @@ its legacy `layout_version` field stays `1` so backends that only know v1 keep w
 | `/workspace` (read-only skeleton) | `/workspace` | v1 ro / v2 rw | v2: the work area's `work/` |
 | `/workspace/work` (cwd) | `/workspace` (cwd) | rw | work area `work/` (same data, so a v1 work area opens unchanged under v2) |
 | `/workspace/deliverables` | `/workspace/deliverables` | rw | work area `deliverables/`, read at archive points |
-| — | `/workspace/AGENTS.md`, `/workspace/CLAUDE.md` | ro | `workspace_files` (single-file binds) |
+| — | `/workspace/AGENTS.md` | ro | `workspace_files` (single-file bind) |
 | `/workspace/inputs` | `/mnt/drive` | ro | granted user files (hard-link view) |
 | `/workspace/context` | `/opt/cr` | ro | generated platform files, nested paths allowed |
 | `/workspace/role/<name>` | `/self` | as requested | v2 mount `self` = role-space root `roles/{role_id}`, `.cr/**` excluded by rclone |
@@ -666,7 +669,7 @@ A v2 acquire looks like:
  "mounts": [{"name": "self",  "bucket": "b", "prefix": "roles/r1",       "mode": "rw"},
             {"name": "diary", "bucket": "b", "prefix": "roles/r1/diary", "mode": "ro"}],
  "inputs": [...], "context": {"env/INDEX.md": "..."},
- "workspace_files": {"AGENTS.md": "...", "CLAUDE.md": "@AGENTS.md\n"}}
+ "workspace_files": {"AGENTS.md": "..."}}
 ```
 
 The `self` mount may carry `"exclude": ["avatar/**", ".staging/**"]` (≤ 16 entries; a
@@ -680,8 +683,8 @@ list means a different mount, so the instance is rebuilt like any other mount ch
 
 v2 accepts only the role mounts `self` (prefix exactly the role root) and `diary` (read-only);
 `cwd` may be omitted and must otherwise equal the layout's cwd. `workspace_files` accepts only
-`AGENTS.md` and `CLAUDE.md` (≤ 1 MiB each) and replaces the pair as a whole: a name left out
-becomes empty. The files are bound before the instance starts (empty when not given) and are
+`AGENTS.md` (≤ 1 MiB) and replaces the set as a whole: a name left out becomes empty. An
+empty `CLAUDE.md` left in `work/` by earlier single-file binds is removed before the instance starts. The files are bound before the instance starts (empty when not given) and are
 rewritten in place, so `PUT /v2/sandboxes/{id}/context` with `{"workspace_files": {...}}`
 (alone or next to `files`) is visible immediately. A tenant entry that would block one of
 these mount points inside `work/` (a symlink, a directory named `AGENTS.md`, a file named

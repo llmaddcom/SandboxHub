@@ -257,7 +257,7 @@ curl -X POST http://localhost:8088/v1/sandboxes/sb_abc123/proxy/api/terminal/kil
 
 v2 的 `GET /v2/work-areas/{id}/jobs` 每条任务同样带这四个结果字段；实例停止或删除时仍未结束、也没有退出码与原因的任务记 `kill_reason: "instance_gone"`。响应带 `cursor`；`?wait=<秒>&since=<cursor>` 为长轮询：`since` 之后有任务结束即返回，否则等满 `wait`（上限 `work_area.jobs_wait_max`，默认 60，`0` = 不限），不带 `wait` 时立即返回。`GET /v2/capabilities` 以 `terminal_jobs: 2` 标识这一代契约，并在 `limits` 里上报生效值：`max_live_jobs`、`jobs_wait_max`、`job_ledger_retention`（已结束任务在清单里保留多久，默认 86400，`0` = 不清理）、`job_log_retention`（已结束任务的日志文件保留多久，默认 0 = 不清理）、`job_max_lifetime`。这些键都在 `config/system.yaml` 的 `work_area.*`。
 
-`POST /api/file/view` 支持 `max_chars`（默认 16000）与 `column`（默认 0）。返回 `path`、`next_offset`、`next_column`、`truncated` 与 `total_lines`；后者仅读到文件末尾时可知，否则为 null。按返回位置继续，超长单行可能仍在同一 `next_offset`，须同时传回 `next_column`。读取在后台线程中逐片进行，不将整文件载入内存；页正文不再叠加固定截断，调用方也应保留该分页结果。旧客户端仍可从正文末尾取得准确续读参数。
+`POST /api/file/view` 支持 `max_chars`（默认 16000）与 `column`（默认 0）。返回 `path`、`next_offset`、`next_column`、`truncated` 与 `total_lines`；后者仅读到文件末尾时可知，否则为 null。按返回位置继续，超长单行可能仍在同一 `next_offset`，须同时传回 `next_column`。读取在后台线程中逐片进行，不将整文件载入内存；页正文不再叠加固定截断，调用方也应保留该分页结果。旧客户端仍可从正文末尾取得准确续读参数。二进制文件（前 8 KiB 含 NUL 字节，或是 zip/OLE2/PDF 文件头）直接返回 400，`detail` 为 `查看文件失败: binary_file: <路径> 是二进制文件，不能按文本查看（codec can't decode）`，不再返回带行号的乱码。
 
 `POST /api/file/upload` 默认无业务大小上限；Hub 流式转发请求，容器从 multipart 暂存文件以 1MiB 片段复制，在同目录临时文件写完后原子替换。失败会清理临时副本，保留旧目标。multipart 解析暂存及目标写入阶段的磁盘/文件系统配额不足均返回 507 并指出路径；失败或取消上传也会关闭未完成的暂存文件，原 multipart 字段及 OpenAPI schema 不变。实际可用容量取决于 Docker 数据盘和 MinIO。multipart 暂存、原子写入及 rclone 待回写缓存仍需实际可用空间。
 `POST /api/terminal/restart` 会 kill 当前 job 并复位 cwd / 环境变量。

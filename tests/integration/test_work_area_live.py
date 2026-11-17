@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 RAND = uuid.uuid4().hex[:6]
-IMAGE_CODE = os.environ.get("LIVE_IMAGE_CODE", "sandbox-code:2026.11.16-1")
+IMAGE_CODE = os.environ.get("LIVE_IMAGE_CODE", "sandbox-code:2026.11.17-1")
 IMAGE_FS = os.environ.get("LIVE_IMAGE_FS", "sandbox-fs:2026.11.10-1")
 GW_PORT = 18555
 # 测试里所有命令都受这个上限约束（平台对每个 job 生效），单条命令须远短于它
@@ -469,7 +469,7 @@ async def test_work_area_layout_v2_end_to_end(live):
         "self", bucket, "roles/r1", "rw", layout_version=2, extra_exclude=("avatar/**", ".staging/**")
     )
     diary_mount = RoleMountSpec("diary", bucket, "roles/r1/diary", "ro", layout_version=2)
-    agents = {"AGENTS.md": "# 盘说明 v1\n", "CLAUDE.md": "@AGENTS.md\n"}
+    agents = {"AGENTS.md": "# 盘说明 v1\n"}
 
     def v2(wa: str, **kw) -> AcquireSpec:
         return AcquireSpec(
@@ -499,7 +499,7 @@ async def test_work_area_layout_v2_end_to_end(live):
         code, out = await _sh(
             a,
             "pwd; echo CWD=$SANDBOX_CWD SKILLS=$CR_SKILLS_DIR LAYOUT=$SANDBOX_LAYOUT; "
-            "cat /workspace/keep.txt /workspace/AGENTS.md /workspace/CLAUDE.md; "
+            "cat /workspace/keep.txt /workspace/AGENTS.md; "
             "cat /self/about.md /self/skills/hello/SKILL.md /self/diary/2026-11-07.md; "
             "cat /mnt/drive/deliverables/r.md /opt/cr/env/INDEX.md /opt/cr/tools/INDEX.md; "
             "echo LS_SELF; ls -1a /self; echo LS_WS; ls -1a /workspace",
@@ -508,14 +508,15 @@ async def test_work_area_layout_v2_end_to_end(live):
         lines = out.splitlines()
         assert lines[0] == "/workspace", out
         assert "CWD=/workspace SKILLS=/self/skills LAYOUT=work-area/v2" in out
-        for text in ("from-v1", "盘说明 v1", "@AGENTS.md", "I am r1", "say hello", "diary entry",
+        for text in ("from-v1", "盘说明 v1", "I am r1", "say hello", "diary entry",
                      "archived deliverable", "环境索引", "工具索引"):
             assert text in out, (text, out)
         ls_self = lines[lines.index("LS_SELF") + 1 : lines.index("LS_WS")]
         assert ".cr" not in ls_self and {"about.md", "skills", "diary"} <= set(ls_self), ls_self
         assert "avatar" not in ls_self and ".staging" not in ls_self, ls_self
         ls_ws = lines[lines.index("LS_WS") + 1 :]
-        assert {"AGENTS.md", "CLAUDE.md", "deliverables", "keep.txt"} <= set(ls_ws), ls_ws
+        assert {"AGENTS.md", "deliverables", "keep.txt"} <= set(ls_ws), ls_ws
+        assert "CLAUDE.md" not in ls_ws, ls_ws  # #99：不再下发 CLAUDE.md
 
         # #75：/self 上的扩展属性读取返回「不支持」而不是 EIO，`ls -l 文件` 与 `sed -i` 不报 I/O 错误
         code, out = await _sh(
@@ -536,11 +537,11 @@ async def test_work_area_layout_v2_end_to_end(live):
         # ── 3. 只读位置写不进（终端与文件接口都一样），读写位置可写 ─────────────
         for path in (
             "/mnt/drive/deliverables/r.md", "/mnt/drive/new.txt", "/opt/cr/env/INDEX.md", "/opt/cr/new.txt",
-            "/self/diary/2026-11-07.md", "/self/diary/new.md", "/workspace/AGENTS.md", "/workspace/CLAUDE.md",
+            "/self/diary/2026-11-07.md", "/self/diary/new.md", "/workspace/AGENTS.md",
         ):
             code, out = await _sh(a, f"echo pwned > {path}")
             assert code != 0, f"{path} 竟然可写：{out}"
-        code, out = await _sh(a, "rm -f /workspace/AGENTS.md; mv /workspace/CLAUDE.md /workspace/x; cat /workspace/AGENTS.md")
+        code, out = await _sh(a, "rm -f /workspace/AGENTS.md; mv /workspace/AGENTS.md /workspace/x; cat /workspace/AGENTS.md")
         assert "盘说明 v1" in out, out
         r = await _file_write(a, "/mnt/drive/new.txt", "x")
         assert r.status_code == 400 and "只读位置" in r.json()["detail"], r.text
@@ -575,8 +576,8 @@ async def test_work_area_layout_v2_end_to_end(live):
         finally:
             got.path.unlink(missing_ok=True)
         await service.update_context(a.sandbox_id, {"env/INDEX.md": "环境 v2\n"}, {"AGENTS.md": "# 盘说明 v2\n"})
-        code, out = await _sh(a, "cat /workspace/AGENTS.md /opt/cr/env/INDEX.md; wc -c < /workspace/CLAUDE.md")
-        assert "盘说明 v2" in out and "环境 v2" in out and out.strip().endswith("0"), out
+        code, out = await _sh(a, "cat /workspace/AGENTS.md /opt/cr/env/INDEX.md")
+        assert "盘说明 v2" in out and "环境 v2" in out, out
         report = service.effective_report(a)
         assert report["layout_version"] == 2 and report["cwd"] == "/workspace"
         assert report["workspace_files"] == {"files": ["AGENTS.md"]}

@@ -586,7 +586,7 @@ async def test_unknown_execution_origin_does_not_guess_from_old_labels(env, fail
 
 SELF = RoleMountSpec("self", "bkt", "roles/r1", "rw", layout_version=2)
 DIARY = RoleMountSpec("diary", "bkt", "roles/r1/diary", "ro", layout_version=2)
-AGENTS = {"AGENTS.md": "# 盘说明\n", "CLAUDE.md": "@AGENTS.md\n"}
+AGENTS = {"AGENTS.md": "# 盘说明\n"}
 
 
 def _v2spec(wa="wa1", **kw) -> AcquireSpec:
@@ -607,15 +607,14 @@ async def test_acquire_v2_binds_five_roots(env):
     assert kwargs["layout_version"] == 2
     binds = {b.target: b for b in kwargs["binds"]}
     assert list(binds) == [
-        "/workspace", "/workspace/deliverables", "/workspace/AGENTS.md", "/workspace/CLAUDE.md",
+        "/workspace", "/workspace/deliverables", "/workspace/AGENTS.md",
         "/mnt/drive", "/opt/cr", "/self", "/self/diary",
     ]
     work = sidecar.root / "work-areas" / "wa1"
     assert binds["/workspace"].source == str(work / "work") and not binds["/workspace"].read_only
     assert binds["/workspace/deliverables"].source == str(work / "deliverables")
     assert not binds["/workspace/deliverables"].read_only
-    for name in ("AGENTS.md", "CLAUDE.md"):
-        assert binds[f"/workspace/{name}"].read_only
+    assert binds["/workspace/AGENTS.md"].read_only
     assert binds["/mnt/drive"].read_only and binds["/opt/cr"].read_only
     assert not binds["/self"].read_only and binds["/self"].propagation == "rslave"
     assert binds["/self/diary"].read_only and binds["/self/diary"].propagation == "rslave"
@@ -629,7 +628,7 @@ async def test_acquire_v2_binds_five_roots(env):
     targets = {m["target"]: m for m in report["mounts"]}
     assert targets["/self"]["exclude"] == ["/.cr/**"] and targets["/self/diary"]["mode"] == "ro"
     assert targets["/workspace"]["mode"] == "rw" and targets["/opt/cr"]["source"] == "context"
-    assert report["workspace_files"] == {"files": ["AGENTS.md", "CLAUDE.md"]}
+    assert report["workspace_files"] == {"files": ["AGENTS.md"]}
     assert report["context"] == {"files": ["env/INDEX.md", "tools/INDEX.md"]}
 
 
@@ -637,7 +636,7 @@ async def test_acquire_v2_without_workspace_files_binds_empty_files(env):
     service, manager, sidecar, _ = env
     instance, _ = await service.acquire(_v2spec(mounts=[]))
     files = sidecar.root / "instances" / instance.sandbox_id / "workspace-files"
-    assert (files / "AGENTS.md").read_bytes() == b"" and (files / "CLAUDE.md").read_bytes() == b""
+    assert (files / "AGENTS.md").read_bytes() == b"" and not (files / "CLAUDE.md").exists()
     assert service.effective_report(instance)["workspace_files"] == {"files": []}
 
 
@@ -649,8 +648,13 @@ async def test_workspace_files_update_in_place_keeps_inode(env):
     files, extra = await service.update_context(instance.sandbox_id, None, {"AGENTS.md": "v2"})
     assert files == [] and extra == ["AGENTS.md"]
     assert agents.read_text() == "v2" and agents.stat().st_ino == inode
-    # 整组替换：没给的 CLAUDE.md 清空
-    assert (agents.parent / "CLAUDE.md").read_bytes() == b""
+    # 整组替换：没给的白名单文件清空
+    files, extra = await service.update_context(instance.sandbox_id, None, {})
+    assert extra == [] and agents.read_bytes() == b"" and agents.stat().st_ino == inode
+    # CLAUDE.md 已不在白名单（#99）
+    with pytest.raises(WorkAreaError) as ei:
+        await service.update_context(instance.sandbox_id, None, {"CLAUDE.md": "@AGENTS.md"})
+    assert ei.value.reason == "invalid_workspace_files"
     # 复用时同样就地更新
     again, reused = await service.acquire(_v2spec(workspace_files={"AGENTS.md": "v3"}))
     assert reused and again is instance and agents.read_text() == "v3" and agents.stat().st_ino == inode
@@ -692,13 +696,12 @@ async def test_v2_moves_aside_tenant_entries_that_block_mountpoints(env):
     work = sidecar.root / "work-areas" / "wa1" / "work"
     work.mkdir(parents=True)
     (work / "AGENTS.md").mkdir()  # 目录挡住单文件挂载
-    (work / "CLAUDE.md").symlink_to("/etc/passwd")  # 软链接会把挂载引到别处
     (work / "deliverables").write_text("not a dir")
     (work / "keep.md").write_text("keep")
     await service.acquire(_v2spec(mounts=[]))
     names = sorted(p.name for p in work.iterdir())
-    assert "AGENTS.md" not in names and "CLAUDE.md" not in names and "deliverables" not in names
-    assert {n.split(".moved-")[0] for n in names if ".moved-" in n} == {"AGENTS.md", "CLAUDE.md", "deliverables"}
+    assert "AGENTS.md" not in names and "deliverables" not in names
+    assert {n.split(".moved-")[0] for n in names if ".moved-" in n} == {"AGENTS.md", "deliverables"}
     assert (work / "keep.md").read_text() == "keep"
 
 
@@ -710,6 +713,28 @@ async def test_v2_keeps_regular_tenant_agents_file(env):
     (work / "deliverables").mkdir()
     await service.acquire(_v2spec(mounts=[]))
     assert (work / "AGENTS.md").read_text() == "mine"  # 只读覆盖期间被遮住，内容不动
+
+
+async def test_v2_removes_leftover_empty_claude_md_mountpoint(env):
+    """不再下发 CLAUDE.md（#99）：早先单文件 bind 留下的空挂载点删掉，租户写过内容的保留。"""
+    service, manager, sidecar, _ = env
+    work = sidecar.root / "work-areas" / "wa1" / "work"
+    work.mkdir(parents=True)
+    (work / "CLAUDE.md").write_bytes(b"")
+    (work / "deliverables").mkdir()
+    await service.acquire(_v2spec(mounts=[]))
+    assert not (work / "CLAUDE.md").exists()
+    targets = [b.target for b in manager.run_wa_container.await_args.kwargs["binds"]]
+    assert "/workspace/CLAUDE.md" not in targets
+
+
+async def test_v2_keeps_tenant_written_claude_md(env):
+    service, _, sidecar, _ = env
+    work = sidecar.root / "work-areas" / "wa2" / "work"
+    work.mkdir(parents=True)
+    (work / "CLAUDE.md").write_text("tenant notes")
+    await service.acquire(_v2spec("wa2", mounts=[]))
+    assert (work / "CLAUDE.md").read_text() == "tenant notes"
 
 
 async def test_startup_adopts_v2_instance_from_layout_label(env):
