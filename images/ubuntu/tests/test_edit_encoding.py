@@ -43,9 +43,9 @@ async def test_view_utf8_file_unaffected(tmp_path):
 
 @pytest.mark.asyncio
 async def test_view_undecodable_bytes_falls_back_to_replace(tmp_path):
-    # 既非 UTF-8 也非合法 GB18030 的任意二进制字节：不应抛异常，用 U+FFFD 兜底
-    path = tmp_path / "bin.dat"
-    path.write_bytes(b"\xff\xfe\x00\xff")
+    # 既非 UTF-8 也非合法 GB18030、又不像二进制（无 NUL、无已知文件头）：不抛异常，用 U+FFFD 兜底
+    path = tmp_path / "odd.txt"
+    path.write_bytes(b"abc \xff\xff\xff def\n")
 
     tool = EditTool()
     result = await tool.view(str(path))

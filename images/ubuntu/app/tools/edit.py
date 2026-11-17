@@ -22,6 +22,21 @@ __all__ = ["EditTool", "MatchError"]
 # 编辑片段显示的上下文行数
 SNIPPET_LINES: int = 4
 
+# view 读之前嗅探的文件头长度与二进制文件头（zip/Office Open XML、OLE2 旧 Office、PDF）。
+_SNIFF_BYTES: int = 8192
+_BINARY_MAGICS: tuple[bytes, ...] = (b"PK\x03\x04", b"\xd0\xcf\x11\xe0", b"%PDF-")
+# 二进制拒绝的固定前缀：调用方按它识别；括号里保留解码失败的原文特征，兼容只认解码报错的调用方。
+BINARY_FILE_ERROR: str = "binary_file"
+
+
+def binary_file_error(path: Path) -> str:
+    return f"{BINARY_FILE_ERROR}: {path} 是二进制文件，不能按文本查看（codec can't decode）"
+
+
+def looks_binary(head: bytes) -> bool:
+    """文件头命中已知二进制格式，或含 NUL 字节（文本文件不会有）即判为二进制。"""
+    return head.startswith(_BINARY_MAGICS) or b"\x00" in head
+
 
 @dataclass(kw_only=True, frozen=True)
 class FileViewResult(CLIResult):
@@ -231,6 +246,14 @@ class EditTool:
         return await asyncio.to_thread(self._read_page, path, start, end, column, max_chars)
 
     def _read_page(self, path: Path, start: int, end: int, column: int, budget: int) -> FileViewResult:
+        # 二进制（xlsx/docx/zip/图片等）直接拒绝：替换解码永远不会失败，不拦就会返回带行号的乱码。
+        try:
+            with path.open("rb") as raw:
+                head = raw.read(_SNIFF_BYTES)
+        except OSError as exc:
+            raise ToolError(f"读取 {path} 时遇到错误: {exc}") from exc
+        if looks_binary(head):
+            raise ToolError(binary_file_error(path))
         # 保持原有 UTF-8 → GB18030 → 替换回退；读取和跳行都以有界片段进行，
         # 不为文件总行数扫描剩余内容。total_lines 仅到 EOF 后可知。
         for encoding, errors in (("utf-8", "strict"), ("gb18030", "strict"), ("utf-8", "replace")):

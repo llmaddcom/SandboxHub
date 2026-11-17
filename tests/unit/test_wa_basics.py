@@ -385,7 +385,7 @@ def test_validate_spec_v2_ok():
         _spec(
             layout_version=2,
             mounts=[_v2("self", "roles/r1/"), _v2("diary", "roles/r1/diary", "ro")],
-            workspace_files={"AGENTS.md": "x", "CLAUDE.md": "@AGENTS.md"},
+            workspace_files={"AGENTS.md": "x"},
         )
     )
 
@@ -442,7 +442,7 @@ def test_layout_env_keeps_v1_and_describes_v2():
     assert env["SANDBOX_LAYOUT"] == "work-area/v2" and env["CR_SKILLS_DIR"] == "/self/skills"
     assert env["CR_TOOLS_DIR"] == "/opt/cr/tools" and env["SANDBOX_HIDDEN_ROOTS"] == "/self/.cr"
     assert env["SANDBOX_READONLY_ROOTS"].split(":") == [
-        "/mnt/drive", "/opt/cr", "/self/diary", "/workspace/AGENTS.md", "/workspace/CLAUDE.md"
+        "/mnt/drive", "/opt/cr", "/self/diary", "/workspace/AGENTS.md"
     ]
 
 
